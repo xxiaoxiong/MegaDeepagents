@@ -1,0 +1,13 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "researcher": "app.agents:get_researcher_graph",
+    "coder": "app.agents:get_coder_graph",
+    "reviewer": "app.agents:get_reviewer_graph"
+  },
+  "env": {
+    "LLM_PROVIDER": "deepseek",
+    "LLM_MODEL": "deepseek-chat",
+    "LLM_API_KEY": "changeme"
+  }
+}

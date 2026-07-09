@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>通用智能体框架 · 任务台</title>
+    <link rel="stylesheet" href="style.css">
+
+    <!-- Markdown 解析 -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js">
+    </script>
+    <!-- 代码高亮 -->
+    <link rel="stylesheet"
+    href="https://cdn.jsdelivr.net/npm/highlight.js@11/styles/atom-one-dark.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/highlight.js@11/highlight.min.js">
+    </script>
+</head>
+<body>
+    <div class="app">
+        <!-- 侧栏遮罩（移动端） -->
+        <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
+
+        <!-- 侧栏 -->
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-content">
+                <!-- 项目标题 -->
+                <div class="sidebar-title">
+                    <h1>通用智能体框架</h1>
+                </div>
+
+                <!-- New Chat -->
+                <button class="new-chat-btn" id="newChatBtn" title="新建对话">
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                        <path d="M8 3v10M3 8h10"/>
+                    </svg>
+                    新建对话
+                </button>
+
+                <!-- 最近对话列表 -->
+                <nav class="recent-list" id="recentList">
+                    <div class="recent-header">
+                        <span>最近</span>
+                    </div>
+                    <div class="recent-items" id="recentItems">
+                        <div class="recent-empty">暂无历史对话</div>
+                    </div>
+                </nav>
+
+                <!-- 更多面板导航 -->
+                <nav class="more-nav">
+                    <a class="more-item" data-tab="history" role="button" tabindex="0">
+                        <span class="more-icon">📜</span><span>历史任务</span>
+                    </a>
+                    <a class="more-item" data-tab="skills" role="button" tabindex="0">
+                        <span class="more-icon">📚</span><span>Skills</span>
+                    </a>
+                    <a class="more-item" data-tab="memory" role="button" tabindex="0">
+                        <span class="more-icon">🧠</span><span>记忆检索</span>
+                    </a>
+                    <a class="more-item" data-tab="review" role="button" tabindex="0">
+                        <span class="more-icon">🔍</span><span>Review</span>
+                    </a>
+                </nav>
+            </div>
+
+
+        </aside>
+
+        <!-- 主内容 -->
+        <main class="main">
+            <!-- 移动端顶栏 -->
+            <div class="mobile-header">
+                <button class="menu-toggle" id="menuToggle" aria-label="菜单">
+                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                        <path d="M4 6h16M4 12h16M4 18h16"/>
+                    </svg>
+                </button>
+                <h1>通用智能体框架</h1>
+            </div>
+
+            <!-- 对话面板 -->
+            <section id="panel-tasks" class="panel active">
+                <div class="chat-container" id="chatContainer">
+                    <div class="chat-stream" id="chatStream">
+                        <!-- 空状态 -->
+                        <div class="empty-state" id="chatEmpty">
+                            <div class="empty-logo">
+                                <svg viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="color: var(--text-primary);">
+                                    <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+                                </svg>
+                            </div>
+                            <h2 class="empty-title">通用智能体框架</h2>
+                            <p class="empty-subtitle">我可以帮你完成各种任务，开工吧。</p>
+                            <div class="empty-hints">
+                                <button class="empty-hint-chip" data-msg="帮我分析一下这个项目的架构">
+                                    📁 帮我分析一下这个项目的架构
+                                </button>
+                                <button class="empty-hint-chip" data-msg="写一个 Python 快速排序">
+                                    🐍 写一个 Python 快速排序
+                                </button>
+                                <button class="empty-hint-chip" data-msg="帮我审查这段代码的潜在问题">
+                                    🔍 帮我审查这段代码的潜在问题
+                                </button>
+                                <button class="empty-hint-chip" data-msg="用 React 实现一个待办事项应用">
+                                    ⚛️ 用 React 实现一个待办事项应用
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 预览遮罩（点击关闭） -->
+                <div id="previewBackdrop" class="preview-backdrop"></div>
+
+                <!-- 文件预览面板 -->
+                <div id="previewPanel" class="preview-panel">
+                    <div class="preview-header">
+                        <span id="previewFileName" class="preview-file-name">未选择文件</span>
+                        <div class="preview-actions">
+                            <button id="previewFullscreen" class="btn btn-ghost btn-sm" title="全屏显示">⛶ 全屏</button>
+                            <button id="previewClose" class="btn btn-ghost btn-sm">✕ 关闭</button>
+                        </div>
+                    </div>
+                    <div id="previewContent" class="preview-content"></div>
+                    <div class="preview-footer">
+                        <a id="previewDownload" class="btn btn-primary" href="#" download>⬇ 下载文件</a>
+                    </div>
+                    <div id="previewResizeHandle" class="preview-resize-handle"></div>
+                </div>
+            </section>
+
+                <!-- 审批卡容器 -->
+                <div id="approval-bar" class="input-area" style="display:none;"></div>
+
+                <!-- 输入区 -->
+                <div class="input-area">
+                    <div class="input-wrapper">
+                        <form class="task-form" id="taskForm">
+                            <textarea id="taskInput" rows="1" placeholder="给 智能体 发送消息..." required></textarea>
+                            <div class="form-actions">
+                                <button type="submit" class="btn btn-primary" id="submitBtn" aria-label="发送">
+                                    <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor">
+                                        <path d="M1.5 8l6-4.5L14.5 8l-6 4.5L1.5 8zm0 0L8 2.5 14.5 8 8 13.5 1.5 8z"/>
+                                    </svg>
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                    <div id="runningBar" class="running-bar" style="display:none;">
+                        <span class="running-dots"><span></span><span></span><span></span></span>
+                        <span class="running-text">Agent 正在执行...</span>
+                    </div>
+                    <p class="hint-text">Made By Nicholas-Xiong</p>
+                </div>
+            </section>
+
+            <!-- 历史面板 -->
+            <section id="panel-history" class="panel">
+                <div class="panel-header">
+                    <h2>📜 历史任务</h2>
+                    <button class="btn btn-ghost btn-sm" onclick="loadTaskHistory()">↻ 刷新</button>
+                </div>
+                <div class="history-list" id="historyList">
+                    <div class="empty-state-card">
+                        <div class="empty-icon">📭</div>
+                        <h3>暂无历史任务</h3>
+                        <p>前往对话页开始你的第一个任务</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Skills 面板 -->
+            <section id="panel-skills" class="panel">
+                <div class="panel-header">
+                    <h2>📚 Skills</h2>
+                    <button class="btn btn-ghost btn-sm" onclick="loadSkills()">↻ 刷新</button>
+                </div>
+                <div class="skills-grid" id="skillsList">
+                    <div class="empty-state-card">
+                        <div class="empty-icon">📚</div>
+                        <h3>暂无 Skills</h3>
+                        <p>尚未加载任何技能卡片</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Memory 面板 -->
+            <section id="panel-memory" class="panel">
+                <div class="panel-header">
+                    <h2>🧠 记忆检索</h2>
+                </div>
+                <div class="memory-search">
+                    <div class="search-box">
+                        <input type="text" id="memoryQuery" placeholder="搜索历史记录..."
+                        autocomplete="off">
+                        <button class="btn btn-primary" onclick="searchMemory()">搜索</button>
+                    </div>
+                    <div class="search-result" id="memoryResult">
+                        <div class="empty-state-card" style="padding: 32px 16px;">
+                            <p>输入关键词搜索记忆</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Review 面板 -->
+            <section id="panel-review" class="panel">
+                <div class="panel-header">
+                    <h2>🔍 Review Queue</h2>
+                    <button class="btn btn-ghost btn-sm" onclick="loadReviews()">↻ 刷新</button>
+                </div>
+                <div class="review-list" id="reviewList">
+                    <div class="empty-state-card">
+                        <div class="empty-icon">✅</div>
+                        <h3>暂无 Review</h3>
+                        <p>所有任务已处理完毕</p>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Toast -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script src="app.js">
+    </script>
+</body>
+</html>

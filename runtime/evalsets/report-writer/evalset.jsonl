@@ -1,0 +1,5 @@
+{"input": "生成一份技术调研报告，关于微服务架构的优缺点", "expected_contains": ["背景", "目标", "结论"], "tags": ["report"]}
+{"input": "写一份项目进度报告，包含任务完成情况和风险", "expected_contains": ["进度", "风险", "下一步"], "tags": ["report"]}
+{"input": "生成一份产品分析报告，面向技术负责人", "expected_contains": ["背景", "目标", "用户"], "tags": ["report"]}
+{"input": "写一份实施计划，分三阶段推进", "expected_contains": ["阶段", "里程碑", "时间"], "tags": ["report"]}
+{"input": "生成一份调研总结，包含至少 3 个发现", "expected_contains": ["调研", "发现", "总结"], "tags": ["report"]}
