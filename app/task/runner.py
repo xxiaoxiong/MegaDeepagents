@@ -11,6 +11,7 @@ from langgraph.types import Command
 
 from app.core.config import settings
 from app.core.logging import logger
+from app.core.observability import traceable
 from app.core.schemas import TaskStatus
 from app.task.models import TaskEvent
 from app.task.service import get_task_service
@@ -182,8 +183,13 @@ class TaskRunner:
         except Exception as exc:
             logger.warning(f"Auto-register artifacts failed: {exc}")
 
+    @traceable(name="single_agent_run", run_type="chain")
     def run(self, user_input: str) -> dict[str, Any]:
-        """执行任务，返回结果字典。"""
+        """执行任务，返回结果字典。
+
+        被 @traceable 装饰：单 Agent 路径每次 run 上报到 LangSmith。
+        deepagents 内部触发的 LLM 调用会自动挂为 child（依赖 LANGSMITH_TRACING 环境变量）。
+        """
         from app.core.agent_factory import build_agent
         from app.core.context import AgentContext
 

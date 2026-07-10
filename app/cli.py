@@ -40,7 +40,9 @@ def run_team(
     review_required: bool = Option(True, "--review/--no-review", help="是否需要评审"),
 ):
     """运行多 Agent 团队任务。"""
+    from app.core.observability import init_observability
     from app.multiagent.team_runner import run_team_task
+    init_observability(component="cli")
     with console.status("[bold green]Team running..."):
         result = run_team_task(
             goal=goal,

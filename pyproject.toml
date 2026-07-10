@@ -31,3 +31,11 @@ where = ["."]
 
 [tool.setuptools.package-data]
 "*" = ["*.md", "*.txt", "*.example", "*.html", "*.js", "*.css"]
+
+[project.optional-dependencies]
+observability = ["langsmith>=0.10.0"]
+
+[tool.pytest.ini_options]
+markers = [
+    "real_langsmith: 需要 LANGSMITH_API_KEY 才运行的集成测试",
+]

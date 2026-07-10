@@ -28,6 +28,7 @@ from datetime import datetime
 from typing import Any
 
 from app.core.logging import logger
+from app.core.observability import traceable, trace_span, emit_trace_event, get_current_run_url
 from app.multiagent.action_guard import (
     get_effective_allowed_actions,
     is_action_allowed,
@@ -99,6 +100,10 @@ class TeamRunner:
         room_id: str | None = None,
     ) -> "TeamRunner":
         """创建并配置一个新的多 Agent 任务。"""
+        # 确保 observability 已初始化（CLI 路径可能没走 main.py lifespan）
+        from app.core.observability import init_observability
+
+        init_observability(component="multiagent")
         team_spec = get_team(team_name)
         if team_spec is None:
             msg = f"Team '{team_name}' not found. Available: {_list_teams()}"
@@ -167,7 +172,11 @@ class TeamRunner:
     # ========== 核心循环 ==========
 
     def run(self, goal_override: str | None = None) -> TeamRunResult:
-        """运行多 Agent 团队任务的主循环。"""
+        """运行多 Agent 团队任务的主循环。
+
+        @traceable 装饰在独立的 _run_team_traced 函数上（见本文件底部），
+        确保跨线程 contextvar 传播 + process_inputs/process_outputs 业务内容可见性。
+        """
         if not self.room or not self.adapter or not self.termination_checker:
             raise RuntimeError("TeamRunner not initialized. Use TeamRunner.create() or .load() first.")
 
@@ -200,131 +209,190 @@ class TeamRunner:
             self._round += 1
             self.room.state.current_round = self._round
 
-            # 1a. 选择下一发言 Agent
-            speaker = self.selector.select(
-                shared_state=self.room.state,
-                agents=self.room.agents,
-                inbox=self.room.inbox,
-                last_speaker=self._last_speaker,
-                last_message=self._last_messages[-1] if self._last_messages else None,
-            )
-
-            if speaker is None:
-                logger.info(f"[TeamRunner] round {self._round}: no speaker selected, terminating")
-                termination_reason = "no_speaker"
-                self.room.state.update_phase(TeamPhase.FAILED)
-                self.emitter.emit(
-                    self.room_id or "",
-                    "termination",
-                    {"reason": "no_speaker", "round": self._round},
-                )
-                break
-
-            # emit: speaker selected
-            self.emitter.emit(
-                self.room_id or "",
-                "speaker_selected",
-                {"agent": speaker.name, "role": speaker.role, "round": self._round},
-            )
-
-            # 1b. 加载 inbox + state
-            inbox_context = self.room.inbox.get_relevant_context(speaker.name)
-            unread = self.room.inbox.list_unread(speaker.name)
-
-            # 1c. 构造 system prompt & 调用运行时
-            prompt = self.adapter.build_system_prompt(
-                agent=speaker,
-                shared_state=self.room.state,
-                inbox_context=inbox_context,
-                team_agents=self.room.agents,
-            )
-            actions = self.adapter.run(
-                agent=speaker,
-                inbox_messages=unread,
-                shared_state=self.room.state,
-            )
-
-            self.emitter.emit(
-                self.room_id or "",
-                "actions_emitted",
-                {
-                    "agent": speaker.name,
-                    "round": self._round,
-                    "action_count": len(actions),
-                    "action_types": [a.get("type", "?") for a in actions],
-                },
-            )
-
-            # 1d. actions 转消息，publish
-            produced_messages = AgentRuntimeAdapter.actions_to_messages(
-                agent_name=speaker.name,
-                task_id=self.task_id,
-                room_id=self.room_id,
-                actions=actions,
-                round_number=self._round,
-            )
-            self._last_messages = []
-            for msg in produced_messages:
-                self.room.publish(msg)
-                self._last_messages.append(msg)
-                # emit: 每条消息发布
-                self.emitter.emit(
-                    self.room_id or "",
-                    "message_published",
-                    {
-                        "id": msg.id,
-                        "from_agent": msg.from_agent,
-                        "to_agent": msg.to_agent,
-                        "message_type": msg.message_type.value,
-                        "content_preview": (msg.content or "")[:200],
+            # 本轮 trace span：让 _traced_llm_call + adapter.run 挂为本 run 的 child
+            with trace_span(
+                "team_round",
+                run_type="chain",
+                metadata={"round": self._round, "task_id": self.task_id, "room_id": self.room_id},
+            ) as round_span:
+                phase_before = self.room.state.phase.value
+                # 1a. 选择下一发言 Agent
+                with trace_span(
+                    "select_speaker",
+                    run_type="chain",
+                    metadata={
+                        "candidates": seat_agent_names,
+                        "last_speaker": self._last_speaker,
                         "round": self._round,
+                    },
+                ):
+                    speaker = self.selector.select(
+                        shared_state=self.room.state,
+                        agents=self.room.agents,
+                        inbox=self.room.inbox,
+                        last_speaker=self._last_speaker,
+                        last_message=self._last_messages[-1] if self._last_messages else None,
+                    )
+
+                if speaker is None:
+                    logger.info(f"[TeamRunner] round {self._round}: no speaker selected, terminating")
+                    termination_reason = "no_speaker"
+                    self.room.state.update_phase(TeamPhase.FAILED)
+                    self.emitter.emit(
+                        self.room_id or "",
+                        "termination",
+                        {"reason": "no_speaker", "round": self._round},
+                    )
+                    break
+
+                # emit: speaker selected
+                self.emitter.emit(
+                    self.room_id or "",
+                    "speaker_selected",
+                    {"agent": speaker.name, "role": speaker.role, "round": self._round},
+                )
+
+                # 1b. 加载 inbox + state
+                inbox_context = self.room.inbox.get_relevant_context(speaker.name)
+                unread = self.room.inbox.list_unread(speaker.name)
+
+                # 1c. 构造 system prompt & 调用运行时
+                prompt = self.adapter.build_system_prompt(
+                    agent=speaker,
+                    shared_state=self.room.state,
+                    inbox_context=inbox_context,
+                    team_agents=self.room.agents,
+                )
+                actions = self.adapter.run(
+                    agent=speaker,
+                    inbox_messages=unread,
+                    shared_state=self.room.state,
+                )
+
+                self.emitter.emit(
+                    self.room_id or "",
+                    "actions_emitted",
+                    {
+                        "agent": speaker.name,
+                        "round": self._round,
+                        "action_count": len(actions),
+                        "action_types": [a.get("type", "?") for a in actions],
                     },
                 )
 
-            # 1e. 更新 SharedTeamState（处理 update_state / request_review / create_artifact 等 action）
-            self._process_actions(speaker.name, actions)
-            self.store.save_state(self.room.state)
-
-            # 1f. 标记已读
-            for m in unread:
-                self.room.inbox.mark_read(m.id, speaker.name)
-
-            # 1g. 记录 round
-            msg_ids = [m.id for m in produced_messages]
-            action_summary = "; ".join(
-                f"{a.get('type','?')}({'->' + a.get('to_agent','') if a.get('to_agent') else ''})"
-                for a in actions[:5]
-            )
-            self.store.save_round(
-                room_id=self.room_id,
-                round_number=self._round,
-                selected_speaker=speaker.name,
-                action_summary=action_summary[:200],
-                message_ids=msg_ids,
-            )
-
-            # 1h. 检查终止
-            self._last_speaker = speaker.name
-
-            # 本轮是否有消息真正到达了某个 Agent 的 inbox？（检测路由黑洞）
-            productive_delivery = self._check_productive_delivery(produced_messages)
-
-            decision = self.termination_checker.check(
-                state=self.room.state,
-                recent_messages=produced_messages,
-                round_count=self._round,
-                productive_delivery=productive_delivery,
-            )
-            if decision.should_terminate:
-                termination_reason = decision.reason
-                if decision.final_phase:
-                    self.room.state.update_phase(decision.final_phase)
-                self.emitter.emit(
-                    self.room_id or "",
-                    "termination",
-                    {"reason": termination_reason, "round": self._round, "phase": self.room.state.phase.value},
+                # 1d. actions 转消息，publish
+                produced_messages = AgentRuntimeAdapter.actions_to_messages(
+                    agent_name=speaker.name,
+                    task_id=self.task_id,
+                    room_id=self.room_id,
+                    actions=actions,
+                    round_number=self._round,
                 )
-                break
+                self._last_messages = []
+                for msg in produced_messages:
+                    self.room.publish(msg)
+                    self._last_messages.append(msg)
+                    # emit: 每条消息发布
+                    self.emitter.emit(
+                        self.room_id or "",
+                        "message_published",
+                        {
+                            "id": msg.id,
+                            "from_agent": msg.from_agent,
+                            "to_agent": msg.to_agent,
+                            "message_type": msg.message_type.value,
+                            "content_preview": (msg.content or "")[:200],
+                            "round": self._round,
+                        },
+                    )
+
+                # 1e. 更新 SharedTeamState（处理 update_state / request_review / create_artifact 等 action）
+                with trace_span(
+                    "process_actions",
+                    run_type="chain",
+                    metadata={
+                        "agent": speaker.name,
+                        "action_count": len(actions),
+                        "action_types": [a.get("type", "?") for a in actions],
+                    },
+                ):
+                    self._process_actions(speaker.name, actions)
+                self.store.save_state(self.room.state)
+
+                # 1f. 标记已读
+                for m in unread:
+                    self.room.inbox.mark_read(m.id, speaker.name)
+
+                # 1g. 记录 round（包含 LangSmith run URL，便于事后回放）
+                msg_ids = [m.id for m in produced_messages]
+                action_summary = "; ".join(
+                    f"{a.get('type','?')}({'->' + a.get('to_agent','') if a.get('to_agent') else ''})"
+                    for a in actions[:5]
+                )
+                run_url = get_current_run_url()
+                self.store.save_round(
+                    room_id=self.room_id,
+                    round_number=self._round,
+                    selected_speaker=speaker.name,
+                    action_summary=action_summary[:200],
+                    message_ids=msg_ids,
+                    langsmith_run_url=run_url,
+                )
+
+                # 1h. 检查终止
+                self._last_speaker = speaker.name
+
+                # 本轮是否有消息真正到达了某个 Agent 的 inbox？（检测路由黑洞）
+                productive_delivery = self._check_productive_delivery(produced_messages)
+
+                with trace_span(
+                    "termination_check",
+                    run_type="chain",
+                    metadata={"round": self._round, "productive_delivery": productive_delivery},
+                ):
+                    decision = self.termination_checker.check(
+                        state=self.room.state,
+                        recent_messages=produced_messages,
+                        round_count=self._round,
+                        productive_delivery=productive_delivery,
+                    )
+
+                # 把本轮的业务摘要写到 team_round span 的 metadata，
+                # 让 LangSmith UI 上每个 team_round 的 metadata 直接可见轮次业务内容
+                round_run = round_span.get("run") if isinstance(round_span, dict) else None
+                if round_run is not None and hasattr(round_run, "add_metadata"):
+                    try:
+                        round_run.add_metadata({
+                            "speaker": speaker.name,
+                            "speaker_role": speaker.role,
+                            "action_types": [a.get("type", "?") for a in actions],
+                            "action_summary": action_summary[:200],
+                            "produced_messages": [
+                                {
+                                    "from": m.from_agent,
+                                    "to": m.to_agent,
+                                    "type": m.message_type.value,
+                                    "preview": (m.content or "")[:300],
+                                }
+                                for m in produced_messages
+                            ],
+                            "phase_before": phase_before,
+                            "phase_after": self.room.state.phase.value,
+                            "termination": decision.reason if decision.should_terminate else None,
+                        })
+                    except Exception:  # noqa: BLE001 - 业务埋点不应影响主流程
+                        logger.debug("[TeamRunner] round_run.add_metadata 失败", exc_info=True)
+
+                if decision.should_terminate:
+                    termination_reason = decision.reason
+                    if decision.final_phase:
+                        self.room.state.update_phase(decision.final_phase)
+                    self.emitter.emit(
+                        self.room_id or "",
+                        "termination",
+                        {"reason": termination_reason, "round": self._round, "phase": self.room.state.phase.value},
+                    )
+                    break
 
         # 2. 完成
         elapsed = (datetime.utcnow() - start_time).total_seconds()
@@ -589,4 +657,60 @@ def run_team_task(
         review_required=review_required,
         task_id=task_id,
     )
-    return runner.run()
+    return _run_team_traced(runner)
+
+
+def _extract_team_run_inputs(args: tuple) -> dict[str, Any]:
+    """@traceable 的 process_inputs：args[0] 是 TeamRunner 实例。
+
+    从中提取 goal / team_name / max_rounds / agents，让 LangSmith UI 上 team_run 的
+    输入是结构化字段而非 Python 对象字符串。
+    """
+    runner = args[0] if args else None
+    if runner is None or not isinstance(runner, TeamRunner):
+        return {"goal": "?"}
+    cfg = getattr(runner.room, "config", None) if runner.room else None
+    agents = [a.name for a in runner.room.agents] if runner.room else []
+    return {
+        "goal": getattr(cfg, "goal", "?"),
+        "team_name": getattr(cfg, "team_name", "?"),
+        "max_rounds": getattr(cfg, "max_rounds", 0),
+        "agents": agents,
+        "task_id": runner.task_id,
+        "room_id": runner.room_id,
+    }
+
+
+def _extract_team_run_outputs(result: Any) -> dict[str, Any]:
+    """@traceable 的 process_outputs：把 TeamRunResult 结构化为简洁字段。"""
+    if not isinstance(result, TeamRunResult):
+        return {"result": str(result)[:200]}
+    return {
+        "status": result.status,
+        "phase": result.phase,
+        "total_rounds": result.total_rounds,
+        "termination_reason": result.termination_reason,
+        "final_output": (result.final_output or "")[:500],
+        "task_id": result.task_id,
+        "room_id": result.room_id,
+    }
+
+
+@traceable(
+    name="team_run",
+    run_type="chain",
+    process_inputs=_extract_team_run_inputs,
+    process_outputs=_extract_team_run_outputs,
+    tags=["multiagent", "team_run"],
+)
+def _run_team_traced(runner: "TeamRunner", goal_override: str | None = None) -> TeamRunResult:
+    """被 @traceable 装饰的入口函数，包装 TeamRunner.run()。
+
+    设计要点：
+    1. **顶层 run 由 @traceable 在调用线程创建**，依赖 langsmith contextvar 继承。
+       routes_team.py 用 contextvars.copy_context() 启动后台线程，确保 trace 父子链正确建立。
+    2. **process_inputs/process_outputs 让 LangSmith UI 上看到结构化业务内容**
+       （goal/agents/total_rounds/phase/final_output），而非 Python 对象字符串。
+    3. CLI 直接调用 runner.run() 时不会包 this wrapper；CLI 路径也应改用此函数以获得 trace。
+    """
+    return runner.run(goal_override)

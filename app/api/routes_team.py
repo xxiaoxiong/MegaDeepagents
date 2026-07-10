@@ -92,6 +92,7 @@ class RoundResponse(BaseModel):
     action_summary: str = ""
     message_ids: list[str] = Field(default_factory=list)
     termination_reason: str | None = None
+    langsmith_run_url: str | None = None
     created_at: str
 
 
@@ -113,14 +114,21 @@ def create_team_task(req: CreateTeamTaskRequest):
         max_rounds=req.max_rounds,
         review_required=req.review_required,
     )
-    # 后台运行
+    # 后台运行：用 copy_context 传播 contextvar（含 LangSmith 的 _PARENT_RUN_TREE_REF），
+    # 否则跨线程会丢失 trace 父子链，LangSmith 上所有 run 变成独立根。
     import threading
+    import contextvars
+
+    from app.multiagent.team_runner import _run_team_traced
+
     def _safe_run():
         try:
-            runner.run()
+            _run_team_traced(runner)
         except Exception as exc:
             logger.error(f"[TeamTask] run failed for task={runner.task_id}: {exc}")
-    thread = threading.Thread(target=_safe_run, daemon=True)
+
+    ctx = contextvars.copy_context()
+    thread = threading.Thread(target=ctx.run, args=(_safe_run,), daemon=True)
     thread.start()
     return CreateTeamTaskResponse(
         task_id=runner.task_id,
@@ -316,6 +324,7 @@ def get_team_task_rounds(task_id: str):
                 if isinstance(r.get("message_ids"), str) else r.get("message_ids", [])
             ),
             termination_reason=r.get("termination_reason"),
+            langsmith_run_url=r.get("langsmith_run_url"),
             created_at=r.get("created_at", ""),
         )
         for r in rounds

@@ -24,6 +24,7 @@ import uuid
 from typing import Any
 
 from app.core.logging import logger
+from app.core.observability import traceable
 from app.multiagent.messages import AgentMessage, MessageType, make_message_id
 from app.multiagent.state import IssueSeverity, IssueStatus, SharedTeamState, TeamIssue, TeamPhase
 
@@ -52,13 +53,19 @@ class ReviewRepairLoop:
         self.max_cycles = max_cycles
         self.cycle_count = 0
 
+    @traceable(name="review_repair", run_type="chain")
     def process_review_result(
         self,
         result: ReviewResult,
         state: SharedTeamState,
         room,
+        langsmith_extra: dict[str, Any] | None = None,
     ) -> list[AgentMessage]:
-        """处理一条 review_result 消息，更新状态并产生后续消息。"""
+        """处理一条 review_result 消息，更新状态并产生后续消息。
+
+        被 @traceable 装饰：评审决策每轮都上报到 LangSmith。
+        call-time 可传 langsmith_extra={"metadata": {...}} 注入 cycle/passed 等动态字段。
+        """
         messages: list[AgentMessage] = []
         state.review_cycles = self.cycle_count
 

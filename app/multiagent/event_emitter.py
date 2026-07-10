@@ -29,6 +29,7 @@ from collections import defaultdict
 from typing import Any
 
 from app.core.logging import logger
+from app.core.observability import emit_trace_event
 
 
 class _Subscription:
@@ -104,7 +105,11 @@ class EventEmitter:
                 logger.info(f"[EventEmitter] unsubscribe key={sub.key}, remaining={len(self._subs[sub.key])}")
 
     def emit(self, key: str, event_type: str, payload: dict[str, Any] | None = None) -> None:
-        """向 key 的所有订阅者广播事件。无订阅者时静默丢弃。"""
+        """向 key 的所有订阅者广播事件。无订阅者时静默丢弃。
+
+        同时旁路分发一份到 LangSmith trace（emit_trace_event）。
+        这样 6 类 SSE 事件自动成为当前 TeamRun trace 下的 child span signal。
+        """
         with self._lock:
             subs = list(self._subs.get(key, []))
         if not subs:
@@ -119,6 +124,8 @@ class EventEmitter:
                 sub.put(event)
             except Exception as exc:  # pragma: no cover
                 logger.warning(f"[EventEmitter] put failed key={key}: {exc}")
+        # 旁路：LangSmith trace 信号
+        emit_trace_event(event_type, payload)
 
 
 # 进程级单例

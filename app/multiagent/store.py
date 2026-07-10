@@ -160,11 +160,20 @@ def _init_multiagent_db(conn: sqlite3.Connection) -> None:
             action_summary TEXT,
             message_ids TEXT NOT NULL DEFAULT '[]',
             termination_reason TEXT,
+            langsmith_run_url TEXT,
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_team_rounds_room ON team_rounds(room_id);
         """
     )
+    # 兼容旧库：如果 team_rounds 表已存在但缺 langsmith_run_url 列，则补上
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(team_rounds)").fetchall()}
+        if "langsmith_run_url" not in cols:
+            conn.execute("ALTER TABLE team_rounds ADD COLUMN langsmith_run_url TEXT")
+            logger.info("[store] team_rounds.langsmith_run_url 已补列（兼容旧库）")
+    except Exception as exc:
+        logger.warning(f"[store] ALTER TABLE team_rounds 失败（可能已存在）：{exc}")
     conn.commit()
 
 
@@ -515,11 +524,13 @@ class MultiAgentStore:
         action_summary: str = "",
         message_ids: list[str] | None = None,
         termination_reason: str | None = None,
+        langsmith_run_url: str | None = None,
     ) -> None:
         self.conn.execute(
             """INSERT INTO team_rounds
-               (room_id, round_number, selected_speaker, action_summary, message_ids, termination_reason, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               (room_id, round_number, selected_speaker, action_summary, message_ids,
+                termination_reason, langsmith_run_url, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 room_id,
                 round_number,
@@ -527,6 +538,7 @@ class MultiAgentStore:
                 action_summary,
                 json.dumps(message_ids or [], ensure_ascii=False),
                 termination_reason,
+                langsmith_run_url,
                 datetime.utcnow().isoformat(),
             ),
         )

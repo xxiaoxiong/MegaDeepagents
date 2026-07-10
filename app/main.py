@@ -69,6 +69,10 @@ def on_startup():
     import threading
 
     from app.skills.metadata import _init_db, get_connection
+    from app.core.observability import init_observability
+
+    # 初始化 LangSmith 可观测性（默认 False 时为 no-op，无外网依赖）
+    init_observability(component="api")
 
     try:
         _init_db(get_connection())

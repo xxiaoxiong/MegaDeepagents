@@ -64,6 +64,16 @@ class Settings(BaseSettings):
     # ========== 响应格式结构化 ==========
     enable_response_format: bool = False
 
+    # ========== 辅助 / 反思模型（非主链路，留空则回退主模型）==========
+    aux_llm_provider: str = ""
+    aux_llm_model: str = ""
+    aux_llm_api_key: str = ""
+    aux_llm_base_url: str = ""
+    reflection_llm_provider: str = ""
+    reflection_llm_model: str = ""
+    reflection_llm_api_key: str = ""
+    reflection_llm_base_url: str = ""
+
     # ========== LLM 缓存 ==========
     enable_llm_cache: bool = True
     llm_cache_path: str = "./runtime/cache/llm_cache.db"
@@ -73,6 +83,16 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = 100
     max_message_length: int = 50000
     pending_runner_ttl_minutes: int = 30
+
+    # ========== LangSmith 可观测性（可选；未配置时本地可跑） ==========
+    langsmith_enabled: bool = False  # 总开关，默认 False 满足"未配置本地可跑"约束
+    langsmith_api_key: str = ""  # 留空则即便 enabled=True 也降级 offline_log
+    langsmith_project: str = "multiagent-frame"
+    langsmith_endpoint: str = "https://api.smith.langchain.com"
+    langsmith_tracing: bool = True  # enabled 且有 key 时是否真的发样本
+    langsmith_service_name: str = "multiagent-frame"
+    langsmith_sample_rate: float = 1.0  # [0,1] 热路径采样率
+    langsmith_offline_log: bool = True  # 关闭时是否把等价 trace 摘要打到本地日志
 
     def _ensure_dirs(self) -> None:
         for d in [
@@ -126,6 +146,9 @@ class Settings(BaseSettings):
             f"CrossThreadMemory: {self.enable_cross_thread_memory}\n"
             f"ResponseFormat: {self.enable_response_format}\n"
             f"LLMCache: {self.enable_llm_cache} ({self.llm_cache_path})\n"
+            f"LangSmith: enabled={self.langsmith_enabled} project={self.langsmith_project} "
+            f"tracing={self.langsmith_tracing} sample_rate={self.langsmith_sample_rate} "
+            f"offline_log={self.langsmith_offline_log}\n"
             f"CORSOrigins: {self.cors_origins}\n"
             f"RateLimit: {self.rate_limit_per_minute} req/min\n"
             f"MaxMessageLength: {self.max_message_length}\n"

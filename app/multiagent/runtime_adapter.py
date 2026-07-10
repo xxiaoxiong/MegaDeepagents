@@ -19,6 +19,7 @@ import json
 from typing import Any
 
 from app.core.logging import logger
+from app.core.observability import traceable
 from app.multiagent.action_guard import filter_actions_by_permission
 from app.multiagent.agent_spec import AgentSpec
 from app.multiagent.messages import (
@@ -29,6 +30,10 @@ from app.multiagent.messages import (
     normalize_message_type,
 )
 from app.multiagent.state import SharedTeamState
+
+
+class _RetryParseException(Exception):
+    """LLM JSON 解析失败，由 _call_llm 决定是否重试。"""
 
 
 # 描述可用的 action 类型
@@ -205,7 +210,7 @@ class AgentRuntimeAdapter:
             f"shared_state phase={shared_state.phase.value}"
         )
 
-        # ---- 实际调用 LLM ----
+        # ---- 实际调用 LLM（带重试 + traceable 包装，见 _call_llm 内部）----
         actions = self._call_llm(agent, full_prompt)
         if not actions:
             # 解析失败回退：用一个 no_op 包装原文本，避免卡住循环
@@ -227,40 +232,34 @@ class AgentRuntimeAdapter:
 
         重试策略：仅对可恢复异常重试（404 / 429 / 5xx / 网络），
         业务错误不重试。最多 3 次，退避间隔 0.6→1.5→3s。
-        """
-        from app.llm_factory import build_model
 
+        每次尝试通过 _traced_llm_call 入口（被 @traceable 装饰成 LangSmith LLM run）。
+        多 Agent 每轮每个 Agent 都会走一次（项目内最高频的 LLM 调用热点）。
+        """
         max_retries = 3
         last_error: str | None = None
 
         for attempt in range(1, max_retries + 1):
             try:
-                llm = build_model()
-                # 使用 JSON mode 提高结构化输出成功率
-                try:
-                    json_llm = llm.bind(response_format={"type": "json_object"})
-                except Exception:
-                    json_llm = llm
-                response = json_llm.invoke([("user", prompt)])
-                text = getattr(response, "content", str(response))
-                if isinstance(text, list):
-                    text = json.dumps(text, ensure_ascii=False)
-                parsed = self.parse_json_response(text)
-                if not parsed:
-                    logger.warning(
-                        f"[AgentRuntimeAdapter] agent={agent.name} 第{attempt}次无法解析 JSON。"
-                        f"原始输出前200字：{text[:200]}"
-                    )
-                    if attempt < max_retries:
-                        continue
-                    return []
-                actions = parsed.get("actions") or []
-                if not isinstance(actions, list):
-                    if attempt < max_retries:
-                        continue
-                    return []
-                valid = [a for a in actions if isinstance(a, dict) and a.get("type")]
-                return valid
+                # call-time 传 langsmith_extra 注入动态 metadata（agent_name/role/attempt）
+                return self._traced_llm_call(
+                    agent, prompt, attempt,
+                    langsmith_extra={
+                        "metadata": {
+                            "agent_name": agent.name,
+                            "agent_role": agent.role,
+                            "attempt": attempt,
+                            "service": "multiagent",
+                        },
+                        "tags": [f"agent:{agent.name}", f"attempt:{attempt}"],
+                    },
+                )
+            except _RetryParseException:
+                # JSON 解析失败 / actions 非法 仍按重试处理（保持原 continue 语义）
+                last_error = "JSON parse failed"
+                if attempt < max_retries:
+                    continue
+                return []
             except Exception as exc:
                 last_error = str(exc)
                 err_str = str(exc)
@@ -293,6 +292,54 @@ class AgentRuntimeAdapter:
             f"重试{max_retries}次全部失败，最终错误：{last_error}"
         )
         return []
+
+    def _call_llm_once(
+        self, agent: AgentSpec, prompt: str, attempt: int
+    ) -> list[dict[str, Any]]:
+        """单次 LLM 调用 + JSON 解析。
+
+        被 self._traced_llm_call (实例方法) 包装为 LangSmith LLM run。
+        @traceable 装饰在 _traced_llm_call 上，让 LangChain 自动挂 child span。
+
+        解析失败时抛 _RetryParseException（保持原来 continue 语义），由外层决定是否重试。
+        """
+        from app.llm_factory import build_model
+
+        llm = build_model()
+        # 使用 JSON mode 提高结构化输出成功率
+        try:
+            json_llm = llm.bind(response_format={"type": "json_object"})
+        except Exception:
+            json_llm = llm
+        response = json_llm.invoke([("user", prompt)])
+        text = getattr(response, "content", str(response))
+        if isinstance(text, list):
+            text = json.dumps(text, ensure_ascii=False)
+        parsed = self.parse_json_response(text)
+        if not parsed:
+            logger.warning(
+                f"[AgentRuntimeAdapter] agent={agent.name} 第{attempt}次无法解析 JSON。"
+                f"原始输出前200字：{text[:200]}"
+            )
+            raise _RetryParseException()
+        actions = parsed.get("actions") or []
+        if not isinstance(actions, list):
+            raise _RetryParseException()
+        valid = [a for a in actions if isinstance(a, dict) and a.get("type")]
+        return valid
+
+    @traceable(name="agent_llm_call", run_type="llm")
+    def _traced_llm_call(
+        self, agent: AgentSpec, prompt: str, attempt: int, **_ls_extra
+    ) -> list[dict[str, Any]]:
+        """被 @traceable 装饰的代理，包装 _call_llm_once。
+
+        调用方可传 langsmith_extra={"metadata": ..., "tags": ...} 注入动态 metadata
+        （agent_name/role/attempt 等），LangSmith 会合并到底层 run。
+        LangChain ChatDeepSeek/ChatOpenAI 的 invoke 会自动挂为子 span。
+        多 Agent 每轮每个 Agent 的 LLM 调用都会走这里，是最高频热路径。
+        """
+        return self._call_llm_once(agent, prompt, attempt)
 
     @staticmethod
     def parse_json_response(response_text: str) -> dict[str, Any] | None:
