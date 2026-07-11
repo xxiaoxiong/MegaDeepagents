@@ -38,4 +38,7 @@ observability = ["langsmith>=0.10.0"]
 [tool.pytest.ini_options]
 markers = [
     "real_langsmith: 需要 LANGSMITH_API_KEY 才运行的集成测试",
+    "live_model: 需要真实 LLM API Key 才能运行的端到端测试（默认 skip）",
+    "slow: 耗时较长的测试，CI 上可单独跳过",
+    "integration: 跨模块集成测试（非纯单元测试）",
 ]

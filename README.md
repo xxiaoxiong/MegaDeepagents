@@ -195,7 +195,7 @@ init  →  发 user_request 到 MessageBus，emit task_started
 | `conflict_resolver` | 冲突裁决（规则引擎 + 升级 HITL） |
 | `layered_memory` | 四层记忆原型（Working/Episodic/Semantic/Procedural） |
 | `bus` | 消息路由总线（direct / broadcast / system） + 别名归一化 |
-| `team_graph` | LangGraph 可恢复状态图 + SqliteSaver checkpoint |
+| `team_graph` | LangGraph 可恢复状态图骨架（实验性/未启用）：4 节点 + SqliteSaver checkpoint；与 TeamRunner.run() 共享 TeamRoundExecutor 单轮组件，**未接到 API**，恢复逻辑尚未经过生产化测试 |
 | `room` | 多 Agent 任务环境（MessageBus + Inbox + SharedTeamState） |
 | `inbox` | 私有收件箱 + 相关上下文排序 |
 | `termination` | 6 种终止策略 |

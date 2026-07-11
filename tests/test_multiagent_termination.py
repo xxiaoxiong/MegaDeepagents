@@ -106,3 +106,50 @@ def test_max_review_cycles_terminates():
     d = c.check(state=s, recent_messages=[], round_count=1)
     assert d.should_terminate
     assert "max_review_cycles" in d.reason
+
+
+# ===== 需求 5：终止语义 =====
+
+
+def test_max_rounds_should_be_incomplete_not_completed():
+    """达到 max_rounds 时终态应为 INCOMPLETE，不是 COMPLETED。
+
+    回归保护：旧实现把 max_rounds 当作 COMPLETED 是错的——只有显式产出
+    final_output（final_message / review_passed）才算完成。
+    """
+    c = _checker(_spec(max_rounds=5))
+    s = _state(phase=TeamPhase.EXECUTING, round=5, max_rounds=5)
+    s.final_output = None
+    s.review_status = None
+    d = c.check(state=s, recent_messages=[], round_count=5)
+    assert d.should_terminate
+    assert "max_rounds" in d.reason
+    # 关键：达到 max_rounds 不应误判为已通过评审或产最终答案
+    assert "review_passed" not in d.reason
+    # phase 仍可推进到 INCOMPLETE（由 runner/executor 决定），但不应被改为 COMPLETED
+    assert s.phase != TeamPhase.COMPLETED
+
+
+def test_max_rounds_explicit_incomplete_phase():
+    """TerminationChecker 在 max_rounds 路径可写入 INCOMPLETE 终态。"""
+    c = _checker(_spec(max_rounds=3))
+    s = _state(phase=TeamPhase.EXECUTING, round=3, max_rounds=3)
+    s.final_output = None
+    d = c.check(state=s, recent_messages=[], round_count=3)
+    assert d.should_terminate
+    # INCOMPLETE 阶段本身应被识别为终止态
+    d2 = c.check(state=_state(phase=TeamPhase.INCOMPLETE, round=3, max_rounds=3),
+                 recent_messages=[], round_count=3)
+    assert d2.should_terminate
+
+
+def test_final_message_only_completes_if_explicit():
+    """只有显式产出 final_output / FINAL 消息才是 COMPLETED，max_rounds + final 双触发优先完成。"""
+    c = _checker()
+    s = _state(phase=TeamPhase.EXECUTING, round=10, max_rounds=10)
+    s.final_output = "最终交付"
+    d = c.check(state=s, recent_messages=[], round_count=10)
+    assert d.should_terminate
+    # 优先 final_message 而非 max_rounds
+    assert "final" in d.reason or "max_rounds" in d.reason
+

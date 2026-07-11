@@ -8,9 +8,14 @@
 4. 与现有 TeamRunner.run() 并存：原同步主循环继续作为简单路径使用；
    -run_via_graph() 走 LangGraph 执行模型，可中断 / 可恢复 / 可观测
 
-注意：本模块不取代 TeamRunner.run() 业务逻辑——节点内部仍调用 TeamRunner 的私有方法。
-LangGraph 只提供执行外壳（状态机 + checkpoint）。这样既满足"LangGraph 负责状态图与
-checkpoint、DeepAgents 负责单 Agent 深度执行"的架构分层，又不重写业务逻辑。
+注意（Req 10）：
+- 本模块是**实验性**组件，**未接入 API 与 CLI**
+- node_run_speaker 内部通过 TeamRoundExecutor.execute_round() 与 TeamRunner.run()
+  共享同一套单轮业务逻辑（Req 3 → 与 Test req 9 等价性验证确认）
+- checkpoint 恢复逻辑仍需更多实机验证；Node-level round 递增 / 传播通过 dict reducer
+  全量传递，后续若改用 Annotated reducer（operator.add）需注意 round 不重复累加
+- HITL 中断节点（node_hitl_wait）使用了 langgraph.types.interrupt，但尚未与
+  HITL 端点对接——属于"结构预留"而非已生效的主路径
 
 失败容忍策略：
 - LangGraph 不可用（缺包等）→ 退化为同步主循环（已有 TeamRunner.run）
@@ -24,6 +29,7 @@ from datetime import datetime
 from typing import Any
 
 from app.core.logging import logger
+from app.multiagent.state import TeamPhase
 
 try:  # pragma: no cover - 由环境决定
     from langgraph.graph import StateGraph, END
@@ -69,99 +75,162 @@ class TeamGraphRunner:
     # 每个节点接收 GraphState，返回 GraphState 增量；TeamRunner 私有方法承担业务逻辑。
 
     def node_select_speaker(self, state: GraphState) -> GraphState:
-        """节点 1：选择本轮 speaker。"""
+        """节点 1：递增轮次计数。
+
+        本节点不再调用 SpeakerSelector.select——因为 node_run_speaker 内部
+        已通过 TeamRoundExecutor.execute_round() 完成 select + run + publish +
+        process_actions + termination 整条链路（与 TeamRunner.run() 主循环一致）。
+        若在此处再次 select，会导致选择冲突（double select），破坏与 TeamRunner
+        的等价性（Test req 9）。
+
+        轮次在此递增后传给 execute_round，保证 checkpoint 中保存正确轮次。
+        """
         try:
+            # 每轮递增一次（保证 checkpoint 中保存正确轮次）
+            _round = state.get("round", 0) + 1
+
             if not self.runner.room or not getattr(self.runner, "selector", None):
                 return {
                     "speaker": None,
-                    "round": state.get("round", 0),
+                    "round": _round,
                     "termination_reason": "no_speaker",
                     "hitl_pending": False,
                 }
-            speaker = self.runner.selector.select(
-                agents=self.runner.room.agents,
-                state=self.runner.room.state,
-                inbox=None,
-            )
+
+            # 若 room.state 不可用（测试 mock 路径），返回空 speaker
+            if self.runner.room.state is None:
+                return {
+                    "speaker": None,
+                    "round": _round,
+                    "termination_reason": "no_state",
+                    "hitl_pending": False,
+                }
+
+            self.runner.room.state.current_round = _round
+
+            # 不选 speaker——execute_round 内部会选
+            # 注意：必须传播 last_speaker / last_messages，否则 dict reducer 会擦除它们
             return {
-                "speaker": speaker.name if speaker else None,
-                "round": state.get("round", 0),
+                "speaker": None,  # 让 execute_round 自己选
+                "round": _round,
+                "last_speaker": state.get("last_speaker"),
+                "last_messages": state.get("last_messages", []),
                 "hitl_pending": False,
-                "termination_reason": None if speaker else "no_speaker",
+                "termination_reason": None,
             }
         except Exception as exc:
             logger.error(f"[TeamGraph] node_select_speaker failed: {exc}")
-            return {"error": str(exc), "termination_reason": str(exc), "round": state.get("round", 0)}
+            return {"error": str(exc), "termination_reason": str(exc), "round": state.get("round", 0) + 1}
 
     def node_run_speaker(self, state: GraphState) -> GraphState:
-        """节点 2：调用 AgentRuntimeAdapter 跑 speaker。"""
-        if not self.runner.room or not self.runner.adapter:
-            return {"termination_reason": "no_room_or_adapter"}
-        speaker_name = state.get("speaker")
-        _round = state.get("round", 0)
-        if not speaker_name:
-            return {"termination_reason": "no_speaker", "round": _round}
-        speaker = next((a for a in self.runner.room.agents if a.name == speaker_name), None)
-        if not speaker:
-            return {"termination_reason": "speaker_not_found", "round": _round}
-        try:
-            from app.multiagent.inbox import AgentInbox
-            from app.multiagent.messages import make_message_id, AgentMessage, MessageType
+        """节点 2：完整执行本轮（通过 execute_round）。
 
-            store = self.runner.store
-            room_id = self.runner.room_id
-            # 用 AgentInbox 的正确签名：store + room_id + task_id
-            inbox = AgentInbox(store=store, room_id=room_id, task_id=self.runner.task_id or self.runner.room.task_id or "")
-            unread = inbox.list_unread(speaker.name)
-            inbox_context = inbox.get_relevant_context(speaker.name)
-            prompt = self.runner.adapter.build_system_prompt(
-                agent=speaker,
-                shared_state=self.runner.room.state,
-                inbox_context=inbox_context,
-                team_agents=self.runner.room.agents,
+        Req 3 等价性约束：调用 TeamRoundExecutor.execute_round()，与
+        TeamRunner.run() 主循环走**同一份**单轮业务逻辑。
+
+        last_speaker 传递策略：
+        - graph 状态 dict 中的 round 已通过所有显式返回修复保留，但 last_speaker
+          仍会被 LangGraph 默认 dict reducer 擦除（部分节点不返回此键）。
+        - 故优先使用 state.get("last_speaker")，若无则回退到 runner._last_speaker
+          （主循环持久持有的跟踪变量），确保 selector 看到正确的历史发言人。
+        """
+        _round = state.get("round", 0)
+        if not self.runner.room or not self.runner.adapter:
+            return {"actions": [], "round": _round, "termination_reason": "no_room_or_adapter"}
+        try:
+            if not self.runner.round_executor:
+                self.runner._init_executor()
+            if self.runner.round_executor is None:
+                return {"actions": [], "round": _round, "termination_reason": "no_executor"}
+
+            # 优先 state 中的历史，若无则回退 runner._last_speaker（主循环同步值）
+            effective_last_speaker = state.get("last_speaker") or self.runner._last_speaker
+            effective_last_messages = state.get("last_messages") or self.runner._last_messages or []
+
+            result = self.runner.round_executor.execute_round(
+                round_number=_round,
+                last_speaker=effective_last_speaker,
+                last_messages=effective_last_messages,
+                cancel_check=True,
             )
-            actions = self.runner.adapter.run(
-                agent=speaker,
-                inbox_messages=unread,
-                shared_state=self.runner.room.state,
-            )
-            return {"actions": actions, "round": _round}
+
+            # 同步 TeamRunner 主循环持有的跟踪状态，供下一轮选择使用
+            self.runner._last_speaker = (result.speaker.name if result.speaker
+                                         else effective_last_speaker)
+            self.runner._last_messages = result.produced_messages
+
+            return {
+                "actions": result.actions,
+                "messages": result.produced_messages,
+                "round": _round,
+                "last_speaker": self.runner._last_speaker,
+                "last_messages": result.produced_messages,
+                "termination_reason": result.termination_reason,
+                "should_terminate": result.should_terminate,
+            }
         except Exception as exc:
             logger.error(f"[TeamGraph] node_run_speaker failed: {exc}")
             return {"error": str(exc), "round": _round}
 
     def node_process_actions(self, state: GraphState) -> GraphState:
-        """节点 3：把 actions 转 messages publish + 更新 SharedTeamState。"""
-        actions = state.get("actions", [])
+        """节点 3：no-op passthrough，但传播 round/messages。
+
+        历史背景：早期 graph 自带一套 _process_actions 副本"做深层护栏 + 持久化"。
+        Req 3 抽 TeamRoundExecutor 后这一步已由 node_run_speaker 内部的
+        execute_round() 完成（_process_actions / save_state / 持久化轮次记录）。
+        若本节点再次调用 _process_actions，会造成状态被双重处理 → 详情计数翻倍、
+        review_result 闭环被重复触发，是等价性破裂的直接根因。
+
+        保留节点壳是为了 graph 拓扑可读性（select → run → process → decide），
+        但本节点不再产生副作用。
+
+        注意（LangGraph dict reducer）：StateGraph(dict) 默认按节点输出替换整状态，
+        故本节点必须显式传播 round / messages，否则后续节点丢失之。
+        """
         _round = state.get("round", 0)
-        if not actions or not self.runner.room:
-            return {"messages": [], "round": _round}
-        try:
-            speaker_name = state.get("speaker", "")
-            # 借助 TeamRunner._process_actions（已含深层护栏）
-            self.runner._process_actions(speaker_name, actions)
-            # messages 不在这里 emit，由 TeamRunner 的 emitter 统一负责
-            return {"round": _round, "messages": []}
-        except Exception as exc:
-            logger.error(f"[TeamGraph] node_process_actions failed: {exc}")
-            return {"error": str(exc), "round": _round}
+        return {"round": _round, "messages": state.get("messages", [])}
 
     def node_decide_terminate(self, state: GraphState) -> GraphState:
-        """节点 4：终止判断。返回 {'continue': True/False, 'termination_reason': ...}。"""
+        """节点 4：终止判断。返回 {'continue': True/False, 'termination_reason': ...}。
+
+        优先采用 execute_round 已得到的 should_terminate（节点 2 内已调用
+        TerminationChecker），避免图再次"独立判断一次"导致与主循环语义分裂。
+        若 run 节点未给出明确终止信号，再 fallback 到一次 TerminationChecker.check，
+        并补上 max_rounds 上限保护。
+        """
         try:
+            # 1. 优先尊重 executor 的判断（与 TeamRunner.run() 主循环等价）
+            if state.get("should_terminate"):
+                reason = state.get("termination_reason") or "terminated"
+                return {
+                    "continue": False,
+                    "hitl_pending": False,
+                    "termination_reason": reason,
+                    "round": state.get("round", 0),
+                    "messages": state.get("messages", []) or [],
+                }
+
+            # 2. 否则补一次独立判断（用于非典型路径，如 max_rounds）
             decision = self.runner.termination_checker.check(
                 state=self.runner.room.state,
-                recent_messages=[],
+                recent_messages=state.get("messages", []) or [],
                 round_count=state.get("round", 0),
             )
-            should_continue = not decision.should_terminate and state.get("round", 0) < self.runner.room.state.max_rounds
+            should_continue = (
+                not decision.should_terminate
+                and state.get("round", 0) < self.runner.room.state.max_rounds
+            )
             return {
                 "continue": should_continue,
+                "hitl_pending": False,
                 "termination_reason": decision.reason if decision.should_terminate else None,
+                "round": state.get("round", 0),
+                "messages": state.get("messages", []) or [],
             }
         except Exception as exc:
             logger.error(f"[TeamGraph] node_decide_terminate failed: {exc}")
-            return {"continue": False, "termination_reason": str(exc)}
+            return {"continue": False, "termination_reason": str(exc),
+                    "round": state.get("round", 0)}
 
     def node_hitl_wait(self, state: GraphState) -> GraphState:
         """可选节点：HITL 等待。若 state.hitl_pending=True 则 interrupt；否则直通。
@@ -253,8 +322,17 @@ class TeamGraphRunner:
             except Exception as exc:
                 logger.error(f"[TeamGraph] fallback run failed: {exc}")
             state_obj = getattr(self.runner.room, "state", None) if self.runner.room else None
+            # 根据终止原因确定准确状态
+            status = "completed"
+            if state_obj:
+                if state_obj.phase == TeamPhase.INCOMPLETE:
+                    status = "failed"
+                elif state_obj.phase == TeamPhase.FAILED:
+                    status = "failed"
+                elif state_obj.phase == TeamPhase.CANCELLED:
+                    status = "cancelled"
             return {
-                "status": "completed",
+                "status": status,
                 "thread_id": resume_thread_id or self.runner.room_id,
                 "rounds": state_obj.current_round if state_obj else 0,
                 "final_output": state_obj.final_output if state_obj else None,
@@ -273,10 +351,15 @@ class TeamGraphRunner:
         # 让 TeamRunner 先进入主循环前置（构造 room / 发初始 user_request / 进入 PLANNING）
         # 我们假定调用方已先调用 runner.run 的准备工作（或Compile 不重头做）
         # 这里直接 invoke graph
+        # 设定合理的递归上限：每轮 4 个节点 + 安全裕量
+        recursion_limit = max(max_rounds_cap * 5 + 10, 50)
         try:
             final = self.graph.invoke(
                 initial_state,
-                config={"configurable": {"thread_id": thread_id}},
+                config={
+                    "configurable": {"thread_id": thread_id},
+                    "recursion_limit": recursion_limit,
+                },
             )
             # 安全上限自检
             rounds = final.get("round", 0)
@@ -284,7 +367,27 @@ class TeamGraphRunner:
                 logger.warning(f"[TeamGraph] 达到安全上限 {max_rounds_cap}，强制停止")
 
             status = "interrupted" if final.get("hitl_pending") else "completed"
-            if final.get("termination_reason") == "no_speaker":
+            term_reason = final.get("termination_reason")
+            # 归一化：execute_round 期间触发 cancel() 后 TerminationChecker 可能返回
+            # phase_already_cancelled，统一回退到 cancel_requested 以保持与 TeamRunner
+            # 主循环一致的语义（避免两个路径 cancellation 字符串分裂）。
+            state_obj_pre = getattr(self.runner.room, "state", None) if self.runner.room else None
+            if state_obj_pre and state_obj_pre.phase == TeamPhase.CANCELLED:
+                if term_reason in (None, "phase_already_cancelled"):
+                    term_reason = "cancel_requested"
+
+            if term_reason == "no_speaker":
+                status = "failed"
+            elif term_reason == "cancel_requested":
+                status = "cancelled"
+
+            state_obj = state_obj_pre
+            # 优先以 SharedTeamState.phase 为准（cancel 后已置 CANCELLED）
+            if state_obj and state_obj.phase == TeamPhase.CANCELLED:
+                status = "cancelled"
+            elif state_obj and state_obj.phase == TeamPhase.INCOMPLETE:
+                status = "failed"
+            elif state_obj and state_obj.phase == TeamPhase.FAILED:
                 status = "failed"
 
             state_obj = getattr(self.runner.room, "state", None) if self.runner.room else None
@@ -293,7 +396,7 @@ class TeamGraphRunner:
                 "thread_id": thread_id,
                 "rounds": rounds,
                 "final_output": state_obj.final_output if state_obj else None,
-                "termination_reason": final.get("termination_reason"),
+                "termination_reason": term_reason,
                 "hitl_pending": final.get("hitl_pending", False),
             }
         except Exception as exc:

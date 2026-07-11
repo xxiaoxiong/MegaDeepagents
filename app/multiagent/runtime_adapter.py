@@ -1,16 +1,17 @@
 """AgentRuntimeAdapter：复用现有 DeepAgents 能力作为每个 TeamAgent 的执行内核。
 
 设计原则：
-1. AgentRuntimeAdapter.run(agent_spec, inbox_messages, shared_state, ...) → list[AgentMessage]
+1. AgentRuntimeAdapter.run(agent_spec, inbox_messages, shared_state, ...) → list[actions]
 2. 内部调用现有 build_model() 为每个 Agent 创建 LLM 实例
 3. 加入 Agent 级工具白名单拦截：按 AgentSpec.allowed_tools 过滤注册的工具
 4. 加入 Agent 级 action 类型白名单拦截：按 AgentSpec.allowed_actions 过滤 action 类型
 5. 要求 Agent 输出结构化 JSON（actions），不可自由输出无法解析的大段文本
 6. 解析失败时走 fallback（包装为 observation 消息）
 
-注意：实际运行时，由于每个 Agent 都是同一个 model + tools + backend 的 DeepAgent，
-所以运行时适配器返回的是"预构造的响应"，而非真正的独立 LLM 调用。
-在初期实现中，AgentRuntimeAdapter 响应由 prompt 驱动，不使用独立的第三方模型调用。
+注意：每个 Agent 使用相同的底层模型实例，但通过不同的 system prompt（角色/目标/权限）
+和 filtered inbox 来差异化行为。action_guard 中的 get_effective_allowed_actions 确保
+每个角色只产出自己职责范围内的 action 类型。AgentRuntimeAdapter 通过 JSON schema
+约束 LLM 输出，配合多级 fallback 重试，提高结构化产出的稳定性。
 """
 
 from __future__ import annotations
@@ -156,6 +157,11 @@ class AgentRuntimeAdapter:
         parts.append("## 你的收件箱")
         parts.append(inbox_context or "(无新消息)")
 
+        # B3: Agent 跨任务记忆回顾
+        memory_context = self._build_memory_context(agent)
+        if memory_context:
+            parts.append(memory_context)
+
         # 输出格式
         parts.append(
             "## 输出要求\n"
@@ -180,6 +186,45 @@ class AgentRuntimeAdapter:
         )
 
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _build_memory_context(agent: AgentSpec, query: str | None = None) -> str:
+        """从 LayeredMemorySystem 检索该 Agent 的跨任务记忆，生成 prompt 片段。
+
+        跳过条件：无 private_memory_scope、无 store 后端、store 暂不可用。
+        返回空字符串表示"不插入记忆上下文"（prompt 长度与向后兼容均不受影响）。
+        """
+        scope = getattr(agent, "private_memory_scope", None) or getattr(agent, "name", None)
+        if not scope:
+            return ""
+        try:
+            from app.multiagent.layered_memory import get_layered_memory, MemoryTier
+            memory = get_layered_memory()
+            semantic_hits = memory.retrieve(
+                MemoryTier.SEMANTIC, query or agent.goal,
+                agent_scope=scope, limit=3,
+            )
+            procedural_hits = memory.retrieve(
+                MemoryTier.PROCEDURAL, query or agent.goal,
+                agent_scope=scope, limit=3,
+            )
+            lines: list[str] = []
+            if semantic_hits:
+                lines.append(
+                    "## 你以往积累的知识\n"
+                    + "\n".join(f"- {e.content[:200]}" for e in semantic_hits)
+                )
+            if procedural_hits:
+                lines.append(
+                    "## 你以往的方法经验（SOP）\n"
+                    + "\n".join(f"- {e.content[:200]}" for e in procedural_hits)
+                )
+            if not lines:
+                return ""
+            return "\n\n".join(lines)
+        except Exception:
+            # memory 不可用时静默跳过，不干扰 prompt
+            return ""
 
     def run(
         self,

@@ -41,6 +41,7 @@ from app.multiagent.agent_spec import AgentSubscription
 def _make_store(tmp_path) -> MultiAgentStore:
     import app.core.config as cfg
     import app.multiagent.store as ma_store
+    ma_store.close_connection()
     cfg.settings.sqlite_path = str(tmp_path / "complex.sqlite3")
     return ma_store.MultiAgentStore()
 
@@ -56,6 +57,7 @@ def _make_bus(store, agents) -> MessageBus:
 
 
 @pytest.mark.asyncio
+@pytest.mark.live_model
 async def test_software_dev_full_flow_real_llm(tmp_path):
     """真实 LLM 驱动软件开发全流程：Planner→Coder→Tester→ReviewerAgent→Finalizer
 
@@ -150,9 +152,9 @@ async def test_software_dev_full_flow_real_llm(tmp_path):
 # ============================================================
 
 
-def test_routing_blackhole_fallback_to_broadcast(tmp_path):
+def test_routing_blackhole_rejected_by_default(tmp_path):
     """LLM 写 to_agent=GhostAgent（团队中不存在）：
-    验证 bus 检测到未知 agent → fallback broadcast → Coder 真实收到。
+    验证 bus 默认拒绝未知 agent，写入 dead-letter，不广播。
     """
     store = _make_store(tmp_path)
     agents = SOFTWARE_DEV_TEAM.agents
@@ -172,21 +174,51 @@ def test_routing_blackhole_fallback_to_broadcast(tmp_path):
     )
     bus.publish(msg)
 
-    # Coder 应通过 fallback broadcast 收到这条 PLAN（Coder 订阅了 PLAN from Planner）
+    # Coder 不应收到（默认拒绝，不广播）
     coder_inbox = store.get_agent_unread_inbox("test_room", "Coder")
-    assert len(coder_inbox) >= 1, (
-        f"Coder 应通过 fallback 收到 PLAN 消息。实际 inbox={len(coder_inbox)}"
-    )
-    received_types = [m.message_type for m in coder_inbox]
-    assert MessageType.PLAN in received_types, (
-        f"Coder 收到的消息类型应包含 PLAN。实际：{received_types}"
+    assert len(coder_inbox) == 0, (
+        f"默认拒绝策略下 Coder 不应通过 fallback 收到 PLAN。实际 inbox={coder_inbox}"
     )
 
-    # 验证 metadata.routing_fallback 标记被设置
-    assert msg.metadata.get("routing_fallback") is True, (
-        f"消息应被标记 routing_fallback=True。实际 metadata={msg.metadata}"
+    # 验证 metadata.routing_rejected 标记被设置
+    assert msg.metadata.get("routing_rejected") is True, (
+        f"消息应被标记 routing_rejected=True。实际 metadata={msg.metadata}"
     )
     assert msg.metadata.get("routing_original_to") == ["GhostAgent"]
+
+    # dead-letter 应包含此消息
+    dead = bus.get_dead_letters()
+    assert len(dead) == 1
+    assert dead[0].to_agent == "GhostAgent"
+
+
+def test_routing_blackhole_fallback_when_enabled(tmp_path):
+    """显式启用 allow_broadcast_fallback=True 时，未知 agent 才回退广播。"""
+    from app.multiagent.bus import MessageBus
+    store = _make_store(tmp_path)
+    agents = SOFTWARE_DEV_TEAM.agents
+    bus = MessageBus(
+        room_id="test_room", task_id="test_task",
+        agents=agents, store=store,
+        allow_broadcast_fallback=True,
+    )
+
+    msg = AgentMessage(
+        id=make_message_id(),
+        task_id="test_task",
+        room_id="test_room",
+        from_agent="Planner",
+        to_agent="GhostAgent",
+        visibility=MessageVisibility.DIRECT,
+        message_type=MessageType.PLAN,
+        content="给幽灵 agent 的 plan",
+        cause_by="send_message",
+    )
+    bus.publish(msg)
+
+    coder_inbox = store.get_agent_unread_inbox("test_room", "Coder")
+    assert len(coder_inbox) >= 1, "Coder 应通过 fallback broadcast 收到 PLAN"
+    assert msg.metadata.get("routing_fallback") is True
 
 
 def test_unknown_message_type_normalized(tmp_path):

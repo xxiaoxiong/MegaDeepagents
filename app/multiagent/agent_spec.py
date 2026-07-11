@@ -127,6 +127,17 @@ class TeamSpec(BaseModel):
     review_required: bool = Field(default=True, description="是否需要评审环节")
     max_review_cycles: int = Field(default=3, ge=0, le=20, description="最大评审返工次数")
 
+    # B2: 异步并行执行
+    max_concurrent_agents: int = Field(
+        default=1,
+        ge=1,
+        le=8,
+        description=(
+            "单轮最多同时执行的 Agent 数。=1 为默认串行模式（与原行为完全一致）；"
+            ">1 时在 EXECUTING / DISCUSSING 阶段允许多个 Agent 并行跑 LLM。"
+        ),
+    )
+
     def get_agent_names(self) -> list[str]:
         return [a.name for a in self.agents]
 

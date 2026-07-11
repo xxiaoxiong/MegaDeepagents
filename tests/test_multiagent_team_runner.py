@@ -27,6 +27,7 @@ from app.multiagent.store import get_multiagent_store, MultiAgentStore
 # ===== AgentRuntimeAdapter 单独集成测试 =====
 
 
+@pytest.mark.live_model
 def test_adapter_call_llm_returns_actions():
     """验证 AgentRuntimeAdapter._call_llm 能调用真实 LLM 并返回有效 actions。"""
     adapter = AgentRuntimeAdapter(task_id="test_llm", room_id="test_llm")
@@ -78,6 +79,7 @@ def fresh_store(tmp_path):
     ma_store.close_connection()
 
 
+@pytest.mark.live_model
 def test_team_runner_real_llm_two_rounds(fresh_store):
     """TeamRunner 运行 2 轮，验证全部链路正常。
 
@@ -206,6 +208,7 @@ def test_team_runner_real_llm_two_rounds(fresh_store):
     logger.info(f"集成测试完成：{len(msgs)} 条消息, {len(rounds)} 轮, phase={state.phase.value}")
 
 
+@pytest.mark.live_model
 def test_adapter_planner_produces_plan_action():
     """Planner Agent 应产出规划类动作（update_state 或 send_message）。"""
     adapter = AgentRuntimeAdapter(task_id="test_llm2", room_id="test_llm2")
@@ -230,6 +233,7 @@ def test_adapter_planner_produces_plan_action():
     logger.info(f"Planner actions:\n{json.dumps(actions, ensure_ascii=False, indent=2)}")
 
 
+@pytest.mark.live_model
 def test_adapter_actions_can_roundtrip(tmp_path):
     """验证 actions → AgentMessage → 入库 完整往返。"""
     import app.core.config as cfg

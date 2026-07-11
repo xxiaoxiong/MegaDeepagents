@@ -33,10 +33,60 @@ from app.multiagent.messages import (
 )
 
 
+# 显式别名表：覆盖 LLM 常用变体到规范名的确定性映射。
+# 任何不在此表、且经后缀规则也不命中的目标都视为未知（dead-letter 或 fallback）。
+EXPLICIT_ALIASES: dict[str, str] = {
+    "DeveloperAgent": "Coder",
+    "Developer": "Coder",
+    "CodeAgent": "Coder",
+    "Reviewer": "ReviewerAgent",
+    "TestAgent": "Tester",
+    "PlanAgent": "Planner",
+    "FinalizeAgent": "Finalizer",
+    "ResearchAgent": "Researcher",
+}
+
+
+def resolve_alias(target: str, known_agents: set[str] | list[str]) -> str | None:
+    """确定性别名映射（模块级函数，便于单测）。
+
+    规则顺序（先命中先返回）：
+    1. 完全相等
+    2. EXPLICIT_ALIASES 显式表
+    3. 去 'Agent' 后缀后再精确比较
+    4. 加 'Agent' 后缀后再精确比较
+
+    其他情况（包括子串包含、小写包含等模糊匹配）一律视为未知，
+    由调用方按 dead-letter / fallback 策略处理。
+    """
+    known = set(known_agents)
+    if target in known:
+        return target
+    mapped = EXPLICIT_ALIASES.get(target)
+    if mapped and mapped in known:
+        return mapped
+    # 反查：若 target 是某规范名去掉 Agent 后缀的形式
+    if target.endswith("Agent"):
+        stripped = target[: -len("Agent")]
+        if stripped and stripped in known:
+            return stripped
+    candidate = target + "Agent"
+    if candidate in known:
+        return candidate
+    return None
+
+
 class MessageBus:
     """消息总线。不直接依赖 store，但可关联 store 作持久化。
 
     初始化时传入 Agent 列表和 Room ID，以便路由。
+
+    路由策略（V2 - 安全优先）：
+    - DIRECT + 已知 to_agent：准确投递
+    - DIRECT + 已知别名（TesterAgent → Tester）：别名归一化后投递
+    - DIRECT + 未知 to_agent + allow_broadcast_fallback=True：回退广播
+    - DIRECT + 未知 to_agent + allow_broadcast_fallback=False（默认）：拒绝，写入 dead-letter
+    - BROADCAST：按订阅规则匹配
     """
 
     def __init__(
@@ -45,6 +95,7 @@ class MessageBus:
         task_id: str,
         agents: list[AgentSpec],
         store: Any | None = None,
+        allow_broadcast_fallback: bool = False,
     ):
         self.room_id = room_id
         self.task_id = task_id
@@ -53,7 +104,9 @@ class MessageBus:
             a.name: a.get_subscription() for a in agents
         }
         self.store = store
+        self.allow_broadcast_fallback = allow_broadcast_fallback
         self._transcript: list[AgentMessage] = []
+        self._dead_letters: list[AgentMessage] = []
 
     def get_all_agent_names(self) -> list[str]:
         return list(self._agents.keys())
@@ -118,31 +171,12 @@ class MessageBus:
 
         known_agents = set(self._agents.keys())
 
-        # 别名归一化：LLM 常用 "TesterAgent"/"DeveloperAgent" 等，
-        # 如果在已知名字基础上加减 "Agent"/"er" 后缀能匹配到真实 agent，则重写
+        # 确定性别名归一化（不再使用 'ka in t' 这类模糊子串匹配）
         normalized_targets: list[str] = []
         aliases_used = False
         for t in targets:
-            if t in known_agents:
-                normalized_targets.append(t)
-                continue
-            # 尝试常见 LLM 命名偏差：去掉或加上 "Agent" 后缀
-            candidate = t
-            matched = None
-            for ka in known_agents:
-                if ka in t or t in ka:
-                    matched = ka
-                    break
-                ka_no_suffix = ka.replace("Agent", "")
-                t_no_suffix = t.replace("Agent", "")
-                if ka_no_suffix and t_no_suffix and (ka_no_suffix == t_no_suffix):
-                    matched = ka
-                    break
-                # 角色名小写匹配
-                if ka.lower() in t.lower() or t.lower() in ka.lower():
-                    matched = ka
-                    break
-            if matched:
+            matched = resolve_alias(t, known_agents)
+            if matched and matched != t:
                 normalized_targets.append(matched)
                 aliases_used = True
                 logger.info(
@@ -161,19 +195,38 @@ class MessageBus:
         known = [t for t in normalized_targets if t in known_agents]
 
         if unknown:
-            logger.warning(
-                f"[MessageBus] direct message {message.id} to unknown agent(s): {unknown}. "
-                f"Known agents: {list(known_agents)}. Falling back to broadcast routing."
-            )
-            if not message.metadata:
-                message.metadata = {}
-            message.metadata["routing_fallback"] = True
-            message.metadata["routing_original_to"] = targets
-            self._route_to_subscribers(message)
-            return
+            # 未知 agent 路由：根据策略回退广播或写 dead-letter
+            if self.allow_broadcast_fallback:
+                logger.warning(
+                    f"[MessageBus] direct message {message.id} to unknown agent(s): {unknown}. "
+                    f"Known agents: {list(known_agents)}. Falling back to broadcast routing."
+                )
+                if not message.metadata:
+                    message.metadata = {}
+                message.metadata["routing_fallback"] = True
+                message.metadata["routing_original_to"] = targets
+                self._route_to_subscribers(message)
+                return
+            else:
+                # 默认安全策略：拒绝投递到未知 agent，写入 dead-letter 队列
+                logger.warning(
+                    f"[MessageBus] REJECTED direct message {message.id} to unknown agent(s): {unknown}. "
+                    f"Known agents: {list(known_agents)}. Routed to dead-letter."
+                )
+                if not message.metadata:
+                    message.metadata = {}
+                message.metadata["routing_rejected"] = True
+                message.metadata["routing_original_to"] = targets
+                message.metadata["unknown_agents"] = unknown
+                self._dead_letters.append(message)
+                return
 
         for name in normalized_targets:
             self._deliver_to_inbox(name, message)
+
+    def get_dead_letters(self) -> list[AgentMessage]:
+        """返回被拒绝投递的消息列表（用于诊断 / 审计 / 测试）。"""
+        return list(self._dead_letters)
 
     def _deliver_to_all(self, message: AgentMessage) -> None:
         """system visibility：投递给所有 Agent。"""

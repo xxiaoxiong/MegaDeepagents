@@ -93,7 +93,7 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8081 --reload
 | **conflict_resolver.py** | 冲突裁决规则引擎（Reviewer 否决 / Planner 路线 / 安全优先 / 谁产谁修）+ 兜不住升级 HITL |
 | **layered_memory.py** | 四层记忆原型（Working/Episodic/Semantic/Procedural），进程内 dict 实现 |
 | **bus.py** | 消息路由总线；direct 只投 to_agent（含别名归一化 DeveloperAgent→Coder 等）、broadcast 按 subscription、system 投所有 Agent |
-| **team_graph.py** | LangGraph 可恢复状态图（4 节点 + HITL 中断节点 + SqliteSaver） |
+| **team_graph.py** | LangGraph 版可恢复状态图骨架（**实验性**）：4 节点（init / select_speaker / process_actions / termination_check）+ HITL 中断节点 + SqliteSaver。**未接入 API 与 CLI**；与 TeamRunner.run() 共享 TeamRoundExecutor 单轮组件而非重复实现业务逻辑。checkpoint 恢复逻辑仍需更多实机验证，请勿在已知负载下作强一致恢复使用 |
 | **room.py** | 多 Agent 任务环境（MessageBus + Inbox + SharedTeamState） |
 | **inbox.py** | 私有收件箱 + 相关上下文优先排序 + summarize_old_messages |
 | **termination.py** | 6 种终止策略（max_rounds / review_passed / stale_no_progress / stale_no_op / final_message / error_message ...） |

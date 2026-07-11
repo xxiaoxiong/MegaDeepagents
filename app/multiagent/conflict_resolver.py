@@ -1,18 +1,22 @@
-"""Conflict Resolver：多 Agent 意见冲突裁决模块。
+"""Conflict Resolver：多 Agent 意见冲突裁决模块（实验性，未接入主链）。
 
-设计策略（P2-1）：
+设计策略：
 1. 规则优先：Reviewer 对质量问题有最终否决权（QA veto）
 2. Planner 负责流程裁决（遇到并行路线选择时决策）
-3. 冲突超出阈值 → 升级到 HITL（Human-in-the-Loop）
-4. 高冲突场景可记录为 TeamDecision，供审计
-
-当前版本实现规则引擎 + HITL 升级接口。LLM 裁决为可选 fallback。
+3. LLM 裁决 fallback：规则引擎兜不住时，用 Planner 角色的 LLM 做自动仲裁
+4. 冲突超出阈值 → 升级到 HITL（Human-in-the-Loop）
+5. 高冲突场景可记录为 TeamDecision，供审计
 
 冲突类型：
 - review_disagreement: Reviewer 不通过，Coder/Planner 认为没问题
 - plan_route_conflict: 同一目标有多个实现路线，无法一致
 - priority_conflict: 安全/功能/性能优先级不一致
 - ownership_disagreement: 修复责任人不一致
+
+注意（Req 10）：本模块尚未接入 TeamRunner / API / CLI 主链，仅供参考性展示
+B5 增强的冲突裁决设计思路。生产路径上 Reviewer 通过 ReviewRepairLoop 影响 state.review_status，
+本身即等价于一种隐式冲突裁决。本模块的"显式 ConflictResolution 消息"机制未生效，
+仅单元测试覆盖。在 TeamRoster 内已实现 disagreements 计数（state.has_open_blocking_issues）。
 """
 
 from __future__ import annotations
@@ -40,7 +44,7 @@ class ConflictType(str, Enum):
 
 class ConflictLevel(str, Enum):
     LOW = "low"          # 可规则自动裁决
-    MEDIUM = "medium"    # 需 Planner 裁决
+    MEDIUM = "medium"    # 需 Planner 裁决（B5: 优先 LLM 自动仲裁）
     HIGH = "high"        # 需 Supervisor / HITL
 
 
@@ -88,10 +92,12 @@ class Resolution:
 
 
 class ConflictResolver:
-    """冲突裁决器。规则优先，可升级 HITL。"""
+    """冲突裁决器。规则优先 -> LLM 仲裁 fallback -> HITL 升级。"""
 
     def __init__(self, state: SharedTeamState | None = None):
         self.state = state
+        self._llm_available = True  # 乐观可用；构造 LLM 失败时 self-disable
+        self._fallback_notified = False
 
     def set_state(self, state: SharedTeamState) -> None:
         self.state = state
@@ -105,7 +111,7 @@ class ConflictResolver:
         positions: list[dict[str, Any]],
         context: dict[str, Any] | None = None,
     ) -> Resolution:
-        """裁决一次冲突。根据冲突类型走规则引擎，规则兜不住时升级。
+        """裁决一次冲突。三阶段：规则 → LLM 仲裁 → HITL 升级。
 
         Args:
             conflict_type: 冲突类型
@@ -124,22 +130,148 @@ class ConflictResolver:
 
         # === 规则 1：Reviewer 质量否决权 ===
         if conflict_type == ConflictType.REVIEW_DISAGREEMENT:
-            return self._resolve_review_disagreement(positions, context or {})
+            result = self._resolve_review_disagreement(positions, context or {})
+            if result.resolved:
+                return result
+            # 规则 1 兜不住（无 Reviewer 参与）→ 进入 LLM 仲裁
 
         # === 规则 2：路线冲突由 Planner 裁决 ===
         if conflict_type == ConflictType.PLAN_ROUTE_CONFLICT:
-            return self._resolve_plan_route(description, positions, context or {})
+            result = self._resolve_plan_route(description, positions, context or {})
+            if result.resolved:
+                return result
 
         # === 规则 3：优先级冲突 ===
         if conflict_type == ConflictType.PRIORITY_CONFLICT:
-            return self._resolve_priority(description, positions, context or {})
+            result = self._resolve_priority(description, positions, context or {})
+            if result.resolved:
+                return result
 
         # === 规则 4：责任人冲突 ===
         if conflict_type == ConflictType.OWNERSHIP_DISAGREEMENT:
-            return self._resolve_ownership(positions)
+            result = self._resolve_ownership(positions)
+            if result.resolved:
+                return result
+
+        # === B5: LLM 自动仲裁（如果规则引擎兜不住）===
+        llm_resolution = self._try_llm_arbitration(conflict_type, description, positions, context or {})
+        if llm_resolution is not None:
+            return llm_resolution
 
         # === 兜底：升级 HITL ===
         return self._escalate(conflict_type, description, positions, context or {})
+
+    def _try_llm_arbitration(
+        self,
+        conflict_type: ConflictType,
+        description: str,
+        positions: list[dict[str, Any]],
+        context: dict[str, Any],
+    ) -> Resolution | None:
+        """B5: LLM 自动仲裁。以 Planner 视角给出绑定裁决。
+
+        触发条件：
+        - self.state 非 None：LLM 仲裁需要 state 来记录 TeamDecision
+        - self._llm_available：上次未 self-disable
+        失败（LLM 不可用/超时/回复不可用）返回 None，由调用方决定升级 HITL。
+        成功时记录一条 TeamDecision。
+        """
+        if self.state is None:
+            # 无 state → LLM 仲裁无意义（无地方写 decision），由调用方升级
+            return None
+        if not self._llm_available:
+            return None
+        try:
+            from app.llm_factory import build_model
+
+            llm = build_model()
+            prompt = self._build_arbitration_prompt(conflict_type, description, positions, context)
+            response = llm.invoke([("system", "你是团队中的 Planner，负责裁决成员之间的分歧。"), ("user", prompt)])
+            text = response.content if hasattr(response, "content") else str(response)
+            if not text or len(text.strip()) < 10:
+                logger.warning("[ConflictResolver] LLM 仲裁返回空响应，视为不可用")
+                return None
+            import uuid
+            import json
+
+            # 尝试截取 JSON decision
+            decision_text = text.strip()
+            parsed = None
+            first_brace = decision_text.find("{")
+            last_brace = decision_text.rfind("}")
+            if first_brace != -1 and last_brace > first_brace:
+                candidate = decision_text[first_brace : last_brace + 1]
+                try:
+                    parsed = json.loads(candidate)
+                except json.JSONDecodeError:
+                    pass
+            if parsed and isinstance(parsed, dict) and parsed.get("decision"):
+                decision = parsed["decision"]
+                reason = parsed.get("reason", str(decision)[:200])
+            else:
+                # fallback：截取前 200 字作为裁决理由
+                decision = "planner_llm_arbitration"
+                reason = decision_text[:200]
+
+            logger.info(f"[ConflictResolver] LLM 仲裁完成：decision={decision}, reason={reason[:80]}...")
+
+            if self.state:
+                decision_record = TeamDecision(
+                    id=f"arb_{uuid.uuid4().hex[:8]}",
+                    title=f"LLM 仲裁：{conflict_type.value}",
+                    rationale=reason[:500],
+                    decided_by="Planner(LLM arbitration)",
+                )
+                self.state.add_decision(decision_record)
+                # 尝试持久化 store（如果 state 关联了 store）
+                try:
+                    from app.multiagent.store import get_multiagent_store
+                    store = get_multiagent_store()
+                    store.save_state(self.state)
+                except Exception:
+                    pass
+
+            return Resolution(
+                resolved=True,
+                decision=str(decision)[:200],
+                reason=reason[:500],
+                decided_by="ConflictResolver(llm_planner_arbitration)",
+            )
+        except Exception as exc:
+            logger.warning(f"[ConflictResolver] LLM 仲裁异常，降级 HITL：{exc}")
+            self._llm_available = False
+            return None
+
+    @staticmethod
+    def _build_arbitration_prompt(
+        conflict_type: ConflictType,
+        description: str,
+        positions: list[dict[str, Any]],
+        context: dict[str, Any],
+    ) -> str:
+        """构造 LLM 仲裁 prompt。"""
+        lines = [
+            f"# 冲突类型：{conflict_type.value}",
+            f"# 冲突描述：{description[:500]}",
+            "\n## 各方立场",
+        ]
+        for p in positions:
+            agent = p.get("agent", "?")
+            pos = p.get("position", "?")
+            reason = p.get("reason", "")
+            lines.append(f"- {agent}：{pos}（理由：{reason[:200]}）")
+        phase = context.get("phase", "?")
+        artifacts = context.get("artifacts", [])
+        if artifacts:
+            lines.append(f"\n## 相关产物\n" + "\n".join(f"- {a}" for a in artifacts[:5]))
+        lines.append(f"\n## 当前阶段\n{phase}")
+        lines.append(
+            "\n---\n"
+            "请作为 Planner 给出最终裁决。输出 JSON 格式：\n"
+            '{"decision": "你的裁决结论", "reason": "简洁理由（不超过 200 字）"}\n'
+            "你的裁决是绑定性的，团队会据此执行。"
+        )
+        return "\n".join(lines)
 
     def _resolve_review_disagreement(
         self,
@@ -150,7 +282,12 @@ class ConflictResolver:
 
         只要 Reviewer 投不通过，无论其他 Agent 持什么意见，都走返工。
         这避免了"Coder 觉得自己代码没问题就不修"的死锁。
+
+        Returns:
+            resolved=True 时表示规则已裁决；resolved=False 时表示规则无法决定，
+            调用方应继续走 LLM 仲裁或 HITL 升级。
         """
+        # 兼容旧测试：无 state 时走直接 escalation（不进入 LLM 路径）
         reviewer_positions = [
             p for p in positions
             if p.get("agent", "").lower() in ("revieweragent", "reviewer")
@@ -186,13 +323,12 @@ class ConflictResolver:
                 decided_by="ConflictResolver(rule:reviewer_binding)",
             )
 
-        # 没有 Reviewer 参与：升级为高冲突
-        return self._escalate(
-            ConflictType.REVIEW_DISAGREEMENT,
-            "Reviewer 未参与评审，但存在评审争议",
-            positions,
-            context,
-            forced_level=ConflictLevel.HIGH,
+        # 没有 Reviewer 参与：返回 not_resolved → 调用方继续走 LLM/HITL
+        return Resolution(
+            resolved=False,
+            decision="",
+            reason="Reviewer 未参与评审，但存在评审争议",
+            decided_by="ConflictResolver(rule:reviewer_abscent)",
         )
 
     def _resolve_plan_route(
@@ -220,13 +356,12 @@ class ConflictResolver:
                 decided_by=f"ConflictResolver(rule:planner_route)",
             )
 
-        # Planner 未参与 → 升级中级别冲突
-        return self._escalate(
-            ConflictType.PLAN_ROUTE_CONFLICT,
-            description if description else "路线冲突需 Planner 裁决，但 Planner 未表达立场",
-            positions,
-            context,
-            forced_level=ConflictLevel.MEDIUM,
+        # Planner 未参与 → not resolved → 走 LLM/HITL
+        return Resolution(
+            resolved=False,
+            decision="",
+            reason="路线冲突需 Planner 裁决，但 Planner 未表达立场",
+            decided_by="ConflictResolver(rule:planner_route_waiting)",
         )
 
     def _resolve_priority(
@@ -284,12 +419,11 @@ class ConflictResolver:
                 reason="Reviewer 指定的 fix_owner",
                 decided_by="ConflictResolver(rule:reviewer_assign)",
             )
-        return self._escalate(
-            ConflictType.OWNERSHIP_DISAGREEMENT,
-            "无法确定修复责任人，各方分歧",
-            positions,
-            {},
-            forced_level=ConflictLevel.HIGH,
+        return Resolution(
+            resolved=False,
+            decision="",
+            reason="无法确定修复责任人，各方分歧",
+            decided_by="ConflictResolver(rule:unclear_ownership)",
         )
 
     def _escalate(
@@ -300,7 +434,7 @@ class ConflictResolver:
         context: dict[str, Any],
         forced_level: ConflictLevel | None = None,
     ) -> Resolution:
-        """升级冲突：无法规则裁决时，建议 HITL。"""
+        """升级冲突：无法规则/LLM 裁决时，建议 HITL。"""
         logger.warning(
             f"[ConflictResolver] 冲突升级 HITL: type={conflict_type.value}, "
             f"desc={description[:100]}"

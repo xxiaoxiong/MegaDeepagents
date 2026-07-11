@@ -38,6 +38,9 @@ class CreateTeamTaskResponse(BaseModel):
     task_id: str
     room_id: str
     status: str
+    max_rounds: int = 20
+    review_required: bool = True
+    max_review_cycles: int = 3
 
 
 class TeamTaskMetaResponse(BaseModel):
@@ -49,6 +52,8 @@ class TeamTaskMetaResponse(BaseModel):
     phase: str | None = None
     current_round: int | None = None
     max_rounds: int | None = None
+    review_required: bool | None = None
+    max_review_cycles: int | None = None
     agents: list[str] = Field(default_factory=list)
     created_at: str = ""
     updated_at: str = ""
@@ -99,6 +104,74 @@ class RoundResponse(BaseModel):
 # ========== Endpoints ==========
 
 
+@router.get("/teams")
+def list_available_teams():
+    """列出所有可用团队模板（B4 前端用）。"""
+    return [
+        {"name": name, "description": "", "agents": []}
+        for name in _list_teams()
+    ]
+
+
+@router.get("/team-tasks", response_model=list[TeamTaskMetaResponse])
+def list_team_tasks(limit: int = 50):
+    """列出所有多 Agent 任务（B4 前端用，最近创建在前）。
+
+    实现上从 store 的 team_rooms 表读所有 room，逆序返回。
+    """
+    store = get_multiagent_store()
+    # store 暴露的接口未直接给 list_rooms，这里用前 N 个 task_id 反查
+    # 兼容：若 store 有 list_rooms 方法优先用
+    if hasattr(store, "list_rooms"):
+        rows = store.list_rooms(limit=limit)
+    else:
+        # fallback：直接查 SQLite
+        rows = store.conn.execute(
+            "SELECT task_id, room_id FROM team_rooms ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        rows = [{"task_id": r[0], "room_id": r[1]} for r in rows]
+
+    out: list[TeamTaskMetaResponse] = []
+    for r in rows:
+        room_id = r["room_id"] if isinstance(r, dict) else r[1]
+        task_id = r["task_id"] if isinstance(r, dict) else r[0]
+        if not room_id:
+            continue
+        meta = store.load_room(room_id)
+        if not meta:
+            continue
+        state = store.load_state(room_id)
+        agents = store.load_agents(room_id)
+        # 从有效策略推断 review_required（复用 store 中可恢复的信息）
+        review_required = None
+        max_review_cycles = None
+        if meta.get("config"):
+            config = meta["config"]
+            team_spec = meta.get("team_spec")
+            if team_spec:
+                from app.multiagent.policies import EffectiveRunPolicy
+                policy = EffectiveRunPolicy.from_team_and_run_config(team_spec, config)
+                review_required = policy.review_required
+                max_review_cycles = policy.max_review_cycles
+        out.append(TeamTaskMetaResponse(
+            task_id=task_id,
+            room_id=room_id,
+            goal=meta["config"].goal if meta.get("config") else "",
+            team_name=meta["team_spec"].name if meta.get("team_spec") else "",
+            status=meta.get("status", "unknown"),
+            phase=state.phase.value if state else None,
+            current_round=state.current_round if state else None,
+            max_rounds=state.max_rounds if state else None,
+            review_required=review_required,
+            max_review_cycles=max_review_cycles,
+            agents=[a.name for a in agents],
+            created_at="",
+            updated_at="",
+        ))
+    return out
+
+
 @router.post("/team-tasks", response_model=CreateTeamTaskResponse)
 def create_team_task(req: CreateTeamTaskRequest):
     """创建并启动多 Agent 团队任务。"""
@@ -130,10 +203,15 @@ def create_team_task(req: CreateTeamTaskRequest):
     ctx = contextvars.copy_context()
     thread = threading.Thread(target=ctx.run, args=(_safe_run,), daemon=True)
     thread.start()
+    # 在响应中暴露 EfficientRunPolicy 派生字段（Req 6：API 必须暴露真实生效的策略）
+    policy = runner.effective_policy
     return CreateTeamTaskResponse(
         task_id=runner.task_id,
         room_id=runner.room_id,
         status="running",
+        max_rounds=policy.max_rounds,
+        review_required=policy.review_required,
+        max_review_cycles=policy.max_review_cycles,
     )
 
 
@@ -155,6 +233,16 @@ def get_team_task(task_id: str):
         raise HTTPException(status_code=404, detail="Team task not found")
     agents = store.load_agents(room_id)
     state = store.load_state(room_id)
+    # 从有效策略推断 review_required
+    review_required = None
+    max_review_cycles = None
+    if room_meta.get("config") and room_meta.get("team_spec"):
+        from app.multiagent.policies import EffectiveRunPolicy
+        policy = EffectiveRunPolicy.from_team_and_run_config(
+            room_meta["team_spec"], room_meta["config"],
+        )
+        review_required = policy.review_required
+        max_review_cycles = policy.max_review_cycles
     return TeamTaskMetaResponse(
         task_id=meta["task_id"],
         room_id=room_id,
@@ -164,6 +252,8 @@ def get_team_task(task_id: str):
         phase=state.phase.value if state else None,
         current_round=state.current_round if state else None,
         max_rounds=state.max_rounds if state else None,
+        review_required=review_required,
+        max_review_cycles=max_review_cycles,
         agents=[a.name for a in agents],
         created_at="",
         updated_at="",

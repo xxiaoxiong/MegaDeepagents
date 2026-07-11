@@ -33,10 +33,13 @@ class TerminationDecision:
 class TerminationChecker:
     """多 Agent 任务终止检查器。"""
 
-    def __init__(self, team_spec: TeamSpec, max_stale_rounds: int = 4):
+    def __init__(self, team_spec: TeamSpec, max_stale_rounds: int = 4, review_required: bool | None = None):
         self.team_spec = team_spec
         self.policy = team_spec.termination_policy
         self.max_stale_rounds = max_stale_rounds
+        # review_required 可以独立覆盖；None 时使用 team_spec 默认值
+        self._review_required = review_required if review_required is not None else team_spec.review_required
+        self._max_review_cycles = team_spec.max_review_cycles
         self._no_op_count = 0
         # 新增：基于"是否产出有效投递"的 stale 检测，替代易被 reset 的 no_op 计数
         self._unproductive_count = 0
@@ -64,9 +67,12 @@ class TerminationChecker:
         if self.policy == "manual_only":
             return TerminationDecision(False, reason="manual_only")
 
-        # 最大轮次
+        # 最大轮次 — 达到上限但未完成成功条件视为 INCOMPLETE，不是 COMPLETED
         if round_count >= state.max_rounds:
-            return TerminationDecision(True, reason="max_rounds", final_phase=TeamPhase.COMPLETED)
+            # 检查是否已满足成功条件（有 final_output 或 review_passed）
+            if state.final_output or (state.review_status == "passed" and state.phase in (TeamPhase.REVIEWING, TeamPhase.FINALIZING)):
+                return TerminationDecision(True, reason="max_rounds_with_success", final_phase=TeamPhase.COMPLETED)
+            return TerminationDecision(True, reason="max_rounds", final_phase=TeamPhase.INCOMPLETE)
 
         # 修复方案完成 / final message
         if state.final_output:
@@ -84,12 +90,12 @@ class TerminationChecker:
                     )
 
         # 评审通过 + 必要评审
-        if self.team_spec.review_required:
+        if self._review_required:
             if state.review_status == "passed" and state.phase in (TeamPhase.REVIEWING, TeamPhase.FINALIZING):
                 return TerminationDecision(
                     True, reason="review_passed", final_phase=TeamPhase.COMPLETED
                 )
-            if state.review_cycles > self.team_spec.max_review_cycles:
+            if state.review_cycles > self._max_review_cycles:
                 return TerminationDecision(
                     True,
                     reason=f"max_review_cycles_exceeded ({state.review_cycles})",
@@ -122,7 +128,7 @@ class TerminationChecker:
                 return TerminationDecision(True, reason="error_message", final_phase=TeamPhase.FAILED)
 
         # 严重阻塞 issue 未解决且超过最大评审返工
-        if state.has_open_blocking_issues() and state.review_cycles > self.team_spec.max_review_cycles:
+        if state.has_open_blocking_issues() and state.review_cycles > self._max_review_cycles:
             return TerminationDecision(True, reason="blocking_issue_unresolved", final_phase=TeamPhase.FAILED)
 
         return TerminationDecision(False, reason="continue")

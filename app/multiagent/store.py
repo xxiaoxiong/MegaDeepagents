@@ -164,6 +164,22 @@ def _init_multiagent_db(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_team_rounds_room ON team_rounds(room_id);
+
+        CREATE TABLE IF NOT EXISTS memory_entries (
+            id TEXT PRIMARY KEY,
+            tier TEXT NOT NULL,
+            agent_scope TEXT,
+            content TEXT NOT NULL DEFAULT '',
+            metadata TEXT NOT NULL DEFAULT '{}',
+            importance REAL NOT NULL DEFAULT 0.5,
+            access_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            last_accessed_at TEXT,
+            task_id TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_memory_tier ON memory_entries(tier);
+        CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory_entries(agent_scope);
+        CREATE INDEX IF NOT EXISTS idx_memory_task ON memory_entries(task_id);
         """
     )
     # 兼容旧库：如果 team_rounds 表已存在但缺 langsmith_run_url 列，则补上
@@ -174,6 +190,14 @@ def _init_multiagent_db(conn: sqlite3.Connection) -> None:
             logger.info("[store] team_rounds.langsmith_run_url 已补列（兼容旧库）")
     except Exception as exc:
         logger.warning(f"[store] ALTER TABLE team_rounds 失败（可能已存在）：{exc}")
+    # 兼容旧库：memory_entries 缺 task_id 列则补上
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(memory_entries)").fetchall()}
+        if "task_id" not in cols:
+            conn.execute("ALTER TABLE memory_entries ADD COLUMN task_id TEXT")
+            logger.info("[store] memory_entries.task_id 已补列（兼容旧库）")
+    except Exception as exc:
+        logger.warning(f"[store] ALTER TABLE memory_entries 失败（可能已存在）：{exc}")
     conn.commit()
 
 
@@ -550,6 +574,133 @@ class MultiAgentStore:
             (room_id,),
         )
         return [dict(r) for r in cur.fetchall()]
+
+    # ========== Memory Entries（agent 跨任务持久记忆） ==========
+
+    def save_memory_entry(self, entry: dict[str, Any]) -> None:
+        """写入或更新一条 memory_entries 记录（按 id UPSERT）。
+
+        entry 字段：id, tier, agent_scope, content, metadata(dict), importance,
+                    access_count, created_at(iso), last_accessed_at(iso|None), task_id
+        """
+        meta_json = json.dumps(entry.get("metadata", {}), ensure_ascii=False)
+        self.conn.execute(
+            """
+            INSERT INTO memory_entries (id, tier, agent_scope, content, metadata, importance,
+                                         access_count, created_at, last_accessed_at, task_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                tier = excluded.tier,
+                agent_scope = excluded.agent_scope,
+                content = excluded.content,
+                metadata = excluded.metadata,
+                importance = excluded.importance,
+                access_count = excluded.access_count,
+                last_accessed_at = excluded.last_accessed_at,
+                task_id = excluded.task_id
+            """,
+            (
+                entry["id"],
+                entry["tier"],
+                entry.get("agent_scope"),
+                entry.get("content", ""),
+                meta_json,
+                float(entry.get("importance", 0.5)),
+                int(entry.get("access_count", 0)),
+                entry.get("created_at") or datetime.utcnow().isoformat(),
+                entry.get("last_accessed_at"),
+                entry.get("task_id"),
+            ),
+        )
+        self.conn.commit()
+
+    def list_memory_entries(
+        self,
+        tier: str | None = None,
+        agent_scope: str | None = None,
+        include_shared: bool = True,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """列出符合 tier/scope 的记忆条目。include_shared=True 时，agent_scope 过滤会
+        同时包含 team-shared（agent_scope IS NULL）。
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if tier:
+            clauses.append("tier = ?")
+            params.append(tier)
+        if agent_scope is not None:
+            if include_shared:
+                clauses.append("(agent_scope = ? OR agent_scope IS NULL)")
+                params.append(agent_scope)
+            else:
+                clauses.append("agent_scope = ?")
+                params.append(agent_scope)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"SELECT * FROM memory_entries{where} ORDER BY importance DESC, created_at DESC LIMIT ?"
+        params.append(limit)
+        cur = self.conn.execute(sql, tuple(params))
+        rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            if r.get("metadata"):
+                try:
+                    r["metadata"] = json.loads(r["metadata"])
+                except (json.JSONDecodeError, TypeError):
+                    r["metadata"] = {}
+            else:
+                r["metadata"] = {}
+        return rows
+
+    def search_memory_entries(
+        self,
+        query: str,
+        tier: str | None = None,
+        agent_scope: str | None = None,
+        include_shared: bool = True,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """关键词模糊检索 memory_entries。返回按 importance DESC 排序的结果。
+
+        检索策略：分词后 AND 命中（每词都必须在 content 中出现，不区分大小写）。
+        空查询退化为按 importance 列出。
+        """
+        all_rows = self.list_memory_entries(
+            tier=tier, agent_scope=agent_scope, include_shared=include_shared, limit=1000
+        )
+        if not query or not query.strip():
+            return all_rows[:limit]
+        kws = [w.lower() for w in query.split() if w]
+        if not kws:
+            return all_rows[:limit]
+        matched: list[tuple[float, dict[str, Any]]] = []
+        for r in all_rows:
+            content = (r.get("content") or "").lower()
+            hits = sum(1 for kw in kws if kw in content)
+            if hits == 0:
+                continue
+            score = hits + float(r.get("importance", 0.5))
+            matched.append((score, r))
+        matched.sort(key=lambda t: t[0], reverse=True)
+        # bump access_count + last_accessed_at（fire-and-forget，不抛错）
+        result_ids = [r["id"] for _, r in matched[:limit]]
+        if result_ids:
+            now = datetime.utcnow().isoformat()
+            placeholders = ",".join("?" * len(result_ids))
+            try:
+                self.conn.execute(
+                    f"UPDATE memory_entries SET access_count = access_count + 1, "
+                    f"last_accessed_at = ? WHERE id IN ({placeholders})",
+                    (now, *result_ids),
+                )
+                self.conn.commit()
+            except Exception as exc:
+                logger.warning(f"[store] bump memory access_count 失败：{exc}")
+        return [r for _, r in matched[:limit]]
+
+    def delete_memory_entry(self, entry_id: str) -> bool:
+        cur = self.conn.execute("DELETE FROM memory_entries WHERE id = ?", (entry_id,))
+        self.conn.commit()
+        return cur.rowcount > 0
 
 
 _store: MultiAgentStore | None = None

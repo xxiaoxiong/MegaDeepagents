@@ -1,38 +1,30 @@
-"""TeamRunner：多智能体团队运行核心循环。
+"""TeamRunner：多智能体团队运行核心循环（复用 TeamRoundExecutor）。
 
 核心流程：
 1. create room（或 load 已有 room）
-2. 初始化 MessageBus / AgentInbox / SharedTeamState
+2. 初始化 TeamRoundExecutor（统一封装选择 Agent、加载 Inbox、调用 Agent、
+   发布 MessageBus、更新 SharedTeamState、持久化、termination）
 3. publish user_request 到总线
-4. loop:
-   a. SpeakerSelector 选择下一 Agent
-   b. 加载该 Agent 的 inbox + shared_state
-   c. AgentRuntimeAdapter.run() 产生 actions
-   d. actions → AgentMessages → bus.publish+write
-   e. 更新 SharedTeamState
-   f. 发 task events
-   g. TerminationChecker 判断
+4. loop: execute_round → 判断终止
 5. finalize
 
 注意：
-- 本 runner 目前是"半模拟"模式：Agent 不真正调用 LLM，而是通过 AgentRuntimeAdapter
-  在 prompt 阶段返回 no_op。真实 LLM 调用需要接入后替换 runtime_adapter。
-- 每个 action 都会落库，供前端查看 step-by-step。
+- Agent 通过 AgentRuntimeAdapter 调用真实 LLM（build_model），产出 JSON actions。
+- 每轮完整链路：select_speaker → adapter.run → actions_to_messages → bus.publish →
+  process_actions(state update) → persist_round → termination_check。
+- ReviewRepairLoop 已接入主链路：review_result 触发 critique 消息发布到 MessageBus。
+- 与 TeamGraph 共享 TeamRoundExecutor 组件，不再复制两套业务逻辑。
+- TeamRoundExecutor 作为共享单轮执行组件，供 TeamRunner.run() 和 TeamGraphRunner 共同使用。
 """
 
 from __future__ import annotations
 
-import traceback
 import uuid
 from datetime import datetime
 from typing import Any
 
 from app.core.logging import logger
-from app.core.observability import traceable, trace_span, emit_trace_event, get_current_run_url
-from app.multiagent.action_guard import (
-    get_effective_allowed_actions,
-    is_action_allowed,
-)
+from app.core.observability import traceable, trace_span, get_current_run_url
 from app.multiagent.agent_spec import (
     AgentSpec,
     TeamRunConfig,
@@ -41,23 +33,15 @@ from app.multiagent.agent_spec import (
 )
 from app.multiagent.default_teams import get_team, list_teams as _list_teams
 from app.multiagent.event_emitter import get_event_emitter
-from app.multiagent.inbox import AgentInbox
-from app.multiagent.messages import (
-    AgentMessage,
-    MessageType,
-    make_message_id,
-)
-from app.multiagent.policies import TeamRunMode
-from app.multiagent.prompts import get_role_prompt
-from app.multiagent.review_repair import ReviewRepairLoop, ReviewResult
+from app.multiagent.messages import AgentMessage, MessageType
+from app.multiagent.policies import EffectiveRunPolicy, TeamRunMode
+from app.multiagent.review_repair import ReviewRepairLoop
 from app.multiagent.room import TeamRoom
 from app.multiagent.runtime_adapter import AgentRuntimeAdapter
+from app.multiagent.round_executor import TeamRoundExecutor
 from app.multiagent.speaker_selector import SpeakerSelector
 from app.multiagent.state import (
     SharedTeamState,
-    TeamArtifactRef,
-    TeamDecision,
-    TeamIssue,
     TeamPhase,
 )
 from app.multiagent.store import get_multiagent_store
@@ -81,6 +65,7 @@ class TeamRunner:
         self.selector = SpeakerSelector()
         self.termination_checker: TerminationChecker | None = None
         self.review_loop = ReviewRepairLoop()
+        self.round_executor: TeamRoundExecutor | None = None
         self.run_mode = TeamRunMode.CONTROLLED_GROUP_CHAT
         self.emitter = get_event_emitter()  # SSE 事件总线
 
@@ -88,6 +73,24 @@ class TeamRunner:
         self._last_speaker: str | None = None
         self._last_messages: list[AgentMessage] = []
         self._room_messages: list[AgentMessage] = []
+        self._team_spec: TeamSpec | None = None
+        self._effective_policy: EffectiveRunPolicy | None = None
+
+    def _init_executor(self) -> None:
+        """懒初始化 TeamRoundExecutor。"""
+        if self.round_executor is None and self.room is not None:
+            self.round_executor = TeamRoundExecutor(
+                room=self.room,
+                adapter=self.adapter,
+                selector=self.selector,
+                termination_checker=self.termination_checker,
+                review_loop=self.review_loop,
+                store=self.store,
+                emitter=self.emitter,
+                task_id=self.task_id,
+                room_id=self.room_id,
+                team_spec=self._team_spec,
+            )
 
     @classmethod
     def create(
@@ -100,7 +103,6 @@ class TeamRunner:
         room_id: str | None = None,
     ) -> "TeamRunner":
         """创建并配置一个新的多 Agent 任务。"""
-        # 确保 observability 已初始化（CLI 路径可能没走 main.py lifespan）
         from app.core.observability import init_observability
 
         init_observability(component="multiagent")
@@ -115,6 +117,9 @@ class TeamRunner:
             max_rounds=max_rounds,
             review_required=review_required,
         )
+
+        # 计算有效运行策略，确保 review_required / max_rounds 在所有组件中一致
+        effective_policy = EffectiveRunPolicy.from_team_and_run_config(team_spec, config)
 
         actual_task_id = task_id or "task_" + uuid.uuid4().hex[:8]
         actual_room_id = room_id or "room_" + uuid.uuid4().hex[:12]
@@ -132,14 +137,21 @@ class TeamRunner:
             task_id=actual_task_id,
             room_id=actual_room_id,
         )
+        # 使用有效策略创建 TerminationChecker，而非直接从 team_spec 读取
         runner.termination_checker = TerminationChecker(
             team_spec=team_spec,
             max_stale_rounds=2,
+            review_required=effective_policy.review_required,
         )
+        # ReviewRepairLoop 也使用有效策略的 max_review_cycles
+        runner.review_loop.reset_max_cycles(effective_policy.max_review_cycles)
+        # 将有效策略存入 runner，便于其他组件查询
+        runner._effective_policy = effective_policy
 
         logger.info(
             f"TeamRunner created: task={actual_task_id}, room={actual_room_id}, "
-            f"team={team_name}, agents={len(team_spec.agents)}"
+            f"team={team_name}, agents={len(team_spec.agents)}, "
+            f"review_required={effective_policy.review_required}"
         )
         return runner
 
@@ -160,28 +172,42 @@ class TeamRunner:
         if runner.room is None:
             return None
         runner.room.config = config
+        # 在构造依赖组件之前先计算有效策略
+        runner._effective_policy = EffectiveRunPolicy.from_team_and_run_config(team_spec, config)
         runner.adapter = AgentRuntimeAdapter(task_id=task_id, room_id=room_id)
         runner.termination_checker = TerminationChecker(
             team_spec=team_spec,
             max_stale_rounds=2,
+            review_required=runner._effective_policy.review_required,
         )
+        runner.review_loop.reset_max_cycles(runner._effective_policy.max_review_cycles)
         runner._round = runner.room.state.current_round
         logger.info(f"TeamRunner loaded: task={task_id}, room={room_id}, round={runner._round}")
         return runner
+
+    @property
+    def effective_policy(self) -> EffectiveRunPolicy:
+        """返回当前生效的运行策略，用于查询 review_required / max_rounds 真实值。"""
+        if self._effective_policy is None:
+            # 临时构造：从 team_spec 和当前 room.config 推断
+            cfg = self.room.config if self.room else None
+            self._effective_policy = EffectiveRunPolicy.from_team_and_run_config(
+                self._team_spec, cfg,
+            )
+        return self._effective_policy
 
     # ========== 核心循环 ==========
 
     def run(self, goal_override: str | None = None) -> TeamRunResult:
         """运行多 Agent 团队任务的主循环。
 
-        @traceable 装饰在独立的 _run_team_traced 函数上（见本文件底部），
-        确保跨线程 contextvar 传播 + process_inputs/process_outputs 业务内容可见性。
+        全部复用 TeamRoundExecutor 完成单轮执行逻辑。
         """
         if not self.room or not self.adapter or not self.termination_checker:
             raise RuntimeError("TeamRunner not initialized. Use TeamRunner.create() or .load() first.")
 
         start_time = datetime.utcnow()
-        seat_agent_names = [a.name for a in self.room.agents]
+        self._init_executor()
 
         # 0. 发送 user_request 到总线
         if goal_override:
@@ -189,14 +215,12 @@ class TeamRunner:
         self.room.state.goal = self.room.config.goal
         self.room.state.update_phase(TeamPhase.PLANNING)
 
-        # emit: task started
         self.emitter.emit(
             self.room_id or "",
             "task_started",
             {"goal": self.room.config.goal, "agents": [a.name for a in self.room.agents]},
         )
 
-        # 初始消息
         self.room.send_system_message(
             content=self.room.config.goal,
             message_type=MessageType.USER_REQUEST,
@@ -206,190 +230,82 @@ class TeamRunner:
         # 1. 主循环
         termination_reason: str | None = None
         while True:
+            # === 取消检查：每轮开始前从持久化状态读取 cancel request ===
+            # 取消信号写过的话立刻停止，不再执行后续节点
+            if self.room.is_cancel_requested():
+                logger.info(f"[TeamRunner] cancel detected at round {self._round}, stopping")
+                self.room.state.update_phase(TeamPhase.CANCELLED)
+                termination_reason = "cancel_requested"
+                self.emitter.emit(
+                    self.room_id or "", "termination",
+                    {"reason": "cancel_requested", "round": self._round, "phase": TeamPhase.CANCELLED.value},
+                )
+                break
             self._round += 1
             self.room.state.current_round = self._round
 
-            # 本轮 trace span：让 _traced_llm_call + adapter.run 挂为本 run 的 child
             with trace_span(
                 "team_round",
                 run_type="chain",
                 metadata={"round": self._round, "task_id": self.task_id, "room_id": self.room_id},
             ) as round_span:
                 phase_before = self.room.state.phase.value
-                # 1a. 选择下一发言 Agent
-                with trace_span(
-                    "select_speaker",
-                    run_type="chain",
-                    metadata={
-                        "candidates": seat_agent_names,
-                        "last_speaker": self._last_speaker,
-                        "round": self._round,
-                    },
-                ):
-                    speaker = self.selector.select(
-                        shared_state=self.room.state,
-                        agents=self.room.agents,
-                        inbox=self.room.inbox,
-                        last_speaker=self._last_speaker,
-                        last_message=self._last_messages[-1] if self._last_messages else None,
-                    )
 
-                if speaker is None:
-                    logger.info(f"[TeamRunner] round {self._round}: no speaker selected, terminating")
-                    termination_reason = "no_speaker"
+                # 使用 TeamRoundExecutor 执行一轮
+                result = self.round_executor.execute_round(
+                    round_number=self._round,
+                    last_speaker=self._last_speaker,
+                    last_messages=self._last_messages,
+                )
+
+                if result.error:
+                    logger.error(f"[TeamRunner] round {self._round} error: {result.error}")
+                    termination_reason = result.error
                     self.room.state.update_phase(TeamPhase.FAILED)
                     self.emitter.emit(
-                        self.room_id or "",
-                        "termination",
-                        {"reason": "no_speaker", "round": self._round},
+                        self.room_id or "", "termination",
+                        {"reason": result.error, "round": self._round},
                     )
                     break
 
-                # emit: speaker selected
-                self.emitter.emit(
-                    self.room_id or "",
-                    "speaker_selected",
-                    {"agent": speaker.name, "role": speaker.role, "round": self._round},
-                )
+                # 更新追踪状态
+                self._last_speaker = result.speaker.name if result.speaker else self._last_speaker
+                self._last_messages = result.produced_messages
 
-                # 1b. 加载 inbox + state
-                inbox_context = self.room.inbox.get_relevant_context(speaker.name)
-                unread = self.room.inbox.list_unread(speaker.name)
-
-                # 1c. 构造 system prompt & 调用运行时
-                prompt = self.adapter.build_system_prompt(
-                    agent=speaker,
-                    shared_state=self.room.state,
-                    inbox_context=inbox_context,
-                    team_agents=self.room.agents,
-                )
-                actions = self.adapter.run(
-                    agent=speaker,
-                    inbox_messages=unread,
-                    shared_state=self.room.state,
-                )
-
-                self.emitter.emit(
-                    self.room_id or "",
-                    "actions_emitted",
-                    {
-                        "agent": speaker.name,
-                        "round": self._round,
-                        "action_count": len(actions),
-                        "action_types": [a.get("type", "?") for a in actions],
-                    },
-                )
-
-                # 1d. actions 转消息，publish
-                produced_messages = AgentRuntimeAdapter.actions_to_messages(
-                    agent_name=speaker.name,
-                    task_id=self.task_id,
-                    room_id=self.room_id,
-                    actions=actions,
-                    round_number=self._round,
-                )
-                self._last_messages = []
-                for msg in produced_messages:
-                    self.room.publish(msg)
-                    self._last_messages.append(msg)
-                    # emit: 每条消息发布
-                    self.emitter.emit(
-                        self.room_id or "",
-                        "message_published",
-                        {
-                            "id": msg.id,
-                            "from_agent": msg.from_agent,
-                            "to_agent": msg.to_agent,
-                            "message_type": msg.message_type.value,
-                            "content_preview": (msg.content or "")[:200],
-                            "round": self._round,
-                        },
+                # trace span metadata
+                if result.speaker:
+                    action_summary = "; ".join(
+                        f"{a.get('type', '?')}({'->' + a.get('to_agent', '') if a.get('to_agent') else ''})"
+                        for a in result.actions[:5]
                     )
+                    round_run = round_span.get("run") if isinstance(round_span, dict) else None
+                    if round_run is not None and hasattr(round_run, "add_metadata"):
+                        try:
+                            round_run.add_metadata({
+                                "speaker": result.speaker.name,
+                                "speaker_role": result.speaker.role,
+                                "action_types": [a.get("type", "?") for a in result.actions],
+                                "action_summary": action_summary[:200],
+                                "produced_messages": [
+                                    {"from": m.from_agent, "to": m.to_agent, "type": m.message_type.value, "preview": (m.content or "")[:300]}
+                                    for m in result.produced_messages
+                                ],
+                                "phase_before": phase_before,
+                                "phase_after": self.room.state.phase.value,
+                                "termination": result.termination_reason,
+                            })
+                        except Exception:
+                            logger.debug("[TeamRunner] round_run.add_metadata 失败", exc_info=True)
 
-                # 1e. 更新 SharedTeamState（处理 update_state / request_review / create_artifact 等 action）
-                with trace_span(
-                    "process_actions",
-                    run_type="chain",
-                    metadata={
-                        "agent": speaker.name,
-                        "action_count": len(actions),
-                        "action_types": [a.get("type", "?") for a in actions],
-                    },
-                ):
-                    self._process_actions(speaker.name, actions)
-                self.store.save_state(self.room.state)
-
-                # 1f. 标记已读
-                for m in unread:
-                    self.room.inbox.mark_read(m.id, speaker.name)
-
-                # 1g. 记录 round（包含 LangSmith run URL，便于事后回放）
-                msg_ids = [m.id for m in produced_messages]
-                action_summary = "; ".join(
-                    f"{a.get('type','?')}({'->' + a.get('to_agent','') if a.get('to_agent') else ''})"
-                    for a in actions[:5]
-                )
-                run_url = get_current_run_url()
-                self.store.save_round(
-                    room_id=self.room_id,
-                    round_number=self._round,
-                    selected_speaker=speaker.name,
-                    action_summary=action_summary[:200],
-                    message_ids=msg_ids,
-                    langsmith_run_url=run_url,
-                )
-
-                # 1h. 检查终止
-                self._last_speaker = speaker.name
-
-                # 本轮是否有消息真正到达了某个 Agent 的 inbox？（检测路由黑洞）
-                productive_delivery = self._check_productive_delivery(produced_messages)
-
-                with trace_span(
-                    "termination_check",
-                    run_type="chain",
-                    metadata={"round": self._round, "productive_delivery": productive_delivery},
-                ):
-                    decision = self.termination_checker.check(
-                        state=self.room.state,
-                        recent_messages=produced_messages,
-                        round_count=self._round,
-                        productive_delivery=productive_delivery,
-                    )
-
-                # 把本轮的业务摘要写到 team_round span 的 metadata，
-                # 让 LangSmith UI 上每个 team_round 的 metadata 直接可见轮次业务内容
-                round_run = round_span.get("run") if isinstance(round_span, dict) else None
-                if round_run is not None and hasattr(round_run, "add_metadata"):
-                    try:
-                        round_run.add_metadata({
-                            "speaker": speaker.name,
-                            "speaker_role": speaker.role,
-                            "action_types": [a.get("type", "?") for a in actions],
-                            "action_summary": action_summary[:200],
-                            "produced_messages": [
-                                {
-                                    "from": m.from_agent,
-                                    "to": m.to_agent,
-                                    "type": m.message_type.value,
-                                    "preview": (m.content or "")[:300],
-                                }
-                                for m in produced_messages
-                            ],
-                            "phase_before": phase_before,
-                            "phase_after": self.room.state.phase.value,
-                            "termination": decision.reason if decision.should_terminate else None,
-                        })
-                    except Exception:  # noqa: BLE001 - 业务埋点不应影响主流程
-                        logger.debug("[TeamRunner] round_run.add_metadata 失败", exc_info=True)
-
-                if decision.should_terminate:
-                    termination_reason = decision.reason
-                    if decision.final_phase:
-                        self.room.state.update_phase(decision.final_phase)
+                if result.should_terminate:
+                    termination_reason = result.termination_reason
+                    # 归一化：若最终 phase 是 CANCELLED，统一 termination_reason 为 cancel_requested
+                    #（避免 execute_round 期间 cancel() 触发后 TerminationChecker 返回
+                    # phase_already_cancelled 导致语义分裂）
+                    if self.room.state.phase == TeamPhase.CANCELLED:
+                        termination_reason = "cancel_requested"
                     self.emitter.emit(
-                        self.room_id or "",
-                        "termination",
+                        self.room_id or "", "termination",
                         {"reason": termination_reason, "round": self._round, "phase": self.room.state.phase.value},
                     )
                     break
@@ -400,10 +316,24 @@ class TeamRunner:
         self.room.mark_terminated()
         self.store.set_room_terminated(self.room_id, True, self.room.state.phase.value)
 
+        # 终态 → status 映射：仅 COMPLETED 视为成功；INCOMPLETE 仍是 failed
+        # 但通过 termination_reason 区分细节
+        if self.room.state.phase == TeamPhase.COMPLETED:
+            result_status = "completed"
+        elif self.room.state.phase == TeamPhase.CANCELLED:
+            result_status = "cancelled"
+        elif self.room.state.phase == TeamPhase.INCOMPLETE:
+            result_status = "failed"  # 达到 max_rounds 但未完成
+        elif self.room.state.phase == TeamPhase.FAILED:
+            result_status = "failed"
+        else:
+            # 非终态被强制收尾（异常路径）→ failed
+            result_status = "failed"
+
         result = TeamRunResult(
             task_id=self.task_id,
             room_id=self.room_id,
-            status="completed" if self.room.state.phase in (TeamPhase.COMPLETED, TeamPhase.FINALIZING) else "failed",
+            status=result_status,
             final_output=self.room.state.final_output or "（无最终输出）",
             phase=self.room.state.phase.value,
             total_rounds=self._round,
@@ -434,145 +364,104 @@ class TeamRunner:
     # ========== Action 处理 ==========
 
     def _process_actions(self, agent_name: str, actions: list[dict[str, Any]]) -> None:
-        """根据 Agent 输出的 actions 更新 SharedTeamState。
+        """转发到 TeamRoundExecutor._process_actions。
 
-        本层做"深度护栏（defense in depth）"：即便 runtime_adapter 在第一层已经
-        把越权 action 改为 no_op，这里仍按 agent 的 allowed_actions 再次校验，
-        避免任何绕过路径直接落库 / 改状态 / 改 final_output。
+        历史背景：早期 TeamRunner 自带一份 _process_actions 实现，包含了与 TeamGraph
+        相同的深层护栏逻辑。Req 3 抽取 TeamRoundExecutor 后此方法已不再被主循环使用
+        （run() 走 round_executor.execute_round()）。保留为转发壳是为了兼容任何外部
+        调用与测试代码，避免再次分裂出两套业务逻辑。
         """
-        state = self.room.state
-        speaking_agent = next(
-            (a for a in self.room.agents if a.name == agent_name), None
-        )
-        allowed_actions = (
-            get_effective_allowed_actions(speaking_agent) if speaking_agent else []
-        )
-        allowed_set = set(allowed_actions) if allowed_actions else None
+        # 仅初始化 executor，然后转交归一化实现，**禁止再恢复一套本地护栏副本**。
+        if self.round_executor is None:
+            self._init_executor()
+        # 保护：若任何依赖未就绪（如 load 路径上游漏初始化），不静默吞错。
+        if self.round_executor is None or self.room is None:
+            logger.warning(
+                f"[TeamRunner._process_actions] called but executor/room not ready"
+            )
+            return
+        speaker = next((a for a in self.room.agents if a.name == agent_name), None)
+        if speaker is None:
+            logger.warning(
+                f"[TeamRunner._process_actions] agent={agent_name} not found in room"
+            )
+            return
+        self.round_executor._process_actions(speaker, actions)
 
+    # ========== B3: Agent 跨任务持久记忆 ==========
+
+    def _persist_agent_memory(
+        self,
+        agent: AgentSpec,
+        actions: list[dict[str, Any]],
+        messages: list[AgentMessage],
+    ) -> None:
+        """把本轮 Agent 的可学项沉淀到 LayeredMemorySystem（semantic + procedural）。
+
+        策略（保守、避免噪声）：
+        - create_artifact / request_review / mark_done 等关键决策写一条 procedural
+          "经验"短句；其后该 Agent 再次遇到类似 goal 时可在 prompt 中回顾。
+        - send_message 含技术决策（content 较长且非 no_op）→ 写一条 semantic 知识。
+        - 重复内容用 content hash 做幂等去重，importance 累加。
+        所有写入受 try/except 保护，记忆失败不阻断主循环。
+        """
+        if not agent or not actions:
+            return
+        scope = agent.private_memory_scope or agent.name
+        try:
+            from app.multiagent.layered_memory import (
+                get_layered_memory, MemoryTier, PersistentMemory,
+            )
+            memory = get_layered_memory()
+        except Exception as exc:
+            logger.debug(f"[B3] load layered memory 失败，跳过持久化：{exc}")
+            return
+
+        importance_bump = 0.05
         for action in actions:
-            action_type = action.get("type", "no_op")
-            # ---- 深层护栏：未授权 action 不允许触碰 state ----
-            if allowed_set is not None and action_type not in allowed_set:
-                logger.warning(
-                    f"[TeamRunner._process_actions] agent={agent_name} action={action_type} "
-                    f"不在白名单 {sorted(allowed_set)}，已拒绝执行状态/消息副作用"
-                )
-                continue
-
-            if action_type == "update_state":
-                patch = action.get("patch", {})
-                phase = patch.get("phase")
-                if phase and state.phase.value != phase:
-                    try:
-                        state.update_phase(TeamPhase(phase))
-                    except ValueError:
-                        pass
-                plan = patch.get("plan")
-                if plan:
-                    if isinstance(plan, list):
-                        state.plan = "\n".join(
-                            f"{s.get('step','')}. {s.get('content',s.get('action',str(s)))}"
-                            if isinstance(s, dict) else str(s)
-                            for s in plan
+            try:
+                atype = action.get("type", "no_op")
+                content = (action.get("content") or "").strip()
+                # 1) procedural：关键操作产出 SOP 短句
+                if atype in ("create_artifact", "request_review", "respond_critique", "mark_done"):
+                    target = action.get("to_agent") or action.get("artifact_role") or "?"
+                    summary = (
+                        f"[{atype}] -> {target}: "
+                        f"{content[:160] or '(无内容)'}"
+                    )
+                    entry_id = f"proc_{scope}_{hash(summary) & 0xFFFFFFFF:x}"
+                    existing = memory.procedural.get(entry_id)
+                    if existing is None:
+                        memory.add(
+                            MemoryTier.PROCEDURAL,
+                            content=summary,
+                            agent_scope=scope,
+                            importance=0.6,
+                            metadata={"source_action": atype, "id": entry_id, "task_id": self.task_id},
+                            task_id=self.task_id,
                         )
                     else:
-                        state.plan = str(plan)
-
-            elif action_type == "create_artifact":
-                path = action.get("artifact_path", action.get("content", ""))
-                role = action.get("artifact_role", "artifact")
-                version = action.get("version", 1)
-                artifact_id = action.get("artifact_id")
-                if path:
-                    self.room.state.add_artifact(
-                        TeamArtifactRef(
-                            path=path,
-                            role=role,
-                            produced_by=agent_name,
-                            version=version,
-                            artifact_id=artifact_id,
+                        existing.importance = min(1.0, existing.importance + importance_bump)
+                        memory.procedural._persist(existing, task_id=self.task_id)
+                # 2) semantic：技术性 send_message 当作知识沉淀
+                elif atype == "send_message" and len(content) >= 30:
+                    summary = f"[send_to:{action.get('to_agent','?')}] {content[:200]}"
+                    entry_id = f"sem_{scope}_{hash(summary) & 0xFFFFFFFF:x}"
+                    existing = memory.semantic.get(entry_id)
+                    if existing is None:
+                        memory.add(
+                            MemoryTier.SEMANTIC,
+                            content=summary,
+                            agent_scope=scope,
+                            importance=0.5,
+                            metadata={"source_action": atype, "id": entry_id, "task_id": self.task_id},
+                            task_id=self.task_id,
                         )
-                    )
-
-            elif action_type == "request_review":
-                state.review_status = "pending"
-                state.update_phase(TeamPhase.REVIEWING)
-
-            elif action_type == "respond_critique":
-                pass  # 由 TeamRunner 消息流处理
-
-            elif action_type == "mark_done":
-                # 深层防线：只有 Finalizer 角色才允许真正写入 final_output 终止任务
-                if speaking_agent is None or speaking_agent.role != "Finalizer":
-                    logger.warning(
-                        f"[TeamRunner._process_actions] agent={agent_name} "
-                        f"role={speaking_agent.role if speaking_agent else 'Unknown'} "
-                        f"尝试 mark_done 被深层护栏拒绝（仅 Finalizer 可宣布完成）"
-                    )
-                    continue
-                state.final_output = action.get("content", "")
-                state.update_phase(TeamPhase.FINALIZING)
-
-            elif action_type == "handoff":
-                to_agent = action.get("to_agent", "")
-                if to_agent:
-                    state.update_phase(TeamPhase.EXECUTING)
-
-            elif action_type == "send_message":
-                # 处理 review_result 类型
-                msg_type_str = action.get("message_type", "")
-                if msg_type_str == "review_result":
-                    # 深层护栏：只有 ReviewerAgent / Reviewer 角色才能产出 review_result
-                    if speaking_agent is None or speaking_agent.role not in (
-                        "ReviewerAgent",
-                        "Reviewer",
-                    ):
-                        logger.warning(
-                            f"[TeamRunner._process_actions] agent={agent_name} "
-                            f"role={speaking_agent.role if speaking_agent else 'Unknown'} "
-                            f"越权产出 review_result，已拒绝触发返工闭环"
-                        )
-                        continue
-                    raw_msg = action.get("content", "")
-                    review_result = ReviewResult(
-                        passed=action.get("review_result", {}).get("passed", False),
-                        issues=action.get("review_result", {}).get("issues", []),
-                        required_fix_owner=action.get("review_result", {}).get("required_fix_owner"),
-                        raw=raw_msg,
-                    )
-                    self.review_loop.process_review_result(
-                        result=review_result,
-                        state=state,
-                        room=self.room,
-                    )
-                    # P0-2: 同步更新对应 artifact 的 reviewed_by / status
-                    artifact_refs = action.get("artifact_refs", []) or []
-                    for ref in artifact_refs:
-                        path = ref.get("path") if isinstance(ref, dict) else None
-                        if path:
-                            status = "approved" if review_result.passed else "rejected"
-                            state.mark_artifact_reviewed(
-                                path=path,
-                                reviewed_by=agent_name,
-                                status=status,
-                                message_id=None,
-                            )
-                elif msg_type_str == "plan" and state.phase == TeamPhase.PLANNING:
-                    # Planner 把计划正式发给 Coder → 进入执行阶段
-                    state.update_phase(TeamPhase.EXECUTING)
-                elif msg_type_str == "delegation" and state.phase in (TeamPhase.PLANNING, TeamPhase.DISCUSSING):
-                    state.update_phase(TeamPhase.EXECUTING)
-                elif msg_type_str == "final":
-                    # 深层护栏：final 仅 Finalizer 角色有效，其它角色发 final 不写入 final_output
-                    if speaking_agent is None or speaking_agent.role != "Finalizer":
-                        logger.warning(
-                            f"[TeamRunner._process_actions] agent={agent_name} "
-                            f"role={speaking_agent.role if speaking_agent else 'Unknown'} "
-                            f"越权发 final 消息，不写入 final_output（仅 Finalizer 可）"
-                        )
-                        continue
-                    state.final_output = action.get("content", "") or state.final_output
-                    state.update_phase(TeamPhase.FINALIZING)
+                    else:
+                        existing.importance = min(1.0, existing.importance + importance_bump)
+                        memory.semantic._persist(existing, task_id=self.task_id)
+            except Exception as exc:
+                logger.debug(f"[B3] persist agent memory for {agent.name} action={action.get('type')} 失败：{exc}")
 
     # ========== 生产性投递检测 ==========
 

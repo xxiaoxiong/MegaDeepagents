@@ -35,7 +35,7 @@ def test_reviewer_binding_when_no_explicit_veto():
 
 
 def test_review_absent_escalates_high():
-    """Reviewer 没参与但出现评审争议：升级 HITL。"""
+    """Reviewer 没参与但出现评审争议：升级 HITL（无 state 时直接 escalation）。"""
     resolver = ConflictResolver()
     positions = [
         {"agent": "Coder", "position": "ok", "reason": "我自己测过没问题"},
@@ -120,14 +120,18 @@ def test_ownership_escalates_when_no_producer():
 
 
 def test_escalation_creates_blocking_issue_in_state():
-    """升级 HITL 时在 state 中创建 blocking issue。"""
+    """LLM 不可用时，OTHER 冲突升级 HITL 并在 state 中创建 blocking issue。"""
+    from unittest.mock import patch, MagicMock
+
     state = SharedTeamState(room_id="r1", task_id="t1")
     resolver = ConflictResolver(state=state)
     positions = [
         {"agent": "A", "position": "x"},
         {"agent": "B", "position": "y"},
     ]
-    r = resolver.resolve(ConflictType.OTHER, "无法自动裁决", positions)
+    # 强制 LLM 不可用，强制走 HITL 升级路径
+    with patch("app.llm_factory.build_model", side_effect=RuntimeError("no key")):
+        r = resolver.resolve(ConflictType.OTHER, "无法自动裁决", positions)
     assert r.escalate_to_hitl is True
     assert r.created_issue_id is not None
     # state 中应有一个 issue
@@ -136,8 +140,11 @@ def test_escalation_creates_blocking_issue_in_state():
 
 
 def test_unknown_conflict_type_treated_as_other():
-    """未知 conflict_type 字符串归到 OTHER。"""
+    """未知 conflict_type 字符串归到 OTHER。LLM 不可用时走升级路径。"""
+    from unittest.mock import patch
+
     resolver = ConflictResolver()
-    r = resolver.resolve("totally_unknown", "x", [{"agent": "A"}])
+    with patch("app.llm_factory.build_model", side_effect=RuntimeError("no key")):
+        r = resolver.resolve("totally_unknown", "x", [{"agent": "A"}])
     # OTHER 走升级路径
     assert r.escalate_to_hitl is True

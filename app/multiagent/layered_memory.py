@@ -1,6 +1,6 @@
-"""Memory 分层实验：多 Agent 系统中的分层记忆。
+"""Memory 分层实验：多 Agent 系统中的分层记忆（实验性，未接入主链）。
 
-设计（P2-2 实验性原型）：
+分层设计（从快到慢）：
 1. **Working Memory（工作记忆）**：当前轮次上下文，本轮结束后清空
 2. **Episodic Memory（情景记忆）**：单次 task run 内的轮次/消息序列
 3. **Semantic Memory（语义记忆）**：跨 task 持久化的事实/学到的知识（KB）
@@ -16,6 +16,10 @@
 - Working：进程内 dict，无持久化
 - Episodic：MultiAgent store 的 agent_messages / team_rounds
 - Semantic / Procedural：扩展 store 的 memory_entries 表
+
+注意（Req 10）：TeamRoundExecutor._persist_agent_memory 已在主循环中调用本系统写入，
+但 RuntimeAdapter 中的 _retrieve_relevant_memory 调用受 try/except 保护——检索失败不阻断
+主循环。本模块处于"持续打磨"状态，需更多端到端验证，不属于稳定 API 一部分。
 """
 
 from __future__ import annotations
@@ -174,14 +178,41 @@ class PersistentMemory:
 
     生产环境应改用 sqlstore + 向量索引；当前用 in-memory dict 兜底，
     保证接口稳定，方便后续替换实现。
+
+    可选注入 store（MultiAgentStore）：注入后 add / get / retrieve 会自动镜像到 SQLite
+    memory_entries 表，实现跨 task / 跨进程持久化；同时第一次注入时会在内存层从 store
+    懒加载全部条目，保证旧条目不丢。
     """
 
-    def __init__(self, tier: str) -> None:
+    def __init__(self, tier: str, store: Any = None) -> None:
         if tier not in (MemoryTier.SEMANTIC, MemoryTier.PROCEDURAL):
             raise ValueError(f"PersistentMemory 只支持 semantic/procedural，传入：{tier}")
         self.tier = tier
         self._entries: dict[str, MemoryEntry] = {}
         self._lock = threading.Lock()
+        self._store = store
+        self._loaded_from_store = False
+
+    def attach_store(self, store: Any) -> None:
+        """关联 SQLite 数存储后端。幂等：重复 attach 不会重载。"""
+        self._store = store
+
+    def _ensure_loaded(self) -> None:
+        """首次访问 store 后从 SQLite 懒加载全部条目（仅一次）。"""
+        if self._loaded_from_store or self._store is None:
+            self._loaded_from_store = True
+            return
+        try:
+            rows = self._store.list_memory_entries(tier=self.tier, limit=10000)
+        except Exception as exc:
+            logger.warning(f"[PersistentMemory] 从 store 加载 {self.tier} 失败：{exc}")
+            rows = []
+        with self._lock:
+            for r in rows:
+                entry = _row_to_entry(r, self.tier)
+                if entry and entry.id not in self._entries:
+                    self._entries[entry.id] = entry
+        self._loaded_from_store = True
 
     def add(
         self,
@@ -190,6 +221,7 @@ class PersistentMemory:
         agent_scope: str | None = None,
         importance: float = 0.5,
         metadata: dict[str, Any] | None = None,
+        task_id: str | None = None,
     ) -> MemoryEntry:
         entry = MemoryEntry(
             id=id,
@@ -201,9 +233,11 @@ class PersistentMemory:
         )
         with self._lock:
             self._entries[id] = entry
+        self._persist(entry, task_id=task_id)
         return entry
 
     def get(self, id: str) -> MemoryEntry | None:
+        self._ensure_loaded()
         with self._lock:
             e = self._entries.get(id)
             if e:
@@ -217,6 +251,7 @@ class PersistentMemory:
         limit: int = 5,
     ) -> list[MemoryEntry]:
         """关键词模糊检索，按重要度+命中率排序。"""
+        self._ensure_loaded()
         with self._lock:
             pool = [e for e in self._entries.values() if e.agent_scope in (None, agent_scope)]
 
@@ -233,8 +268,106 @@ class PersistentMemory:
         return ranked
 
     def all_entries(self) -> list[MemoryEntry]:
+        self._ensure_loaded()
         with self._lock:
             return list(self._entries.values())
+
+    # ===== SQLite persistence =====
+
+    def _persist(self, entry: MemoryEntry, task_id: str | None = None) -> None:
+        if self._store is None:
+            return
+        try:
+            self._store.save_memory_entry({
+                "id": entry.id,
+                "tier": entry.tier,
+                "agent_scope": entry.agent_scope,
+                "content": entry.content,
+                "metadata": entry.metadata or {},
+                "importance": entry.importance,
+                "access_count": entry.access_count,
+                "created_at": entry.created_at.isoformat() if entry.created_at else None,
+                "last_accessed_at": (
+                    entry.last_accessed_at.isoformat() if entry.last_accessed_at else None
+                ),
+                "task_id": task_id or entry.metadata.get("task_id") if entry.metadata else None,
+            })
+        except Exception as exc:
+            logger.warning(f"[PersistentMemory] 持久化 {entry.id} 失败：{exc}")
+
+    def recall_from_store(
+        self,
+        query: str,
+        agent_scope: str | None = None,
+        limit: int = 5,
+    ) -> list[MemoryEntry]:
+        """直接走 store 关键词检索（不限于内存层已加载条目）。
+
+        比 retrieve 多看一份 SQLite 全量数据，用于 Agent 私有回忆。
+        """
+        if self._store is None:
+            return self.retrieve(query, agent_scope=agent_scope, limit=limit)
+        try:
+            rows = self._store.search_memory_entries(
+                query=query, tier=self.tier,
+                agent_scope=agent_scope, include_shared=True, limit=limit,
+            )
+        except Exception as exc:
+            logger.warning(f"[PersistentMemory] recall_from_store 失败：{exc}")
+            return self.retrieve(query, agent_scope=agent_scope, limit=limit)
+        # 同步内存层缓存
+        results: list[MemoryEntry] = []
+        with self._lock:
+            for r in rows:
+                entry = _row_to_entry(r, self.tier)
+                if not entry:
+                    continue
+                if entry.id not in self._entries:
+                    self._entries[entry.id] = entry
+                else:
+                    merged = self._entries[entry.id]
+                    merged.access_count = max(merged.access_count, entry.access_count)
+                    if entry.last_accessed_at and (
+                        not merged.last_accessed_at
+                        or entry.last_accessed_at > merged.last_accessed_at
+                    ):
+                        merged.last_accessed_at = entry.last_accessed_at
+                results.append(self._entries[entry.id])
+        return results
+
+
+def _row_to_entry(row: dict[str, Any], fallback_tier: str) -> MemoryEntry | None:
+    """把 store 行还原为 MemoryEntry。"""
+    if not row or not row.get("id"):
+        return None
+    try:
+        created_raw = row.get("created_at")
+        created = datetime.fromisoformat(created_raw) if isinstance(created_raw, str) else datetime.utcnow()
+    except Exception:
+        created = datetime.utcnow()
+    try:
+        last_raw = row.get("last_accessed_at")
+        last = datetime.fromisoformat(last_raw) if isinstance(last_raw, str) else None
+    except Exception:
+        last = None
+    metadata = row.get("metadata") or {}
+    if isinstance(metadata, str):
+        import json as _json
+        try:
+            metadata = _json.loads(metadata)
+        except Exception:
+            metadata = {}
+    return MemoryEntry(
+        id=row["id"],
+        tier=row.get("tier") or fallback_tier,
+        agent_scope=row.get("agent_scope"),
+        content=row.get("content") or "",
+        metadata=metadata if isinstance(metadata, dict) else {},
+        created_at=created,
+        last_accessed_at=last,
+        access_count=int(row.get("access_count") or 0),
+        importance=float(row.get("importance") or 0.5),
+    )
 
 
 class LayeredMemorySystem:
@@ -247,12 +380,19 @@ class LayeredMemorySystem:
     4. 跨 Agent 共享层用 None agent_scope
     """
 
-    def __init__(self) -> None:
+    def __init__(self, store: Any = None) -> None:
         self.working = WorkingMemory()
         self.episodic: dict[str, EpisodicMemory] = {}  # by task_id
-        self.semantic = PersistentMemory(MemoryTier.SEMANTIC)
-        self.procedural = PersistentMemory(MemoryTier.PROCEDURAL)
+        self.semantic = PersistentMemory(MemoryTier.SEMANTIC, store=store)
+        self.procedural = PersistentMemory(MemoryTier.PROCEDURAL, store=store)
         self._ep_lock = threading.Lock()
+        self._store = store
+
+    def attach_store(self, store: Any) -> None:
+        """关联 SQLite 持久化后端。已存在条目保留，新写入会镜像到 store。"""
+        self._store = store
+        self.semantic.attach_store(store)
+        self.procedural.attach_store(store)
 
     # ---- Episodic 分 task 管理 ----
     def get_episodic(self, task_id: str) -> EpisodicMemory:
@@ -287,14 +427,16 @@ class LayeredMemorySystem:
                 metadata.get("id") if metadata else None
             ) or f"sem_{int(time.time()*1000)}"
             return self.semantic.add(
-                entry_id, content, agent_scope=agent_scope, importance=importance, metadata=metadata
+                entry_id, content, agent_scope=agent_scope, importance=importance,
+                metadata=metadata, task_id=task_id,
             )
         if tier == MemoryTier.PROCEDURAL:
             entry_id = (
                 metadata.get("id") if metadata else None
             ) or f"proc_{int(time.time()*1000)}"
             return self.procedural.add(
-                entry_id, content, agent_scope=agent_scope, importance=importance, metadata=metadata
+                entry_id, content, agent_scope=agent_scope, importance=importance,
+                metadata=metadata, task_id=task_id,
             )
         raise ValueError(f"unknown tier: {tier}")
 
@@ -321,9 +463,9 @@ class LayeredMemorySystem:
                 raise ValueError("episodic retrieve 需要 task_id")
             return self.get_episodic(task_id).retrieve(query, agent_scope=agent_scope, limit=limit)
         if tier == MemoryTier.SEMANTIC:
-            return self.semantic.retrieve(query, agent_scope=agent_scope, limit=limit)
+            return self.semantic.recall_from_store(query, agent_scope=agent_scope, limit=limit)
         if tier == MemoryTier.PROCEDURAL:
-            return self.procedural.retrieve(query, agent_scope=agent_scope, limit=limit)
+            return self.procedural.recall_from_store(query, agent_scope=agent_scope, limit=limit)
         raise ValueError(f"unknown tier: {tier}")
 
     def snapshot(self, task_id: str | None = None) -> dict[str, Any]:
@@ -350,4 +492,15 @@ def get_layered_memory() -> LayeredMemorySystem:
     with _singleton_lock:
         if _global_layered_memory is None:
             _global_layered_memory = LayeredMemorySystem()
+            _try_attach_store(_global_layered_memory)
         return _global_layered_memory
+
+
+def _try_attach_store(memory: LayeredMemorySystem) -> None:
+    """Lazy attach store：只在 store 可安全获取时绑定，缺失库时不抛错。"""
+    try:
+        from app.multiagent.store import get_multiagent_store
+        store = get_multiagent_store()
+        memory.attach_store(store)
+    except Exception as exc:
+        logger.warning(f"[layered_memory] attach SQLite store 失败，回退纯内存模式：{exc}")

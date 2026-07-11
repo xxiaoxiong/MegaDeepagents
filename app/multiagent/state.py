@@ -35,6 +35,10 @@ class TeamPhase(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    # 新增：区分"达到上限但未成功"与真正成功
+    INCOMPLETE = "incomplete"  # 达到最大轮次但未满足成功条件
+    TIMED_OUT = "timed_out"  # 超时
+    WAITING_HUMAN = "waiting_human"  # 等待人工处理
 
 
 class IssueSeverity(str, Enum):
@@ -143,7 +147,10 @@ class SharedTeamState(BaseModel):
     # ========== 合法阶段转换 ==========
 
     # 终态：进入后不可再变
-    _TERMINAL: set["TeamPhase"] = {TeamPhase.COMPLETED, TeamPhase.FAILED, TeamPhase.CANCELLED}
+    _TERMINAL: set["TeamPhase"] = {
+        TeamPhase.COMPLETED, TeamPhase.FAILED, TeamPhase.CANCELLED,
+        TeamPhase.INCOMPLETE, TeamPhase.TIMED_OUT,
+    }
     # 工作中阶段：相互之间可自由跳转
     _WORKING: set["TeamPhase"] = {
         TeamPhase.PLANNING,

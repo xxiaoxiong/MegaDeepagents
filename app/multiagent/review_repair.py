@@ -44,6 +44,7 @@ class ReviewResult:
         self.passed = passed
         self.issues = issues or []
         self.required_fix_owner = required_fix_owner
+        self.raw = raw
 
 
 class ReviewRepairLoop:
@@ -52,6 +53,10 @@ class ReviewRepairLoop:
     def __init__(self, max_cycles: int = 3):
         self.max_cycles = max_cycles
         self.cycle_count = 0
+
+    def reset_max_cycles(self, max_cycles: int) -> None:
+        """根据有效运行策略重新设置最大返工次数。"""
+        self.max_cycles = max_cycles
 
     @traceable(name="review_repair", run_type="chain")
     def process_review_result(
