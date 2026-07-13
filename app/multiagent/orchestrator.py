@@ -71,6 +71,7 @@ class SimpleOrchestrator:
         max_rounds: int = 30,
         checkpoint_path: str | None = None,
         ctx: TeamRunContext | None = None,
+        cancel_event: Any | None = None,
     ):
         self.planner = planner
         self._executor = executor or _InMemoryWorkerExecutor()
@@ -80,6 +81,7 @@ class SimpleOrchestrator:
         self.max_rounds = max_rounds
         self.checkpoint_path = checkpoint_path
         self._ctx = ctx  # TeamRunContext for workspace/run_id
+        self.cancel_event = cancel_event
 
         self._result: OrchestrationResult = OrchestrationResult()
         self._task_graph = None
@@ -124,6 +126,13 @@ class SimpleOrchestrator:
                 return self._result
             self._emit_event("planning_finished", {"task_count": len(dag.nodes)})
 
+            # TASK_TEAM normal runs must create real teammates before the
+            # scheduler starts.  DISCUSSION remains on TeamRunner elsewhere.
+            if self._ctx is not None:
+                from app.multiagent.default_teams import get_team
+                from app.multiagent.team_builder import TeamBuilder
+                TeamBuilder().build_team_sync(self._ctx, get_team(self._ctx.team_id), dag)
+
             # 3. 调度 + 执行
             self.phase = "scheduling"
             self._result.total_tasks = len(dag.nodes)
@@ -142,6 +151,8 @@ class SimpleOrchestrator:
             self._result.verification_verdict = verdict
             self._log(f"验证结果: {verdict}")
             self._emit_event("verification_done", {"verdict": verdict})
+            if verdict == "pass":
+                self._mark_produced_verified(dag)
 
             # 5. Repair / Replan 循环
             repair_round = 0
@@ -296,10 +307,11 @@ class SimpleOrchestrator:
 
         try:
             from app.multiagent.parallel_scheduler import ParallelTeamScheduler
-            from app.multiagent.agent_registry import get_agent_registry
-            from app.multiagent.task_board import get_task_board
 
-            sched = ParallelTeamScheduler(run_id=run_id, max_rounds=self.max_rounds)
+            sched = ParallelTeamScheduler(
+                run_id=run_id, task_graph=dag, max_rounds=self.max_rounds,
+                verifier=self.verifier, cancel_event=self.cancel_event,
+            )
             # 调用方传入的真实 executor（DeepAgentExecutor / 测试 stub）
             executor_used = self._executor or _InMemoryWorkerExecutor()
             run_result = self._run_parallel(sched, executor_used)
@@ -311,23 +323,10 @@ class SimpleOrchestrator:
             )
             # 把 BoardTask 终态反映回 dag.nodes，让 _verify 能判断
             self._sync_board_to_dag(run_id, dag)
-            return True
+            return status == "completed"
         except Exception as exc:
-            logger.error(f"[Orchestrator] ParallelTeamScheduler 不可用，回退 sync: {exc}")
-            # 兜底：sync fallback
-            scheduler = TaskScheduler(
-                task_dag=dag,
-                max_rounds=self.max_rounds,
-                worker_executor=self._executor,
-            )
-            result = scheduler._run_sync_fallback(task_input={
-                "run_id": run_id,
-                "workspace_root": self._ctx.workspace_root if self._ctx else "",
-            })
-            self.current_round = result.get("rounds", 0)
-            status = result.get("status", "failed")
-            self._log(f"调度完成(回退): status={status}, rounds={self.current_round}")
-            return status in ("completed", "incomplete")
+            logger.error(f"[Orchestrator] ParallelTeamScheduler failed: {exc}")
+            return False
 
     def _run_parallel(self, sched, executor):
         """在事件循环中跑 ParallelTeamScheduler.run。
@@ -389,6 +388,8 @@ class SimpleOrchestrator:
             target: TaskNodeStatus | None = None
             if bt.status == BoardTaskStatus.SUCCEEDED:
                 target = TaskNodeStatus.SUCCEEDED
+            elif bt.status in (BoardTaskStatus.PRODUCED, BoardTaskStatus.VERIFYING):
+                target = TaskNodeStatus.RUNNING
             elif bt.status == BoardTaskStatus.FAILED:
                 target = TaskNodeStatus.FAILED
             elif bt.status in (BoardTaskStatus.RUNNING, BoardTaskStatus.CLAIMED):
@@ -417,7 +418,7 @@ class SimpleOrchestrator:
             workspace_root = self._ctx.workspace_root if self._ctx else None
 
             for node in dag.nodes.values():
-                if node.status.value == "succeeded":
+                if node.status.value in ("succeeded", "running"):
                     entry: dict[str, Any] = {
                         "content_preview": node.objective[:200],
                         "status": node.status.value,
@@ -442,10 +443,23 @@ class SimpleOrchestrator:
                     artifacts[f"task:{node.id}"] = entry
 
             result = self.verifier.validate(goal=goal, artifacts=artifacts)
+            self._last_validation_result = result
             return result.verdict.value
         except Exception as exc:
             logger.warning(f"[Verifier] validate failed: {exc}")
             return "repair"
+
+    def _mark_produced_verified(self, dag) -> None:
+        """Only a passing verifier is allowed to complete board tasks."""
+        if not self._ctx:
+            return
+        from app.multiagent.task_board import get_task_board, BoardTaskStatus
+        board = get_task_board()
+        for task in board.list_by_run(self._ctx.run_id):
+            if task.status in (BoardTaskStatus.PRODUCED, BoardTaskStatus.VERIFYING):
+                board.mark_verifying(task.task_id, run_id=self._ctx.run_id)
+                board.mark_verified(task.task_id, run_id=self._ctx.run_id)
+        self._sync_board_to_dag(self._ctx.run_id, dag)
 
     def _repair(self, dag, verdict: str):
         """根据 Verifier 的 REPAIR 结果创建修复任务。"""
@@ -505,6 +519,7 @@ def run_orchestrated(
     router: Any = None,
     max_repair_rounds: int = 3,
     ctx: TeamRunContext | None = None,
+    cancel_event: Any | None = None,
 ) -> OrchestrationResult:
     """一站式编排执行入口。"""
     orch = SimpleOrchestrator(
@@ -514,5 +529,6 @@ def run_orchestrated(
         router=router,
         max_repair_rounds=max_repair_rounds,
         ctx=ctx,
+        cancel_event=cancel_event,
     )
     return orch.run(goal=goal, context=context, mode_override=mode_override, ctx=ctx)
