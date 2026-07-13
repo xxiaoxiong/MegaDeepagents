@@ -7,6 +7,7 @@ Phase C 第二步：持久化（Plan-G 第 7 节）。
 from __future__ import annotations
 
 from datetime import datetime
+import threading
 from typing import Any
 
 from app.core.logging import logger
@@ -31,13 +32,15 @@ class AgentRegistry:
     def __init__(self, lease_timeout_seconds: int = 60) -> None:
         self._agents: dict[str, AgentInstance] = {}
         self._lease_timeout = lease_timeout_seconds
+        self._lock = threading.RLock()
 
     # ===== 注册 =====
 
     def register_agent(self, instance: AgentInstance) -> AgentInstance:
         """注册一个新 AgentInstance。"""
-        instance.heartbeat()
-        self._agents[instance.agent_id] = instance
+        with self._lock:
+            instance.heartbeat()
+            self._agents[instance.agent_id] = instance
         logger.info(
             f"[AgentRegistry] registered agent={instance.agent_id} "
             f"role={instance.role} run={instance.run_id}"
@@ -56,6 +59,11 @@ class AgentRegistry:
         checkpoint_namespace: str | None = None,
         workspace_root: str = "",
         agent_id_override: str | None = None,
+        session_id_override: str | None = None,
+        thread_id_override: str | None = None,
+        checkpoint_namespace_override: str | None = None,
+        created_at_override: datetime | None = None,
+        max_concurrency: int = 1,
     ) -> AgentInstance:
         """快捷创建并注册一个 AgentInstance。"""
         agent_id = agent_id_override or make_agent_id()
@@ -67,11 +75,13 @@ class AgentRegistry:
             name=name,
             role=role,
             description=description,
-            session_id=make_session_id(),
-            thread_id=make_session_id(),
-            checkpoint_namespace=checkpoint_namespace or f"agent:{name}:{run_id}",
+            session_id=session_id_override or make_session_id(),
+            thread_id=thread_id_override or make_session_id(),
+            checkpoint_namespace=checkpoint_namespace_override or checkpoint_namespace or f"agent:{name}:{run_id}",
             workspace_root=workspace_root,
             capabilities=capabilities or [],
+            created_at=created_at_override or datetime.utcnow(),
+            max_concurrency=max_concurrency,
         )
         # 创建后置 SPAWNING → IDLE
         instance.status = AgentStatus.IDLE
@@ -105,15 +115,52 @@ class AgentRegistry:
 
     def find_idle(self, run_id: str, capabilities: list[str] | None = None) -> AgentInstance | None:
         """找一个空闲 Agent（按 capabilities 过滤）。"""
-        for a in self._agents.values():
-            if a.run_id != run_id:
-                continue
-            if a.status != AgentStatus.IDLE:
-                continue
-            if capabilities and not any(c in a.capabilities for c in capabilities):
-                continue
-            return a
+        with self._lock:
+            for a in self._agents.values():
+                if a.run_id != run_id or a.status != AgentStatus.IDLE:
+                    continue
+                if capabilities and not set(capabilities).issubset(set(a.capabilities)):
+                    continue
+                return a
         return None
+
+    def reserve_idle_agent(
+        self, run_id: str, required_capabilities: set[str], task_id: str,
+    ) -> AgentInstance | None:
+        """Atomically select and reserve a compatible idle teammate.
+
+        Scheduling used to call ``find_idle`` and only changed the state after
+        an await point, so multiple coroutines could select one worker.  The
+        CLAIMING state is intentionally set while the same lock is held.
+        """
+        with self._lock:
+            for agent in self._agents.values():
+                if agent.run_id != run_id or agent.status != AgentStatus.IDLE:
+                    continue
+                if not required_capabilities.issubset(set(agent.capabilities)):
+                    continue
+                if agent.max_concurrency < 1:
+                    continue
+                if not agent.update_status(AgentStatus.CLAIMING):
+                    continue
+                agent.current_task_id = task_id
+                agent.heartbeat()
+                return agent
+        return None
+
+    def release_reservation(self, agent_id: str, task_id: str | None = None) -> bool:
+        with self._lock:
+            agent = self._agents.get(agent_id)
+            if agent is None:
+                return False
+            if task_id and agent.current_task_id != task_id:
+                return False
+            if agent.status not in (AgentStatus.CLAIMING, AgentStatus.RUNNING):
+                return False
+            agent.update_status(AgentStatus.IDLE)
+            agent.current_task_id = None
+            agent.heartbeat()
+            return True
 
     # ===== 心跳租约 =====
 

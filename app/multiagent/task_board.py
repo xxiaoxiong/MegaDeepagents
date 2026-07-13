@@ -24,7 +24,11 @@ class BoardTaskStatus(str, Enum):
     PENDING = "pending"
     CLAIMED = "claimed"
     RUNNING = "running"
+    PRODUCED = "produced"
+    VERIFYING = "verifying"
     SUCCEEDED = "succeeded"
+    REPAIR_REQUIRED = "repair_required"
+    REPLAN_REQUIRED = "replan_required"
     FAILED = "failed"
     BLOCKED = "blocked"
     CANCELLED = "cancelled"
@@ -66,16 +70,22 @@ class TaskBoard:
 
     def __init__(self) -> None:
         import threading
-        self._tasks: dict[str, BoardTask] = {}
-        self._by_run: dict[str, list[str]] = {}
+        # A local task id is only unique inside one TeamRun.  Keeping a
+        # composite key here prevents two concurrent runs from overwriting
+        # each other (both planners commonly emit ``task_1``).
+        self._tasks: dict[tuple[str, str], BoardTask] = {}
+        self._by_run: dict[str, list[tuple[str, str]]] = {}
         self._lock = threading.RLock()
 
     # ===== 添加 =====
 
     def add(self, task: BoardTask) -> BoardTask:
         with self._lock:
-            self._tasks[task.task_id] = task
-            self._by_run.setdefault(task.run_id, []).append(task.task_id)
+            key = (task.run_id, task.task_id)
+            self._tasks[key] = task
+            keys = self._by_run.setdefault(task.run_id, [])
+            if key not in keys:
+                keys.append(key)
             logger.debug(f"[TaskBoard] added task={task.task_id} run={task.run_id}")
             return task
 
@@ -104,10 +114,10 @@ class TaskBoard:
 
     # ===== 原子认领 =====
 
-    def claim(self, task_id: str, agent_id: str) -> ClaimResult:
+    def claim(self, task_id: str, agent_id: str, run_id: str | None = None) -> ClaimResult:
         """原子认领。如果 task 已被认领或不在 PENDING 状态，返回失败。"""
         with self._lock:
-            task = self._tasks.get(task_id)
+            task = self.get(task_id, run_id=run_id)
             if task is None:
                 return ClaimResult(success=False, reason="task_not_found")
             if task.status != BoardTaskStatus.PENDING:
@@ -118,7 +128,7 @@ class TaskBoard:
                 )
             # 检查依赖是否已完成
             for dep_id in task.dependencies:
-                dep = self._tasks.get(dep_id)
+                dep = self._tasks.get((task.run_id, dep_id))
                 if dep is None or dep.status != BoardTaskStatus.SUCCEEDED:
                     return ClaimResult(
                         success=False,
@@ -134,10 +144,10 @@ class TaskBoard:
             )
             return ClaimResult(success=True, task=task)
 
-    def start(self, task_id: str, agent_id: str) -> bool:
+    def start(self, task_id: str, agent_id: str, run_id: str | None = None) -> bool:
         """CLAIMED → RUNNING。"""
         with self._lock:
-            task = self._tasks.get(task_id)
+            task = self.get(task_id, run_id=run_id)
             if task is None or task.claimed_by != agent_id:
                 return False
             if task.status != BoardTaskStatus.CLAIMED:
@@ -146,10 +156,10 @@ class TaskBoard:
             task.updated_at = datetime.utcnow()
             return True
 
-    def release(self, task_id: str, agent_id: str, reason: str = "") -> bool:
+    def release(self, task_id: str, agent_id: str, reason: str = "", run_id: str | None = None) -> bool:
         """释放回 PENDING（让其他 Agent 认领）。"""
         with self._lock:
-            task = self._tasks.get(task_id)
+            task = self.get(task_id, run_id=run_id)
             if task is None or task.claimed_by != agent_id:
                 return False
             if task.status not in (BoardTaskStatus.CLAIMED, BoardTaskStatus.RUNNING, BoardTaskStatus.BLOCKED):
@@ -165,13 +175,12 @@ class TaskBoard:
 
     def complete(
         self,
-        task_id: str,
-        agent_id: str,
-        artifact_ids: list[str] | None = None,
+        task_id: str, agent_id: str, artifact_ids: list[str] | None = None,
+        run_id: str | None = None,
     ) -> bool:
         """标记 succeeded。"""
         with self._lock:
-            task = self._tasks.get(task_id)
+            task = self.get(task_id, run_id=run_id)
             if task is None or task.claimed_by != agent_id:
                 return False
             task.status = BoardTaskStatus.SUCCEEDED
@@ -184,10 +193,54 @@ class TaskBoard:
             )
             return True
 
-    def fail(self, task_id: str, agent_id: str, error: str) -> bool:
+    def mark_produced(
+        self, task_id: str, agent_id: str, artifact_ids: list[str] | None,
+        run_id: str | None = None,
+    ) -> bool:
+        """Record worker output; only the verifier may mark SUCCEEDED."""
+        with self._lock:
+            task = self.get(task_id, run_id=run_id)
+            if task is None or task.claimed_by != agent_id:
+                return False
+            if task.status != BoardTaskStatus.RUNNING:
+                return False
+            task.status = BoardTaskStatus.PRODUCED
+            task.produced_artifact_ids = list(dict.fromkeys(artifact_ids or []))
+            task.updated_at = datetime.utcnow()
+            return True
+
+    def mark_verifying(self, task_id: str, run_id: str | None = None) -> bool:
+        with self._lock:
+            task = self.get(task_id, run_id=run_id)
+            if task is None or task.status != BoardTaskStatus.PRODUCED:
+                return False
+            task.status = BoardTaskStatus.VERIFYING
+            task.updated_at = datetime.utcnow()
+            return True
+
+    def mark_verified(self, task_id: str, run_id: str | None = None) -> bool:
+        with self._lock:
+            task = self.get(task_id, run_id=run_id)
+            if task is None or task.status not in (BoardTaskStatus.PRODUCED, BoardTaskStatus.VERIFYING):
+                return False
+            task.status = BoardTaskStatus.SUCCEEDED
+            task.completed_at = datetime.utcnow()
+            task.updated_at = datetime.utcnow()
+            return True
+
+    def mark_repair_required(self, task_id: str, run_id: str | None = None) -> bool:
+        with self._lock:
+            task = self.get(task_id, run_id=run_id)
+            if task is None or task.status not in (BoardTaskStatus.PRODUCED, BoardTaskStatus.VERIFYING):
+                return False
+            task.status = BoardTaskStatus.REPAIR_REQUIRED
+            task.updated_at = datetime.utcnow()
+            return True
+
+    def fail(self, task_id: str, agent_id: str, error: str, run_id: str | None = None) -> bool:
         """标记 failed（或重置为 PENDING 如果还有重试次数）。"""
         with self._lock:
-            task = self._tasks.get(task_id)
+            task = self.get(task_id, run_id=run_id)
             if task is None or task.claimed_by != agent_id:
                 return False
             task.attempts += 1
@@ -212,12 +265,20 @@ class TaskBoard:
 
     # ===== 查询 =====
 
-    def get(self, task_id: str) -> BoardTask | None:
-        return self._tasks.get(task_id)
+    def get(self, task_id: str, run_id: str | None = None) -> BoardTask | None:
+        """Return a task, requiring a run id whenever it is ambiguous.
+
+        The optional argument preserves the old single-run API without
+        silently selecting a task from another concurrent run.
+        """
+        if run_id is not None:
+            return self._tasks.get((run_id, task_id))
+        matches = [task for (rid, tid), task in self._tasks.items() if tid == task_id]
+        return matches[0] if len(matches) == 1 else None
 
     def list_by_run(self, run_id: str) -> list[BoardTask]:
-        ids = self._by_run.get(run_id, [])
-        return [self._tasks[i] for i in ids if i in self._tasks]
+        keys = self._by_run.get(run_id, [])
+        return [self._tasks[key] for key in keys if key in self._tasks]
 
     def list_pending(self, run_id: str) -> list[BoardTask]:
         return [
@@ -233,15 +294,14 @@ class TaskBoard:
         for t in self.list_pending(run_id):
             # 依赖检查
             if not all(
-                self._tasks.get(dep) and
-                self._tasks[dep].status == BoardTaskStatus.SUCCEEDED
+                self._tasks.get((run_id, dep)) is not None and
+                self._tasks[(run_id, dep)].status == BoardTaskStatus.SUCCEEDED
                 for dep in t.dependencies
-                if dep in self._tasks
             ):
                 continue
             # 能力检查
             if capabilities and t.required_capabilities:
-                if not any(c in capabilities for c in t.required_capabilities):
+                if not set(t.required_capabilities).issubset(set(capabilities)):
                     continue
             result.append(t)
         result.sort(key=lambda x: -x.priority)
@@ -252,6 +312,13 @@ class TaskBoard:
         if not tasks:
             return True
         return all(t.status == BoardTaskStatus.SUCCEEDED for t in tasks)
+
+    def all_produced(self, run_id: str) -> bool:
+        tasks = self.list_by_run(run_id)
+        return bool(tasks) and all(
+            task.status in (BoardTaskStatus.PRODUCED, BoardTaskStatus.SUCCEEDED)
+            for task in tasks
+        )
 
     def summary(self, run_id: str) -> dict[str, int]:
         tasks = self.list_by_run(run_id)

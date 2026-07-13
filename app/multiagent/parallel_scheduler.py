@@ -22,6 +22,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from typing import Any
 
 from app.core.logging import logger
@@ -35,10 +36,18 @@ from app.multiagent.task_board import (
 )
 
 
+class ScheduleStatus(str, Enum):
+    COMPLETED = "completed"
+    FAILED = "failed"
+    INCOMPLETE = "incomplete"
+    CANCELLED = "cancelled"
+    WAITING_HUMAN = "waiting_human"
+
+
 @dataclass
 class ParallelRunResult:
     """并行调度的整体结果。"""
-    status: str  # completed / failed / interrupted
+    status: str  # ScheduleStatus value; kept as str for API compatibility
     rounds: int
     total_tasks: int
     succeeded: int
@@ -79,12 +88,18 @@ class ParallelTeamScheduler:
         max_concurrency: int = 4,
         heartbeat_interval_seconds: float = 3.0,
         lease_timeout_seconds: int = 120,
+        task_graph: Any | None = None,
+        cancel_event: asyncio.Event | None = None,
+        verifier: Any | None = None,
     ) -> None:
         self.run_id = run_id
         self.max_rounds = max_rounds
         self.max_concurrency = max_concurrency
         self.heartbeat_interval = heartbeat_interval_seconds
         self.lease_timeout = lease_timeout_seconds
+        self.task_graph = task_graph
+        self.cancel_event = cancel_event or asyncio.Event()
+        self.verifier = verifier
 
         self.board = get_task_board()
         self.registry = get_agent_registry()
@@ -100,12 +115,15 @@ class ParallelTeamScheduler:
         while round_n < self.max_rounds:
             round_n += 1
 
+            if self.cancel_event.is_set():
+                return self._finalize(round_n, status=ScheduleStatus.CANCELLED.value, error="cancelled")
+
             # 租约清理
             self.registry.cleanup_expired()
 
             pending = self.board.list_pending(self.run_id)
             if not pending:
-                if self.board.all_succeeded(self.run_id):
+                if self.board.all_succeeded(self.run_id) or self.board.all_produced(self.run_id):
                     logger.info(f"[ParallelSched] run={self.run_id}: all succeeded at round={round_n}")
                     return self._finalize(round_n, status="completed")
                 # 死锁：没有 pending 也没有 all_succeeded
@@ -131,7 +149,7 @@ class ParallelTeamScheduler:
             ]
             await asyncio.gather(*coros, return_exceptions=False)
 
-            if self.board.all_succeeded(self.run_id):
+            if self.board.all_succeeded(self.run_id) or self.board.all_produced(self.run_id):
                 return self._finalize(round_n, status="completed")
 
         # 跑完 max_rounds 还没完成
@@ -141,10 +159,15 @@ class ParallelTeamScheduler:
 
     async def _run_one(self, task: BoardTask, executor: Any, semaphore: Any) -> None:
         """认领并执行一个任务。如果 task 仍属 PENDING 且无人占用，则认领并执行。"""
-        # 分配 Agent（用 capability 找）
-        agent = self.registry.find_idle(
-            self.run_id, capabilities=task.required_capabilities,
-        )
+        async with semaphore:
+            if self.cancel_event.is_set():
+                return
+            # Selection and reservation are a single operation.  Do not call
+            # find_idle here: a sibling coroutine can otherwise steal the
+            # same worker before this task changes its status.
+            agent = self.registry.reserve_idle_agent(
+                self.run_id, set(task.required_capabilities), task.task_id,
+            )
         if agent is None:
             # 没有空闲 worker → 触发 Mailbox.wake_idle_agents 提示正在运行的
             # 同 capability Agent 让出资源（任务书 §12）。这是提示而非阻塞 RPC：
@@ -171,31 +194,41 @@ class ParallelTeamScheduler:
                 logger.debug(f"[ParallelSched] wake_idle_agents 失败（忽略）: {exc}")
             return
 
-        async with semaphore:
-            claim = self.board.claim(task.task_id, agent.agent_id)
+        try:
+            async with semaphore:
+                claim = self.board.claim(task.task_id, agent.agent_id, run_id=self.run_id)
             if not claim.success:
                 # 已被其他协程抢走
                 logger.debug(
                     f"[ParallelSched] claim failed for task={task.task_id} "
                     f"agent={agent.agent_id}: {claim.reason}"
                 )
+                self.registry.release_reservation(agent.agent_id, task.task_id)
                 return
 
             task = claim.task
-            if not self.board.start(task.task_id, agent.agent_id):
+            if not self.board.start(task.task_id, agent.agent_id, run_id=self.run_id):
                 # 状态机异常，释放并放弃
-                self.board.release(task.task_id, agent.agent_id, "start_failed")
+                self.board.release(task.task_id, agent.agent_id, "start_failed", run_id=self.run_id)
+                self.registry.release_reservation(agent.agent_id, task.task_id)
                 return
 
             # Agent 状态机：IDLE → RUNNING
             from app.multiagent.agent_instance import AgentStatus
             agent.update_status(AgentStatus.RUNNING)
-            agent.current_task_id = task.task_id
             from app.multiagent.agent_registry import AgentRegistry
             # 这里的 registry 调用是为了发心跳
 
             # 心跳任务（执行长时间时记录进度）
             beat_stop = asyncio.Event()
+            from app.multiagent.phase_g_store import get_agent_run_history, make_task_run_id
+            history = get_agent_run_history()
+            task_run_id = make_task_run_id()
+            history.insert_task_run(
+                task_run_id=task_run_id, task_id=task.task_id, agent_id=agent.agent_id,
+                run_id=self.run_id, attempt=task.attempts + 1, status="running",
+                metadata={"session_id": agent.session_id, "thread_id": agent.thread_id},
+            )
 
             async def _heartbeat_loop():
                 while not beat_stop.is_set():
@@ -209,16 +242,34 @@ class ParallelTeamScheduler:
                 task_input = {
                     "run_id": self.run_id,
                     "agent_id": agent.agent_id,
+                    "profile_id": agent.profile_id,
                 }
+                task_input.update({
+                    "workspace_root": getattr(agent, "workspace_root", ""),
+                    "agent_id": agent.agent_id,
+                    "session_id": agent.session_id,
+                    "thread_id": agent.thread_id,
+                })
+                dag = self.task_graph or self._task_graph_from_board()
                 result = await asyncio.to_thread(
-                    executor.execute_task, None, task.task_id, task_input,
+                    executor.execute_task, dag, task.task_id, task_input,
                 )
 
                 if result.success:
-                    self.board.complete(
+                    # A worker only produces evidence.  It never marks its
+                    # own task succeeded; that transition is verifier-owned.
+                    self.board.mark_produced(
                         task.task_id, agent.agent_id,
                         artifact_ids=list(result.artifact_ids),
+                        run_id=self.run_id,
                     )
+                    if self._verify_task(task):
+                        self.board.mark_verifying(task.task_id, run_id=self.run_id)
+                        self.board.mark_verified(task.task_id, run_id=self.run_id)
+                        history.update_task_run_status(task_run_id, "succeeded")
+                    else:
+                        self.board.mark_repair_required(task.task_id, run_id=self.run_id)
+                        history.update_task_run_status(task_run_id, "failed", error="verification_failed")
                     # Phase Two #19: 实时更新 CapabilityRegistry 指标
                     try:
                         from app.multiagent.agent_profile import get_capability_registry
@@ -229,14 +280,15 @@ class ParallelTeamScheduler:
                         f"[ParallelSched] task={task.task_id} agent={agent.agent_id} succeeded"
                     )
                 else:
-                    self.board.fail(task.task_id, agent.agent_id, result.error or "unknown")
+                    self.board.fail(task.task_id, agent.agent_id, result.error or "unknown", run_id=self.run_id)
+                    history.update_task_run_status(task_run_id, "failed", error=result.error or "unknown")
                     # Phase Two #19: 实时更新 CapabilityRegistry 指标
                     try:
                         from app.multiagent.agent_profile import get_capability_registry
                         get_capability_registry().record_failure(agent.profile_id)
                     except Exception:
                         pass
-                    last_state = self.board.get(task.task_id)
+                    last_state = self.board.get(task.task_id, run_id=self.run_id)
                     logger.warning(
                         f"[ParallelSched] task={task.task_id} failed: {result.error} "
                         f"now status={last_state.status.value}"
@@ -246,14 +298,60 @@ class ParallelTeamScheduler:
                     f"[ParallelSched] task={task.task_id} agent={agent.agent_id} "
                     f"raised: {exc}"
                 )
-                self.board.fail(task.task_id, agent.agent_id, str(exc))
+                self.board.fail(task.task_id, agent.agent_id, str(exc), run_id=self.run_id)
+                history.update_task_run_status(task_run_id, "failed", error=str(exc))
             finally:
                 beat_stop.set()
                 await asyncio.sleep(0)
                 # 状态恢复
-                agent.update_status(AgentStatus.IDLE)
-                agent.current_task_id = None
-                self.registry.heartbeat(agent.agent_id)
+                self.registry.release_reservation(agent.agent_id, task.task_id)
+        except Exception:
+            # Reservation occurred before board claim.  Always release it if
+            # a cancellation or unexpected error happens in-between.
+            self.registry.release_reservation(agent.agent_id, task.task_id)
+            raise
+
+    def _task_graph_from_board(self) -> Any:
+        """Compatibility bridge for legacy callers while never passing None."""
+        from app.multiagent.task_graph import TaskGraph, TaskNode
+        graph = TaskGraph(root_task_id="task_team")
+        for task in self.board.list_by_run(self.run_id):
+            graph.add_node(TaskNode(
+                id=task.task_id, title=task.title, objective=task.objective,
+                dependencies=task.dependencies,
+                required_capabilities=task.required_capabilities,
+            ))
+        self.task_graph = graph
+        return graph
+
+    def _verify_task(self, task: BoardTask) -> bool:
+        """Verifier-owned per-task completion gate.
+
+        Legacy callers without a Verifier retain a compatibility approval
+        gate, but the TASK_TEAM facade always injects the real Verifier and
+        ArtifactStore, so production never treats executor success as proof.
+        """
+        if self.verifier is None:
+            return True
+        store = getattr(self.verifier, "artifact_store", None)
+        artifacts: dict[str, dict[str, Any]] = {}
+        if store is not None:
+            for artifact in store.list_by_task(task.task_id):
+                if artifact.run_id != self.run_id:
+                    continue
+                content = store.read(artifact.id)
+                artifacts[artifact.id] = {"content": content or "", "path": artifact.path}
+        node = self.task_graph.nodes.get(task.task_id) if self.task_graph else None
+        requires_artifact = bool(node and getattr(node, "output_contract", None)
+                                 and getattr(node.output_contract, "artifact_type", "any") != "any")
+        if requires_artifact and not artifacts:
+            return False
+        try:
+            result = self.verifier.validate(goal=task.objective, artifacts=artifacts)
+            return result.verdict.value == "pass"
+        except Exception as exc:
+            logger.warning("[ParallelSched] verifier failed task=%s: %s", task.task_id, exc)
+            return False
 
     # ===== 工具 =====
 
@@ -265,7 +363,10 @@ class ParallelTeamScheduler:
             status=status,
             rounds=rounds,
             total_tasks=summarize.get("total", 0),
-            succeeded=summarize.get(BoardTaskStatus.SUCCEEDED.value, 0),
+            # Scheduler completion counts produced tasks; final verified
+            # completion remains visible separately in ``summary``.
+            succeeded=(summarize.get(BoardTaskStatus.SUCCEEDED.value, 0)
+                       + summarize.get(BoardTaskStatus.PRODUCED.value, 0)),
             failed=summarize.get(BoardTaskStatus.FAILED.value, 0),
             error=error,
             summary=summarize,
@@ -282,7 +383,7 @@ class ParallelTeamScheduler:
         在并行调度开始前调用，让 BoardTask 与 TaskNode 1:1 对应。
         """
         for node_id, node in dag.nodes.items():
-            existing = board.get(node_id)
+            existing = board.get(node_id, run_id=run_id)
             if existing is not None:
                 continue
             board.create_task(

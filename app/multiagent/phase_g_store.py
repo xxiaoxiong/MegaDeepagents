@@ -39,6 +39,36 @@ class AgentRunHistory:
     def conn(self):
         return _get_conn()
 
+    # ===== TeamRun control plane =====
+
+    def save_team_run(self, *, run_id: str, goal: str, team_id: str, mode: str,
+                      workspace_root: str, status: str, max_rounds: int,
+                      review_required: bool, metadata: dict[str, Any] | None = None) -> None:
+        _ensure_team_runs(self.conn)
+        now = datetime.utcnow().isoformat()
+        self.conn.execute(
+            """INSERT INTO team_runs (run_id, goal, team_id, mode, workspace_root, status,
+               max_rounds, review_required, metadata, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(run_id) DO UPDATE SET status=excluded.status,
+               metadata=excluded.metadata, updated_at=excluded.updated_at""",
+            (run_id, goal, team_id, mode, workspace_root, status, max_rounds,
+             int(review_required), json.dumps(metadata or {}), now, now),
+        )
+        self.conn.commit()
+
+    def get_team_run(self, run_id: str) -> dict[str, Any] | None:
+        _ensure_team_runs(self.conn)
+        row = self.conn.execute("SELECT * FROM team_runs WHERE run_id = ?", (run_id,)).fetchone()
+        return _row_to_dict(row) if row else None
+
+    def update_team_run_status(self, run_id: str, status: str) -> bool:
+        _ensure_team_runs(self.conn)
+        cur = self.conn.execute("UPDATE team_runs SET status=?, updated_at=? WHERE run_id=?",
+                                (status, datetime.utcnow().isoformat(), run_id))
+        self.conn.commit()
+        return cur.rowcount > 0
+
     # ===== AgentInstance =====
 
     def upsert_agent_instance(
@@ -180,7 +210,13 @@ class AgentRunHistory:
         self.conn.commit()
         return cur.rowcount > 0
 
-    def latest_task_run(self, task_id: str) -> dict[str, Any] | None:
+    def latest_task_run(self, task_id: str, run_id: str | None = None) -> dict[str, Any] | None:
+        if run_id is not None:
+            row = self.conn.execute(
+                "SELECT * FROM task_runs WHERE task_id = ? AND run_id = ? ORDER BY attempt DESC LIMIT 1",
+                (task_id, run_id),
+            ).fetchone()
+            return _row_to_dict(row) if row else None
         row = self.conn.execute(
             "SELECT * FROM task_runs WHERE task_id = ? ORDER BY attempt DESC LIMIT 1",
             (task_id,)
@@ -344,7 +380,13 @@ class AgentRunHistory:
         ).fetchall()
         return [_row_to_dict(r) for r in rows]
 
-    def list_artifacts_by_task(self, task_id: str) -> list[dict[str, Any]]:
+    def list_artifacts_by_task(self, task_id: str, run_id: str | None = None) -> list[dict[str, Any]]:
+        if run_id is not None:
+            rows = self.conn.execute(
+                "SELECT * FROM artifacts WHERE task_id = ? AND run_id = ? ORDER BY version",
+                (task_id, run_id),
+            ).fetchall()
+            return [_row_to_dict(r) for r in rows]
         rows = self.conn.execute(
             "SELECT * FROM artifacts WHERE task_id = ? ORDER BY version", (task_id,)
         ).fetchall()
@@ -463,6 +505,18 @@ def _ensure_task_runs(conn) -> None:
     """在 task_runs 表存在的会话内确保表存在（防御性）。"""
     # 已由 _init_multiagent_db 创建，应已存在
     pass
+
+
+def _ensure_team_runs(conn) -> None:
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS team_runs (
+            run_id TEXT PRIMARY KEY, goal TEXT NOT NULL, team_id TEXT NOT NULL,
+            mode TEXT NOT NULL, workspace_root TEXT NOT NULL, status TEXT NOT NULL,
+            max_rounds INTEGER NOT NULL, review_required INTEGER NOT NULL,
+            metadata TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )"""
+    )
+    conn.commit()
 
 
 # ===== 全局单例 =====

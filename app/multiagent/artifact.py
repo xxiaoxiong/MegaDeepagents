@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -200,6 +201,7 @@ class ArtifactStore:
         5. 标记为 PUBLISHED
         """
         artifact_type = type if isinstance(type, ArtifactType) else ArtifactType(type)
+        self._safe_path(relative_path)  # validate before persisting metadata
         content_hash = compute_content_hash(content)
         size = len(content.encode("utf-8") if isinstance(content, str) else content)
 
@@ -322,14 +324,29 @@ class ArtifactStore:
         if not self._root_path:
             # 仅内存模式（测试或 diskless 场景）
             return
-        abs_path = os.path.join(self._root_path, artifact.path)
-        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        abs_path = self._safe_path(artifact.path)
+        abs_path.parent.mkdir(parents=True, exist_ok=True)
         if isinstance(content, str):
-            with open(abs_path, "w", encoding="utf-8") as f:
+            with abs_path.open("w", encoding="utf-8") as f:
                 f.write(content)
         else:
-            with open(abs_path, "wb") as f:
+            with abs_path.open("wb") as f:
                 f.write(content)
+
+    def _safe_path(self, relative_path: str) -> Path:
+        """Resolve an artifact path under the run root, rejecting escapes."""
+        if not self._root_path:
+            # Memory-only stores still reject an absolute / traversal path;
+            # accepting it would persist unsafe metadata for a later restore.
+            candidate = Path(relative_path)
+            if candidate.is_absolute() or ".." in candidate.parts:
+                raise ValueError(f"artifact path escapes store: {relative_path}")
+            return candidate
+        root = Path(self._root_path).resolve()
+        candidate = (root / relative_path).resolve()
+        if not candidate.is_relative_to(root):
+            raise ValueError(f"artifact path escapes store: {relative_path}")
+        return candidate
 
     # ---- 读取 ----
     def read(self, artifact_id: str) -> str | None:
@@ -339,10 +356,10 @@ class ArtifactStore:
             return None
         if not self._root_path:
             return None
-        abs_path = os.path.join(self._root_path, artifact.path)
-        if not os.path.isfile(abs_path):
+        abs_path = self._safe_path(artifact.path)
+        if not abs_path.is_file():
             return None
-        with open(abs_path, "r", encoding="utf-8") as f:
+        with abs_path.open("r", encoding="utf-8") as f:
             return f.read()
 
     def get(self, artifact_id: str) -> Artifact | None:

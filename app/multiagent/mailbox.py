@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import threading
+import asyncio
 import uuid
 from collections import defaultdict, deque
 from datetime import datetime
@@ -115,6 +116,7 @@ class Mailbox:
 
         # 顺序读出（绕内存即可）
         self._all_messages: dict[str, MailboxMessage] = {}
+        self._wake_events: dict[str, asyncio.Event] = {}
 
     # ===== 治理 API =====
 
@@ -154,6 +156,9 @@ class Mailbox:
             self._enforce_capacity(message.to_agent_id)
             self._inboxes[message.to_agent_id].append(message)
             self._all_messages[message.message_id] = message
+            event = self._wake_events.get(message.to_agent_id)
+            if event is not None:
+                event.set()
             logger.info(
                 f"[Mailbox] delivered msg={message.message_id} "
                 f"from={message.from_agent_id} → {message.to_agent_id}"
@@ -209,6 +214,24 @@ class Mailbox:
     def inbox_size(self, agent_id: str) -> int:
         with self._lock:
             return len(self._inboxes.get(agent_id, deque()))
+
+    async def wait_for_message(self, agent_id: str, timeout: float | None = None) -> MailboxMessage | None:
+        """Wait for mailbox delivery; queues are notifications, SQLite remains truth."""
+        messages = self.receive(agent_id, max_count=1)
+        if messages:
+            return messages[0]
+        event = self._wake_events.setdefault(agent_id, asyncio.Event())
+        try:
+            if timeout is None:
+                await event.wait()
+            else:
+                await asyncio.wait_for(event.wait(), timeout)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            event.clear()
+        messages = self.receive(agent_id, max_count=1)
+        return messages[0] if messages else None
 
     # ===== Idle Agent 唤醒（任务书 §12）=====
 
