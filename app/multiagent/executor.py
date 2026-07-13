@@ -420,7 +420,10 @@ class DeepAgentExecutor:
             dependencies=list(node.dependencies),
             required_capabilities=list(node.required_capabilities),
             max_attempts=node.max_attempts,
-            metadata={"priority": node.priority},
+            metadata={
+                "priority": node.priority,
+                "mailbox_messages": list(task_input.get("mailbox_messages", [])),
+            },
         )
         context = ExecutionContext(
             run_id=task_input.get("run_id") or self._ctx_run_id() or "cli_run",
@@ -504,6 +507,17 @@ class DeepAgentExecutor:
                 f"你必须使用可用工具完成任务。工具受限，越权调用将被拒绝。\n"
                 f"所有产物必须写入工作目录 {task_workspace}。\n"
             )
+            mailbox_messages = assignment.metadata.get("mailbox_messages", [])
+            if mailbox_messages:
+                directives = "\n".join(
+                    f"- {message.get('from_agent_id', 'agent')}: {message.get('content', '')}"
+                    for message in mailbox_messages
+                )
+                system_prompt += (
+                    "\n## 本轮收到的协作消息\n"
+                    "以下是已投递给你的任务级上下文；在不违反角色边界时应纳入执行。\n"
+                    f"{directives}\n"
+                )
 
             agent = create_deep_agent(
                 name=f"{profile.id}:{assignment.task_id}",
