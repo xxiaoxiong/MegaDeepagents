@@ -47,6 +47,7 @@ class ExecutionContext:
     workspace_root: str  # Run 级 workspace 根目录
     task_dag: TaskGraph | None = None
     langsmith_trace_id: str | None = None
+    thread_id: str | None = None
 
 
 @dataclass
@@ -171,31 +172,46 @@ class ModelDecisionExecutor:
 _LANGCHAIN_TOOL_NAMES: dict[str, str] = {}
 
 
+def _safe_workspace_path(root: str, requested: str) -> Path:
+    """Resolve a tool path without allowing traversal or symlink escape."""
+    base = Path(root).resolve()
+    candidate = (base / requested).resolve() if not Path(requested).is_absolute() else Path(requested).resolve()
+    if not candidate.is_relative_to(base):
+        raise ValueError(f"path escapes workspace: {requested}")
+    return candidate
+
+
 def _make_read_file_tool(task_workspace: str):
     from langchain.tools import tool
 
     @tool
     def read_file(file_path: str) -> str:
         """读取指定文件的全部内容。"""
-        import os
-        if not os.path.isfile(file_path):
+        try:
+            path = _safe_workspace_path(task_workspace, file_path)
+        except ValueError as exc:
+            return f"错误: {exc}"
+        if not path.is_file():
             return f"错误: 文件不存在 {file_path}"
-        with open(file_path, "r", encoding="utf-8") as f:
+        with path.open("r", encoding="utf-8") as f:
             return f.read()
     return read_file
 
 
-def _make_list_dir_tool():
+def _make_list_dir_tool(task_workspace: str):
     from langchain.tools import tool
 
     @tool
     def list_dir(path: str = ".") -> str:
         """列出指定目录中的文件和子目录。"""
-        import os
         import json
-        if not os.path.isdir(path):
+        try:
+            resolved = _safe_workspace_path(task_workspace, path)
+        except ValueError as exc:
+            return f"错误: {exc}"
+        if not resolved.is_dir():
             return f"错误: 目录不存在 {path}"
-        items = os.listdir(path)
+        items = [entry.name for entry in resolved.iterdir()]
         return json.dumps(items, ensure_ascii=False)
     return list_dir
 
@@ -206,20 +222,14 @@ def _make_create_file_tool(task_workspace: str):
     @tool
     def create_file(file_path: str, content: str) -> str:
         """创建或覆写文件。路径相对于工作目录。"""
-        import os
-        # 路径遍历防护
-        if ".." in file_path.split(os.sep) or ".." in file_path.split("/"):
-            return f"错误: 路径包含 '..' 遍历，已拒绝: {file_path}"
-        abs_path = os.path.join(task_workspace, file_path) if not os.path.isabs(file_path) else file_path
-        # 绝对路径必须限制在 task_workspace 内
-        if os.path.isabs(file_path):
-            abs_path = os.path.abspath(file_path)
-            if not abs_path.startswith(os.path.abspath(task_workspace)):
-                return f"错误: 路径越权: {file_path}"
-        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-        with open(abs_path, "w", encoding="utf-8") as f:
+        try:
+            path = _safe_workspace_path(task_workspace, file_path)
+        except ValueError as exc:
+            return f"错误: {exc}"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
             f.write(content)
-        return f"文件已写入: {abs_path}"
+        return f"文件已写入: {path}"
     return create_file
 
 
@@ -229,25 +239,20 @@ def _make_edit_file_tool(task_workspace: str):
     @tool
     def edit_file(file_path: str, old_string: str, new_string: str) -> str:
         """编辑文件的字符串替换。"""
-        import os
-        # 路径遍历防护
-        if ".." in file_path.split(os.sep) or ".." in file_path.split("/"):
-            return f"错误: 路径包含 '..' 遍历，已拒绝: {file_path}"
-        abs_path = os.path.join(task_workspace, file_path) if not os.path.isabs(file_path) else file_path
-        if os.path.isabs(file_path):
-            abs_path = os.path.abspath(file_path)
-            if not abs_path.startswith(os.path.abspath(task_workspace)):
-                return f"错误: 路径越权: {file_path}"
-        if not os.path.isfile(abs_path):
-            return f"错误: 文件不存在 {abs_path}"
-        with open(abs_path, "r", encoding="utf-8") as f:
+        try:
+            path = _safe_workspace_path(task_workspace, file_path)
+        except ValueError as exc:
+            return f"错误: {exc}"
+        if not path.is_file():
+            return f"错误: 文件不存在 {path}"
+        with path.open("r", encoding="utf-8") as f:
             content = f.read()
         if old_string not in content:
             return f"未找到要替换的字符串"
         content = content.replace(old_string, new_string, 1)
-        with open(abs_path, "w", encoding="utf-8") as f:
+        with path.open("w", encoding="utf-8") as f:
             f.write(content)
-        return f"已编辑 {abs_path}"
+        return f"已编辑 {path}"
     return edit_file
 
 
@@ -290,6 +295,9 @@ def _build_restricted_tools(
     allowed_tools: list[str],
     deny_default: bool,
     task_workspace: str,
+    allow_file_read: bool = True,
+    allow_file_write: bool = True,
+    allow_shell: bool = True,
 ) -> list[Any]:
     """根据权限构造受限工具列表。"""
     tools = []
@@ -297,15 +305,15 @@ def _build_restricted_tools(
     # 白名单查表
     allowed_set = set(allowed_tools)
 
-    if not deny_default or "read_file" in allowed_set:
+    if allow_file_read and (not deny_default or "read_file" in allowed_set):
         tools.append(_make_read_file_tool(task_workspace))
-    if not deny_default or "list_dir" in allowed_set:
-        tools.append(_make_list_dir_tool())
-    if not deny_default or "create_file" in allowed_set:
+    if allow_file_read and (not deny_default or "list_dir" in allowed_set):
+        tools.append(_make_list_dir_tool(task_workspace))
+    if allow_file_write and (not deny_default or "create_file" in allowed_set):
         tools.append(_make_create_file_tool(task_workspace))
-    if not deny_default or "edit_file" in allowed_set:
+    if allow_file_write and (not deny_default or "edit_file" in allowed_set):
         tools.append(_make_edit_file_tool(task_workspace))
-    if not deny_default or "execute" in allowed_set:
+    if allow_shell and (not deny_default or "execute" in allowed_set):
         tools.append(_make_execute_tool(task_workspace))
 
     return tools
@@ -392,16 +400,17 @@ class DeepAgentExecutor:
         # 确保 workspace/tasks/<task_id> 目录存在
         Path(workspace_root, "tasks", task_id).mkdir(parents=True, exist_ok=True)
 
-        # 选 profile：按 task.required_capabilities 在 CapabilityRegistry 匹配
-        try:
-            registry = get_capability_registry()
-            profile = registry.select_profile(node.required_capabilities)
-        except Exception as exc:
-            logger.warning(
-                f"[DeepAgentExecutor] select_profile failed for {task_id}: {exc}; "
-                f"fallback default coder profile"
+        # A missing capability must fail the assignment.  Falling back to a
+        # broad DefaultCoder would be an unapproved privilege escalation.
+        registry = get_capability_registry()
+        profile = registry.get_profile(task_input.get("profile_id", ""))
+        if profile is None:
+            profile = registry.find_best_worker(set(node.required_capabilities))
+        if profile is None or not set(node.required_capabilities).issubset(profile.capabilities):
+            return TaskResult(
+                task_id=task_id, success=False, artifact_ids=[],
+                error="no_matching_worker",
             )
-            profile = _fallback_coder_profile()
 
         assignment = TaskAssignment(
             task_id=task_id,
@@ -417,6 +426,7 @@ class DeepAgentExecutor:
             run_id=task_input.get("run_id") or self._ctx_run_id() or "cli_run",
             workspace_root=workspace_root,
             task_dag=task_dag,
+            thread_id=task_input.get("thread_id"),
         )
 
         result = self.execute(assignment, profile, context)
@@ -453,7 +463,6 @@ class DeepAgentExecutor:
         if self._mock_invoke is not None:
             return self._mock_invoke(assignment, profile, context)
 
-        from app.core.agent_factory import build_model, _get_sqlite_saver
         from deepagents import create_deep_agent
 
         task_workspace = Path(context.workspace_root) / "tasks" / assignment.task_id
@@ -465,14 +474,24 @@ class DeepAgentExecutor:
             # Phase Two #17: 让 profile.model_policy 真正影响模型选择
             from app.llm_factory import build_model_for_policy
             model = build_model_for_policy(getattr(profile, "model_policy", None))
-            checkpointer = _get_sqlite_saver()
+            # DeepAgent execution remains available when the optional
+            # langgraph sqlite checkpointer extra is absent.  A failed import
+            # must not prevent real tools/artifacts from running.
+            try:
+                from app.core.agent_factory import _get_sqlite_saver
+                checkpointer = _get_sqlite_saver()
+            except Exception as exc:
+                logger.warning("[DeepAgentExecutor] checkpoint unavailable: %s", exc)
+                checkpointer = None
 
             allowed_tools = profile.tool_policy.allowed_tools
             deny_default = profile.tool_policy.deny_all_by_default
 
             tools = _build_restricted_tools(
-                allowed_tools, deny_default,
-                task_workspace=str(task_workspace),
+                allowed_tools, deny_default, task_workspace=str(task_workspace),
+                allow_file_read=profile.tool_policy.allow_file_read,
+                allow_file_write=profile.tool_policy.allow_file_write,
+                allow_shell=profile.tool_policy.allow_shell,
             )
 
             system_prompt = (
@@ -504,32 +523,35 @@ class DeepAgentExecutor:
                      f"完成后返回结果摘要。")
                 ]
             }, config={
-                "configurable": {"thread_id": f"{context.run_id}:{assignment.task_id}"},
+                "configurable": {"thread_id": getattr(context, "thread_id", None) or f"{context.run_id}:{assignment.task_id}"},
                 "recursion_limit": 80,
             })
 
             elapsed = time.time() - start
             tool_calls = _extract_tool_calls(response)
 
+            ignored_parts = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".cache"}
             produced_files = [
-                f for f in task_workspace.rglob("*")
-                if f.is_file() and not f.name.startswith(".")
+                file_path for file_path in task_workspace.rglob("*")
+                if file_path.is_file() and not file_path.name.startswith(".")
+                and not any(part in ignored_parts for part in file_path.parts)
             ]
             produced_artifact_ids = []
             # 移除"兼容回退"伪 ID：所有 artifact ID 必须来自真实 ArtifactStore.create
             if self._artifact_store is not None and context.run_id:
                 try:
-                    with open(f, "r", encoding="utf-8", errors="ignore") as fp:
-                        content = fp.read()
-                    artifact = self._artifact_store.create(
-                        run_id=context.run_id,
-                        task_id=assignment.task_id,
-                        type=self._infer_artifact_type(f.name),
-                        relative_path=relative_path,
-                        content=content,
-                        produced_by=profile.name,
-                    )
-                    produced_artifact_ids.append(artifact.id)
+                    for file_path in produced_files:
+                        relative_path = file_path.relative_to(Path(context.workspace_root)).as_posix()
+                        artifact = self._artifact_store.create(
+                            run_id=context.run_id,
+                            task_id=assignment.task_id,
+                            type=self._infer_artifact_type(file_path.name),
+                            relative_path=relative_path,
+                            content=file_path.read_bytes(),
+                            produced_by=profile.name,
+                            metadata={"profile_id": profile.id, "original_name": file_path.name},
+                        )
+                        produced_artifact_ids.append(artifact.id)
                 except Exception as exc:
                     logger.warning(f"[DeepAgentExecutor] artifact create failed: {exc}")
                     # 不降级为伪 ID：让上游能感知失败
@@ -537,7 +559,7 @@ class DeepAgentExecutor:
             else:
                 logger.warning(
                     f"[DeepAgentExecutor] no artifact_store or run_id configured for "
-                    f"run={context.run_id} – artifact {relative_path} not registered"
+                    f"run={context.run_id} – produced files are not registered"
                 )
 
             final_messages = response.get("messages", [{}]) if isinstance(response, dict) else [{}]
