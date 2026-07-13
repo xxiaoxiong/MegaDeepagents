@@ -45,6 +45,10 @@ class CreateTeamTaskResponse(BaseModel):
     max_review_cycles: int = 3
 
 
+class TeamRunMessageRequest(BaseModel):
+    content: str = Field(..., min_length=1)
+
+
 class TeamTaskMetaResponse(BaseModel):
     task_id: str
     room_id: str
@@ -104,6 +108,84 @@ class RoundResponse(BaseModel):
 
 
 # ========== Endpoints ==========
+
+
+# New control-plane API.  The old /team-tasks endpoints remain compatibility
+# routes, but new clients must not touch TeamRunner / TeamRoom.
+@router.post("/team-runs")
+async def create_team_run(req: CreateTeamTaskRequest):
+    runtime = get_team_runtime()
+    ctx = await runtime.create_run(
+        goal=req.goal, team_name=req.team, mode=TeamRunMode.TASK_TEAM,
+        max_rounds=req.max_rounds, review_required=req.review_required,
+    )
+    import asyncio
+    asyncio.create_task(runtime.start_run(ctx, req.goal, req.team, req.max_rounds, req.review_required))
+    return {"run_id": ctx.run_id, "status": "running"}
+
+
+@router.get("/team-runs/{run_id}")
+async def get_team_run(run_id: str):
+    run = await get_team_runtime().get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Team run not found")
+    return {"run_id": run_id, "status": run.get("status"), "goal": run.get("goal"),
+            "team_name": run.get("team_name", run.get("team_id"))}
+
+
+@router.post("/team-runs/{run_id}/cancel")
+async def cancel_team_run(run_id: str):
+    if not await get_team_runtime().cancel_run(run_id):
+        raise HTTPException(status_code=404, detail="Team run not found")
+    return {"run_id": run_id, "status": "cancelled"}
+
+
+@router.post("/team-runs/{run_id}/resume")
+async def resume_team_run(run_id: str):
+    if not await get_team_runtime().resume_run(run_id):
+        raise HTTPException(status_code=404, detail="Team run not resumable")
+    return {"run_id": run_id, "status": "running"}
+
+
+@router.get("/team-runs/{run_id}/agents")
+def get_team_run_agents(run_id: str):
+    from app.multiagent.agent_registry import get_agent_registry
+    agents = get_agent_registry().list_by_run(run_id)
+    if not agents:
+        from app.multiagent.phase_g_store import get_agent_run_history
+        return get_agent_run_history().list_by_run(run_id)
+    return [agent.model_dump(mode="json") for agent in agents]
+
+
+@router.get("/team-runs/{run_id}/tasks")
+def get_team_run_tasks(run_id: str):
+    from app.multiagent.task_board import get_task_board
+    return [task.model_dump(mode="json") for task in get_task_board().list_by_run(run_id)]
+
+
+@router.get("/team-runs/{run_id}/artifacts")
+def get_team_run_artifacts(run_id: str):
+    from app.multiagent.phase_g_store import get_agent_run_history
+    return get_agent_run_history().list_artifacts_by_run(run_id)
+
+
+@router.get("/team-runs/{run_id}/events")
+def get_team_run_events(run_id: str):
+    from app.multiagent.phase_g_store import get_agent_run_history
+    return get_agent_run_history().list_events(run_id)
+
+
+@router.get("/team-runs/{run_id}/messages")
+def get_team_run_messages(run_id: str):
+    from app.multiagent.mailbox import get_mailbox
+    return [message.model_dump(mode="json") for message in get_mailbox().list_messages_in_run(run_id)]
+
+
+@router.post("/team-runs/{run_id}/agents/{agent_id}/messages")
+async def send_team_run_message(run_id: str, agent_id: str, req: TeamRunMessageRequest):
+    if not await get_team_runtime().send_message(run_id, agent_id, req.content):
+        raise HTTPException(status_code=404, detail="Agent or run not found")
+    return {"run_id": run_id, "agent_id": agent_id, "status": "delivered"}
 
 
 @router.get("/teams")
