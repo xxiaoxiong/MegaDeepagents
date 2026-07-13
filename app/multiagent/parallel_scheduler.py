@@ -250,6 +250,14 @@ class ParallelTeamScheduler:
                     "session_id": agent.session_id,
                     "thread_id": agent.thread_id,
                 })
+                # Mailbox is an execution input, not merely an audit log.
+                # Deliver messages atomically before the worker constructs its
+                # prompt so user/teammate interventions can affect the task.
+                from app.multiagent.mailbox import get_mailbox
+                task_input["mailbox_messages"] = [
+                    message.model_dump(mode="json")
+                    for message in get_mailbox().receive(agent.agent_id, max_count=20)
+                ]
                 dag = self.task_graph or self._task_graph_from_board()
                 result = await asyncio.to_thread(
                     executor.execute_task, dag, task.task_id, task_input,

@@ -163,6 +163,7 @@ class Mailbox:
                 f"[Mailbox] delivered msg={message.message_id} "
                 f"from={message.from_agent_id} → {message.to_agent_id}"
             )
+        self._persist_message(message)
         return True
 
     def broadcast_run(self, run_id: str, agent_ids: list[str], message: MailboxMessage) -> int:
@@ -203,6 +204,8 @@ class Mailbox:
                 msg = inbox.popleft()
                 msg.consumed_at = datetime.utcnow()
                 out.append(msg)
+        for msg in out:
+            self._persist_message(msg)
         return out
 
     def peek(self, agent_id: str) -> list[MailboxMessage]:
@@ -323,6 +326,32 @@ class Mailbox:
             }
 
     # ===== SQLite 落库（Phase G 第 2 步）=====
+
+    def _persist_message(self, msg: MailboxMessage) -> None:
+        """Persist on delivery/consumption; flush_to_db remains a recovery aid."""
+        try:
+            from app.multiagent.phase_g_store import get_agent_run_history
+            get_agent_run_history().insert_mailbox_message(
+                message_id=msg.message_id,
+                from_agent_id=msg.from_agent_id,
+                from_agent_name=msg.from_agent_name,
+                from_role=msg.from_role,
+                to_agent_id=msg.to_agent_id,
+                to_role=msg.to_role,
+                run_id=msg.run_id,
+                title=msg.title,
+                content=msg.content,
+                severity=msg.severity.value,
+                thread_id=msg.thread_id,
+                reply_to=msg.reply_to,
+                delivery_attempts=msg.delivery_attempts,
+                consumed_at=msg.consumed_at,
+                status="consumed" if msg.consumed_at else "delivered",
+                created_at=msg.created_at,
+                metadata=msg.metadata,
+            )
+        except Exception as exc:
+            logger.warning("[Mailbox] persist msg=%s failed: %s", msg.message_id, exc)
 
     def flush_to_db(self, run_id: str, history=None) -> int:
         """把当前内存中（已 delivered 但未 consumed）的消息全部 flush 到 sqlite。

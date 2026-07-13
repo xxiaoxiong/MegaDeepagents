@@ -70,6 +70,11 @@ class ResumeCoordinator:
         result = ResumeResult()
         logger.info(f"[Resume] start for run={run_id}")
 
+        # TaskBoard is the durable data plane.  Rehydrate it before restoring
+        # agents so a restarted scheduler sees the same work, not an empty run.
+        self.board.restore_run(run_id)
+        self.board.prepare_for_resume(run_id)
+
         # 1. 从持久化读 Agent 列表
         persisted_agents = self.history.list_by_run(run_id)
 
@@ -105,10 +110,17 @@ class ResumeCoordinator:
                     run_id=run_id,
                     capabilities=capabilities,
                     agent_id_override=agent_id,
+                    session_id_override=stored.get("session_id"),
+                    thread_id_override=stored.get("thread_id"),
+                    checkpoint_namespace_override=stored.get("checkpoint_namespace"),
                 )
-                # 还原状态（持久化记录的 IDLE 时直接设回）
+                # A process cannot safely resume a RUNNING/CLAIMING lease.
+                # It is requeued above, therefore the teammate comes back IDLE
+                # with the same identity/session/checkpoint namespace.
                 target_status = AgentStatus(stored.get("status", "idle"))
-                if target_status not in (AgentStatus.CREATED,):
+                if target_status in (AgentStatus.RUNNING, AgentStatus.CLAIMING):
+                    target_status = AgentStatus.IDLE
+                if target_status not in (AgentStatus.CREATED, AgentStatus.IDLE):
                     try:
                         agent.update_status(target_status)
                     except Exception:
@@ -125,18 +137,19 @@ class ResumeCoordinator:
             if trun.get("status") != "succeeded":
                 continue
             task_id = trun.get("task_id")
-            bd = self.board.get(task_id)
+            bd = self.board.get(task_id, run_id=run_id)
             if bd is None:
                 continue
             if bd.status != BoardTaskStatus.PENDING:
                 continue  # 不动旧状态
             # 直接置为 SUCCEEDED（跳过执行）
-            bd_with = self.board.claim(task_id, "RESUME_BOT")
+            bd_with = self.board.claim(task_id, "RESUME_BOT", run_id=run_id)
             if bd_with.success:
-                self.board.start(task_id, "RESUME_BOT")
+                self.board.start(task_id, "RESUME_BOT", run_id=run_id)
                 self.board.complete(
                     task_id, "RESUME_BOT",
                     artifact_ids=trun.get("artifact_ids") or [],
+                    run_id=run_id,
                 )
                 result.skipped_tasks += 1
 

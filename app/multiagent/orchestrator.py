@@ -93,7 +93,10 @@ class SimpleOrchestrator:
 
     # ===== 运行入口 =====
 
-    def run(self, goal: str, context: str = "", mode_override: str | None = None, ctx: TeamRunContext | None = None) -> OrchestrationResult:
+    def run(
+        self, goal: str, context: str = "", mode_override: str | None = None,
+        ctx: TeamRunContext | None = None, task_graph: TaskGraph | None = None,
+    ) -> OrchestrationResult:
         """执行一次完整的多-agent 编排。"""
         if ctx is not None:
             self._ctx = ctx
@@ -117,7 +120,10 @@ class SimpleOrchestrator:
             # 2. 规划
             self.phase = "planning"
             self._emit_event("planning_started", {})
-            dag = self._plan(goal, context)
+            # Resume passes the persisted TaskBoard projection here.  Calling
+            # the planner again after a crash can change task ids/dependencies
+            # and is therefore a different run, not a continuation.
+            dag = task_graph or self._plan(goal, context)
             self._task_graph = dag
             if dag is None:
                 self._result.status = "failed"
@@ -323,6 +329,14 @@ class SimpleOrchestrator:
             )
             # 把 BoardTask 终态反映回 dag.nodes，让 _verify 能判断
             self._sync_board_to_dag(run_id, dag)
+            from app.multiagent.task_board import get_task_board, BoardTaskStatus
+            if any(
+                task.status == BoardTaskStatus.REPAIR_REQUIRED
+                and not task.metadata.get("superseded_by_repair")
+                for task in get_task_board().list_by_run(run_id)
+            ):
+                # Repair is a valid verifier outcome, not a scheduler crash.
+                return True
             return status == "completed"
         except Exception as exc:
             logger.error(f"[Orchestrator] ParallelTeamScheduler failed: {exc}")
@@ -390,6 +404,8 @@ class SimpleOrchestrator:
                 target = TaskNodeStatus.SUCCEEDED
             elif bt.status in (BoardTaskStatus.PRODUCED, BoardTaskStatus.VERIFYING):
                 target = TaskNodeStatus.RUNNING
+            elif bt.status == BoardTaskStatus.REPAIR_REQUIRED:
+                target = TaskNodeStatus.RUNNING
             elif bt.status == BoardTaskStatus.FAILED:
                 target = TaskNodeStatus.FAILED
             elif bt.status in (BoardTaskStatus.RUNNING, BoardTaskStatus.CLAIMED):
@@ -406,6 +422,14 @@ class SimpleOrchestrator:
                     pass
 
     def _verify(self, goal: str, dag) -> str:
+        if self._ctx:
+            from app.multiagent.task_board import get_task_board, BoardTaskStatus
+            if any(
+                task.status == BoardTaskStatus.REPAIR_REQUIRED
+                and not task.metadata.get("superseded_by_repair")
+                for task in get_task_board().list_by_run(self._ctx.run_id)
+            ):
+                return "repair"
         if self.verifier is None:
             # 无 verifier → 检查 all_succeeded
             try:
@@ -466,17 +490,39 @@ class SimpleOrchestrator:
         if verdict != "repair":
             return dag
         repair_count = 0
-        for node_id, node in list(dag.nodes.items()):
-            if node.status.value == "failed":
-                try:
-                    dag.add_repair_task(
-                        node_id,
-                        f"修复 {node.objective[:60]}",
-                        required_capabilities=node.required_capabilities,
+        repair_targets = {
+            node_id for node_id, node in dag.nodes.items()
+            if node.status.value == "failed"
+        }
+        if self._ctx:
+            from app.multiagent.task_board import get_task_board, BoardTaskStatus
+            repair_targets.update(
+                task.task_id for task in get_task_board().list_by_run(self._ctx.run_id)
+                if task.status == BoardTaskStatus.REPAIR_REQUIRED
+                and not task.metadata.get("superseded_by_repair")
+            )
+        for node_id in repair_targets:
+            node = dag.nodes.get(node_id)
+            if node is None:
+                continue
+            if node.status == TaskNodeStatus.RUNNING:
+                dag.update_status(node_id, TaskNodeStatus.FAILED)
+            if node.status != TaskNodeStatus.FAILED:
+                continue
+            try:
+                repair_node = dag.add_repair_task(
+                    node_id,
+                    f"修复 {node.objective[:60]}",
+                    required_capabilities=node.required_capabilities,
+                )
+                if self._ctx:
+                    from app.multiagent.task_board import get_task_board
+                    get_task_board().supersede_with_repair(
+                        node_id, repair_node.id, self._ctx.run_id,
                     )
-                    repair_count += 1
-                except Exception as exc:
-                    logger.warning(f"[Repair] add_repair_task({node_id}) failed: {exc}")
+                repair_count += 1
+            except Exception as exc:
+                logger.warning(f"[Repair] add_repair_task({node_id}) failed: {exc}")
         if repair_count:
             self._log(f"新增 {repair_count} 个 repair task")
         return dag
@@ -520,6 +566,7 @@ def run_orchestrated(
     max_repair_rounds: int = 3,
     ctx: TeamRunContext | None = None,
     cancel_event: Any | None = None,
+    task_graph: TaskGraph | None = None,
 ) -> OrchestrationResult:
     """一站式编排执行入口。"""
     orch = SimpleOrchestrator(
@@ -531,4 +578,7 @@ def run_orchestrated(
         ctx=ctx,
         cancel_event=cancel_event,
     )
-    return orch.run(goal=goal, context=context, mode_override=mode_override, ctx=ctx)
+    return orch.run(
+        goal=goal, context=context, mode_override=mode_override, ctx=ctx,
+        task_graph=task_graph,
+    )

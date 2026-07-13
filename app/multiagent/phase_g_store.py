@@ -69,6 +69,38 @@ class AgentRunHistory:
         self.conn.commit()
         return cur.rowcount > 0
 
+    # ===== TaskBoard durable data plane =====
+
+    def upsert_task_board_task(self, payload: dict[str, Any]) -> None:
+        """Persist the complete TaskBoard record using its run/task composite key."""
+        _ensure_task_board_tasks(self.conn)
+        self.conn.execute(
+            """INSERT INTO task_board_tasks (run_id, task_id, payload, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(run_id, task_id) DO UPDATE SET
+                 payload=excluded.payload, updated_at=excluded.updated_at""",
+            (
+                payload["run_id"], payload["task_id"], json.dumps(payload),
+                datetime.utcnow().isoformat(),
+            ),
+        )
+        self.conn.commit()
+
+    def list_task_board_tasks(self, run_id: str) -> list[dict[str, Any]]:
+        """Load the authoritative board state for one run after a restart."""
+        _ensure_task_board_tasks(self.conn)
+        rows = self.conn.execute(
+            "SELECT payload FROM task_board_tasks WHERE run_id=? ORDER BY rowid ASC",
+            (run_id,),
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                result.append(json.loads(row["payload"]))
+            except (TypeError, json.JSONDecodeError):
+                logger.warning("[PhaseG] skipped corrupt persisted TaskBoard row run=%s", run_id)
+        return result
+
     # ===== AgentInstance =====
 
     def upsert_agent_instance(
@@ -515,6 +547,22 @@ def _ensure_team_runs(conn) -> None:
             max_rounds INTEGER NOT NULL, review_required INTEGER NOT NULL,
             metadata TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         )"""
+    )
+    conn.commit()
+
+
+def _ensure_task_board_tasks(conn) -> None:
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS task_board_tasks (
+            run_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (run_id, task_id)
+        )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_task_board_tasks_run ON task_board_tasks(run_id)"
     )
     conn.commit()
 

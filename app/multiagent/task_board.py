@@ -66,9 +66,9 @@ class ClaimResult(BaseModel):
 
 
 class TaskBoard:
-    """共享任务板（进程内 + 锁安全）。"""
+    """共享任务板（进程内缓存 + 可选 SQLite durable source）。"""
 
-    def __init__(self) -> None:
+    def __init__(self, persist: bool = False) -> None:
         import threading
         # A local task id is only unique inside one TeamRun.  Keeping a
         # composite key here prevents two concurrent runs from overwriting
@@ -76,6 +76,20 @@ class TaskBoard:
         self._tasks: dict[tuple[str, str], BoardTask] = {}
         self._by_run: dict[str, list[tuple[str, str]]] = {}
         self._lock = threading.RLock()
+        self._persist_enabled = persist
+
+    def _persist(self, task: BoardTask) -> None:
+        """Best-effort durable write; scheduling must not silently lose state."""
+        if not self._persist_enabled:
+            return
+        try:
+            from app.multiagent.phase_g_store import get_agent_run_history
+            get_agent_run_history().upsert_task_board_task(task.model_dump(mode="json"))
+        except Exception as exc:
+            # A failed durable write makes recovery unsafe.  Surface it to the
+            # caller through logs instead of pretending the board is durable.
+            logger.error("[TaskBoard] persist failed run=%s task=%s: %s", task.run_id, task.task_id, exc)
+            raise
 
     # ===== 添加 =====
 
@@ -86,6 +100,7 @@ class TaskBoard:
             keys = self._by_run.setdefault(task.run_id, [])
             if key not in keys:
                 keys.append(key)
+            self._persist(task)
             logger.debug(f"[TaskBoard] added task={task.task_id} run={task.run_id}")
             return task
 
@@ -139,6 +154,7 @@ class TaskBoard:
             task.claimed_by = agent_id
             task.claimed_at = datetime.utcnow()
             task.updated_at = datetime.utcnow()
+            self._persist(task)
             logger.info(
                 f"[TaskBoard] claimed task={task_id} agent={agent_id}"
             )
@@ -154,6 +170,7 @@ class TaskBoard:
                 return False
             task.status = BoardTaskStatus.RUNNING
             task.updated_at = datetime.utcnow()
+            self._persist(task)
             return True
 
     def release(self, task_id: str, agent_id: str, reason: str = "", run_id: str | None = None) -> bool:
@@ -170,6 +187,7 @@ class TaskBoard:
             task.attempts += 1
             task.last_error = reason or None
             task.updated_at = datetime.utcnow()
+            self._persist(task)
             logger.info(f"[TaskBoard] released task={task_id} agent={agent_id} reason={reason}")
             return True
 
@@ -187,6 +205,7 @@ class TaskBoard:
             task.produced_artifact_ids.extend(artifact_ids or [])
             task.completed_at = datetime.utcnow()
             task.updated_at = datetime.utcnow()
+            self._persist(task)
             logger.info(
                 f"[TaskBoard] completed task={task_id} agent={agent_id} "
                 f"artifacts={len(artifact_ids or [])}"
@@ -207,6 +226,7 @@ class TaskBoard:
             task.status = BoardTaskStatus.PRODUCED
             task.produced_artifact_ids = list(dict.fromkeys(artifact_ids or []))
             task.updated_at = datetime.utcnow()
+            self._persist(task)
             return True
 
     def mark_verifying(self, task_id: str, run_id: str | None = None) -> bool:
@@ -216,6 +236,7 @@ class TaskBoard:
                 return False
             task.status = BoardTaskStatus.VERIFYING
             task.updated_at = datetime.utcnow()
+            self._persist(task)
             return True
 
     def mark_verified(self, task_id: str, run_id: str | None = None) -> bool:
@@ -226,6 +247,7 @@ class TaskBoard:
             task.status = BoardTaskStatus.SUCCEEDED
             task.completed_at = datetime.utcnow()
             task.updated_at = datetime.utcnow()
+            self._persist(task)
             return True
 
     def mark_repair_required(self, task_id: str, run_id: str | None = None) -> bool:
@@ -235,6 +257,18 @@ class TaskBoard:
                 return False
             task.status = BoardTaskStatus.REPAIR_REQUIRED
             task.updated_at = datetime.utcnow()
+            self._persist(task)
+            return True
+
+    def supersede_with_repair(self, task_id: str, repair_task_id: str, run_id: str) -> bool:
+        """Record verifier-owned replacement without forging worker success."""
+        with self._lock:
+            task = self.get(task_id, run_id=run_id)
+            if task is None or task.status != BoardTaskStatus.REPAIR_REQUIRED:
+                return False
+            task.metadata["superseded_by_repair"] = repair_task_id
+            task.updated_at = datetime.utcnow()
+            self._persist(task)
             return True
 
     def fail(self, task_id: str, agent_id: str, error: str, run_id: str | None = None) -> bool:
@@ -261,7 +295,48 @@ class TaskBoard:
                 logger.warning(
                     f"[TaskBoard] task={task_id} failed permanently: {error}"
                 )
+            self._persist(task)
             return True
+
+    # ===== restart recovery =====
+
+    def restore_run(self, run_id: str) -> int:
+        """Hydrate a run's board from SQLite without inventing any task state."""
+        if not self._persist_enabled:
+            return 0
+        try:
+            from app.multiagent.phase_g_store import get_agent_run_history
+            payloads = get_agent_run_history().list_task_board_tasks(run_id)
+        except Exception as exc:
+            logger.error("[TaskBoard] restore failed run=%s: %s", run_id, exc)
+            raise
+        restored = 0
+        with self._lock:
+            for payload in payloads:
+                task = BoardTask.model_validate(payload)
+                key = (task.run_id, task.task_id)
+                if key in self._tasks:
+                    continue
+                self._tasks[key] = task
+                self._by_run.setdefault(task.run_id, []).append(key)
+                restored += 1
+        return restored
+
+    def prepare_for_resume(self, run_id: str) -> int:
+        """Release leases held by a dead process while preserving completed work."""
+        changed = 0
+        with self._lock:
+            for task in self.list_by_run(run_id):
+                if task.status not in (BoardTaskStatus.CLAIMED, BoardTaskStatus.RUNNING):
+                    continue
+                task.status = BoardTaskStatus.PENDING
+                task.claimed_by = None
+                task.claimed_at = None
+                task.last_error = "interrupted_before_resume"
+                task.updated_at = datetime.utcnow()
+                self._persist(task)
+                changed += 1
+        return changed
 
     # ===== 查询 =====
 
@@ -311,7 +386,14 @@ class TaskBoard:
         tasks = self.list_by_run(run_id)
         if not tasks:
             return True
-        return all(t.status == BoardTaskStatus.SUCCEEDED for t in tasks)
+        return all(
+            t.status == BoardTaskStatus.SUCCEEDED
+            or (
+                t.status == BoardTaskStatus.REPAIR_REQUIRED
+                and bool(t.metadata.get("superseded_by_repair"))
+            )
+            for t in tasks
+        )
 
     def all_produced(self, run_id: str) -> bool:
         tasks = self.list_by_run(run_id)
@@ -337,7 +419,7 @@ _board: TaskBoard | None = None
 def get_task_board() -> TaskBoard:
     global _board
     if _board is None:
-        _board = TaskBoard()
+        _board = TaskBoard(persist=True)
     return _board
 
 

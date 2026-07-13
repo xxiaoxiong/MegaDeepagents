@@ -6,6 +6,8 @@ CLI、API、Web 只能调用该 Facade，不得直接实例化旧 TeamRunner 或
 from __future__ import annotations
 
 import asyncio
+import os
+import threading
 import uuid
 from datetime import datetime
 from typing import Any
@@ -57,7 +59,9 @@ class TeamRuntimeFacade:
             "max_rounds": max_rounds,
             "review_required": review_required,
             "status": "created",
-            "cancel_event": asyncio.Event(),
+            # Scheduler runs in a worker thread. threading.Event is safe for
+            # API cancellation from the serving loop as well as that worker.
+            "cancel_event": threading.Event(),
             "created_at": datetime.utcnow(),
         }
         from app.multiagent.phase_g_store import get_agent_run_history
@@ -77,6 +81,8 @@ class TeamRuntimeFacade:
         review_required: bool = True,
     ) -> TeamRunResult:
         """启动团队运行。"""
+        if ctx.run_id not in self._active_runs:
+            self._activate_restored_run(ctx, goal, team_name, max_rounds, review_required)
         self._active_runs[ctx.run_id]["status"] = "running"
         from app.multiagent.phase_g_store import get_agent_run_history
         get_agent_run_history().update_team_run_status(ctx.run_id, "running")
@@ -98,6 +104,8 @@ class TeamRuntimeFacade:
         team_name: str,
         max_rounds: int,
         review_required: bool,
+        *,
+        resume: bool = False,
     ) -> TeamRunResult:
         """TASK_TEAM 模式：使用 Phase Two 基于 TaskGraph 的编排器。"""
         from app.multiagent.executor import DeepAgentExecutor
@@ -108,6 +116,8 @@ class TeamRuntimeFacade:
 
         # 为本次 Run 创建 ArtifactStore（root_path = run workspace）
         artifact_store = ArtifactStore(root_path=ctx.workspace_root)
+        if resume:
+            artifact_store.load_from_db(ctx.run_id)
 
         # 创建 Executor 并注入 workspace 和 artifact_store
         executor = DeepAgentExecutor(workspace_root=ctx.workspace_root)
@@ -120,7 +130,11 @@ class TeamRuntimeFacade:
         )
 
         # 串联运行
-        result = run_orchestrated(
+        resume_graph = self._task_graph_from_persisted_board(ctx.run_id) if resume else None
+        # run_orchestrated contains synchronous planning/executor adapters.
+        # Offloading keeps the API event loop responsive for message/cancel.
+        result = await asyncio.to_thread(
+            run_orchestrated,
             goal=goal,
             mode_override="full_multi",
             planner=lambda g, c: plan_with_llm(g, context=c),
@@ -128,6 +142,7 @@ class TeamRuntimeFacade:
             verifier=verifier,
             ctx=ctx,
             cancel_event=self._active_runs[ctx.run_id]["cancel_event"],
+            task_graph=resume_graph,
         )
 
         # 映射结果
@@ -149,6 +164,34 @@ class TeamRuntimeFacade:
             termination_reason=result.error,
             completed_at=datetime.utcnow(),
         )
+
+    def _task_graph_from_persisted_board(self, run_id: str):
+        """Rebuild only the durable board projection; never re-plan a resume."""
+        from app.multiagent.task_board import get_task_board, BoardTaskStatus
+        from app.multiagent.task_graph import TaskGraph, TaskNode, TaskNodeStatus
+
+        board = get_task_board()
+        board.restore_run(run_id)
+        tasks = board.list_by_run(run_id)
+        if not tasks:
+            return None
+        graph = TaskGraph(root_task_id=tasks[0].task_id)
+        status_map = {
+            BoardTaskStatus.SUCCEEDED: TaskNodeStatus.SUCCEEDED,
+            BoardTaskStatus.FAILED: TaskNodeStatus.FAILED,
+            BoardTaskStatus.CANCELLED: TaskNodeStatus.CANCELLED,
+        }
+        for task in tasks:
+            graph.add_node(TaskNode(
+                id=task.task_id, title=task.title, objective=task.objective,
+                dependencies=task.dependencies,
+                required_capabilities=task.required_capabilities,
+                status=status_map.get(task.status, TaskNodeStatus.PENDING),
+                output_artifact_ids=task.produced_artifact_ids,
+                priority=task.priority,
+                max_attempts=task.max_attempts,
+            ))
+        return graph
 
     async def _run_discussion(
         self,
@@ -219,23 +262,69 @@ class TeamRuntimeFacade:
             return False
 
     async def resume_run(self, run_id: str) -> bool:
-        """恢复一次运行：调用 ResumeCoordinator 加载持久化的 Agent 与已完成的 Task。"""
+        """Restore durable state and continue the same TASK_TEAM execution."""
         from app.multiagent.resume_coordinator import get_resume_coordinator
+        from app.multiagent.phase_g_store import get_agent_run_history
 
         run = self._active_runs.get(run_id)
         if not run:
-            # 也可以从 history 表里反查（Phase G 第 1 步：跨进程重启）
-            logger.info(f"[TeamRuntime] resume_run: run={run_id} 不在内存 _active_runs，尝试从持久化恢复")
+            stored = get_agent_run_history().get_team_run(run_id)
+            if not stored:
+                return False
+            logger.info("[TeamRuntime] cold resume run=%s from durable state", run_id)
+            try:
+                mode = TeamRunMode.from_legacy(stored.get("mode", "task_team"))
+                ctx = TeamRunContext(
+                    run_id=run_id,
+                    team_id=stored["team_id"],
+                    mode=mode,
+                    workspace_root=stored["workspace_root"],
+                    checkpoint_namespace=f"team:{run_id}",
+                    user_goal=stored.get("goal", ""),
+                )
+                os.makedirs(ctx.workspace_root, exist_ok=True)
+                run = self._activate_restored_run(
+                    ctx, stored.get("goal", ""), stored["team_id"],
+                    int(stored.get("max_rounds", 20)), bool(stored.get("review_required", True)),
+                )
+            except Exception as exc:
+                logger.error("[TeamRuntime] failed to reconstruct run=%s: %s", run_id, exc)
+                return False
         try:
             coordinator = get_resume_coordinator()
             result = coordinator.resume(run_id)
-            if run is not None:
-                run["status"] = "running"
+            run["status"] = "running"
+            get_agent_run_history().update_team_run_status(run_id, "running")
             logger.info(f"[TeamRuntime] resume_run result run={run_id}: {result.to_dict()}")
-            return True
+            ctx = run["ctx"]
+            if ctx.mode == TeamRunMode.TASK_TEAM:
+                task_result = await self._run_task_team(
+                    ctx, run["goal"], run["team_name"], run["max_rounds"],
+                    run["review_required"], resume=True,
+                )
+            else:
+                task_result = await self._run_discussion(
+                    ctx, run["goal"], run["team_name"], run["max_rounds"], run["review_required"],
+                )
+            run["status"] = task_result.status
+            get_agent_run_history().update_team_run_status(run_id, task_result.status)
+            return task_result.status not in ("failed", "cancelled")
         except Exception as exc:
             logger.error(f"[TeamRuntime] resume_run failed run={run_id}: {exc}")
             return False
+
+    def _activate_restored_run(
+        self, ctx: TeamRunContext, goal: str, team_name: str,
+        max_rounds: int, review_required: bool,
+    ) -> dict[str, Any]:
+        info = {
+            "ctx": ctx, "goal": goal, "team_name": team_name,
+            "mode": ctx.mode, "max_rounds": max_rounds,
+            "review_required": review_required, "status": "created",
+            "cancel_event": threading.Event(), "created_at": ctx.created_at,
+        }
+        self._active_runs[ctx.run_id] = info
+        return info
 
     def list_runs(self) -> list[dict[str, Any]]:
         return [
