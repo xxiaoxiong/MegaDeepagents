@@ -57,8 +57,15 @@ class TeamRuntimeFacade:
             "max_rounds": max_rounds,
             "review_required": review_required,
             "status": "created",
+            "cancel_event": asyncio.Event(),
             "created_at": datetime.utcnow(),
         }
+        from app.multiagent.phase_g_store import get_agent_run_history
+        get_agent_run_history().save_team_run(
+            run_id=ctx.run_id, goal=goal, team_id=team_name, mode=mode.value,
+            workspace_root=ctx.workspace_root, status="created", max_rounds=max_rounds,
+            review_required=review_required,
+        )
         return ctx
 
     async def start_run(
@@ -71,6 +78,8 @@ class TeamRuntimeFacade:
     ) -> TeamRunResult:
         """启动团队运行。"""
         self._active_runs[ctx.run_id]["status"] = "running"
+        from app.multiagent.phase_g_store import get_agent_run_history
+        get_agent_run_history().update_team_run_status(ctx.run_id, "running")
 
         if ctx.mode == TeamRunMode.DISCUSSION:
             return await self._run_discussion(
@@ -107,6 +116,7 @@ class TeamRuntimeFacade:
         # 构造 Verifier（带程序化 + LLM 回退）
         verifier = Verifier(
             llm_rubric=LLMRubricVerifier(model_available=False),
+            artifact_store=artifact_store,
         )
 
         # 串联运行
@@ -117,6 +127,7 @@ class TeamRuntimeFacade:
             executor=executor,
             verifier=verifier,
             ctx=ctx,
+            cancel_event=self._active_runs[ctx.run_id]["cancel_event"],
         )
 
         # 映射结果
@@ -127,6 +138,8 @@ class TeamRuntimeFacade:
             "incomplete": "failed",
         }
         self._active_runs[ctx.run_id]["status"] = status_map.get(result.status, "failed")
+        from app.multiagent.phase_g_store import get_agent_run_history
+        get_agent_run_history().update_team_run_status(ctx.run_id, self._active_runs[ctx.run_id]["status"])
 
         return TeamRunResult(
             task_id=ctx.run_id,
@@ -165,12 +178,20 @@ class TeamRuntimeFacade:
     async def cancel_run(self, run_id: str) -> bool:
         run = self._active_runs.get(run_id)
         if not run:
-            return False
+            from app.multiagent.phase_g_store import get_agent_run_history
+            return get_agent_run_history().update_team_run_status(run_id, "cancelled")
+        run["cancel_event"].set()
         run["status"] = "cancelled"
+        from app.multiagent.phase_g_store import get_agent_run_history
+        get_agent_run_history().update_team_run_status(run_id, "cancelled")
         return True
 
     async def get_run(self, run_id: str) -> dict[str, Any] | None:
-        return self._active_runs.get(run_id)
+        run = self._active_runs.get(run_id)
+        if run is not None:
+            return run
+        from app.multiagent.phase_g_store import get_agent_run_history
+        return get_agent_run_history().get_team_run(run_id)
 
     async def send_message(self, run_id: str, agent_id: str, message: str) -> bool:
         """向运行中的 Agent 发送消息（通过 Mailbox 治理钩子）。"""
