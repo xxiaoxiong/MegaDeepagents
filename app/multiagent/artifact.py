@@ -166,8 +166,8 @@ class ArtifactStore:
     4. 内容读取：read(artifact_id) → 文件内容
     5. 跨 Run 不可访问（root_path 由 run_id 隔离）
 
-    注意：本类是 in-process 内存注册表 + 同进程磁盘存储的混合实现。
-    未来可演进为 Sqlite 注册表 + S3/磁盘实际内容；接口保持稳定。
+    Phase G #14: create() 时同步写到 SQLite（phase_g_store.insert_artifact），
+    允许跨进程重启后通过 load_from_db(run_id) 重建内存注册表。
     """
 
     def __init__(self, root_path: str | None = None) -> None:
@@ -195,8 +195,9 @@ class ArtifactStore:
         流程：
         1. 计算 hash、size
         2. 写入磁盘（如启用 root_path）
-        3. 注册到索引
-        4. 标记为 PUBLISHED
+        3. 注册到内存索引
+        4. 同步写入 SQLite（Phase G: persistence）
+        5. 标记为 PUBLISHED
         """
         artifact_type = type if isinstance(type, ArtifactType) else ArtifactType(type)
         content_hash = compute_content_hash(content)
@@ -232,15 +233,89 @@ class ArtifactStore:
         # 写入磁盘
         self._write_to_disk(artifact, content)
 
-        # 注册
+        # 注册到内存
         self._registry[artifact.id] = artifact
         self._by_task.setdefault(task_id, []).append(artifact.id)
         self._by_run.setdefault(run_id, []).append(artifact.id)
+
+        # Phase G: 同步写入 SQLite（跨进程恢复）
+        try:
+            from app.multiagent.phase_g_store import get_agent_run_history
+            from app.multiagent.store import _get_conn
+            # 确保 sqlite 连接存在可写
+            h = get_agent_run_history()
+            h.insert_artifact(
+                artifact_id=artifact.id,
+                run_id=run_id,
+                task_id=task_id,
+                type=artifact_type.value,
+                relative_path=relative_path,
+                content_hash=content_hash,
+                size_bytes=size,
+                version=version,
+                produced_by=produced_by,
+                status="published",
+                predecessor_id=predecessor_id,
+                parent_artifact_id=parent_artifact_id,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            logger.warning(f"[ArtifactStore] SQLite persist failed for {artifact.id}: {exc}")
+
         logger.debug(
             f"[ArtifactStore] create id={artifact.id} type={artifact_type.value} "
             f"version={version} hash={content_hash[:24]} bytes={size}"
         )
         return artifact
+
+    # ---- 从 SQLite 恢复 ----
+
+    def load_from_db(self, run_id: str) -> int:
+        """从 SQLite phase_g_store 重建本 run 的所有 Artifact 内存注册表。
+
+        跨进程重启后调用，确保 resume 后可查询到之前的 Artifact 记录。
+        返回恢复条数。幂等：已存在同 artifact_id 的内存条目跳过。
+        """
+        try:
+            from app.multiagent.phase_g_store import get_agent_run_history
+            h = get_agent_run_history()
+            rows = h.list_artifacts_by_run(run_id)
+        except Exception as exc:
+            logger.warning(f"[ArtifactStore] load_from_db run={run_id} 失败: {exc}")
+            return 0
+
+        count = 0
+        for r in rows:
+            aid = r.get("artifact_id")
+            if not aid or aid in self._registry:
+                continue
+            try:
+                from datetime import datetime
+                artifact = Artifact(
+                    id=aid,
+                    run_id=r.get("run_id", run_id),
+                    task_id=r.get("task_id", ""),
+                    type=ArtifactType(r.get("type", "any")),
+                    path=r.get("relative_path", ""),
+                    content_hash=r.get("content_hash", ""),
+                    size_bytes=int(r.get("size_bytes", 0)),
+                    version=int(r.get("version", 1)),
+                    produced_by=r.get("produced_by", ""),
+                    status=ArtifactStatus(r.get("status", "published")),
+                    created_at=datetime.fromisoformat(r["created_at"]) if isinstance(r.get("created_at"), str) else datetime.utcnow(),
+                    metadata=dict(r.get("metadata", {}) if isinstance(r.get("metadata"), dict) else {}),
+                    predecessor_id=r.get("predecessor_id"),
+                    parent_artifact_id=r.get("parent_artifact_id"),
+                )
+                self._registry[aid] = artifact
+                task_id = r.get("task_id", "")
+                self._by_task.setdefault(task_id, []).append(aid)
+                self._by_run.setdefault(run_id, []).append(aid)
+                count += 1
+            except Exception as exc:
+                logger.warning(f"[ArtifactStore] load_from_db row {aid} 跳过: {exc}")
+        logger.info(f"[ArtifactStore] load_from_db run={run_id} 恢复 {count} 个 Artifact")
+        return count
 
     def _write_to_disk(self, artifact: Artifact, content: str | bytes) -> None:
         """实际写入磁盘；root_path 为 None 时跳过（仅 in-memory）。"""

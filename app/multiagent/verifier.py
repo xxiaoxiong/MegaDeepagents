@@ -278,7 +278,7 @@ class LLMRubricVerifier:
             return self._fallback_verify(goal, artifacts)
 
         failed = [
-            CriterionFailure(c=c["criterion"], d=c["detail"], s=c.get("severity", "medium"))
+            CriterionFailure(criterion=c["criterion"], detail=c["detail"], severity=c.get("severity", "medium"))
             for c in parsed.get("failed_criteria", [])
         ]
         verdict_str = parsed.get("verdict", "repair")
@@ -355,10 +355,61 @@ class Verifier:
         programmatic: ProgrammaticVerifier | None = None,
         llm_rubric: LLMRubricVerifier | None = None,
         human_approval: Any | None = None,
+        artifact_store: Any | None = None,
     ):
         self.programmatic = programmatic or ProgrammaticVerifier()
         self.llm_rubric = llm_rubric or LLMRubricVerifier(model_available=True)
         self.human_approval = human_approval  # 预留：未来接入 HITL
+        # Phase Two #16: 接入 ArtifactStore，让 Verifier 能读到注册表里的真实
+        # artifact 元数据与文件内容（content_hash / size / produced_by / version）。
+        self.artifact_store = artifact_store
+
+    def _enrich_with_artifact_store(
+        self, artifacts: dict[str, dict[str, Any]]
+    ) -> dict[str, dict[str, Any]]:
+        """用注册表里的 Artifact 元数据 + 真实文件内容补全 artifacts 字典。
+
+        artifacts 入参通常是 orchestrator 拼出来的 {artifact_key: {content_preview, status}}
+        它只覆盖了"workspace 里看到的文件预览"。注册表里还可能存了 schema 化的
+        content_hash / size / produced_by / version，这些对 LLM Rubric 评分有用。
+        本方法以 artifact_id 形式补 entry，不破坏已有 key。
+        """
+        if self.artifact_store is None:
+            return artifacts
+        try:
+            # 取所有 artifact 元数据
+            registry = getattr(self.artifact_store, "_registry", {})
+            for aid, art in registry.items():
+                key = f"artifact:{aid}"
+                entry = artifacts.get(key, {"status": "registered"})
+                # 注入注册表元数据
+                entry["artifact_id"] = aid
+                entry["type"] = getattr(art, "type", "")
+                if hasattr(art, "type") and hasattr(art.type, "value"):
+                    entry["type"] = art.type.value
+                entry["content_hash"] = getattr(art, "content_hash", "")
+                entry["size_bytes"] = getattr(art, "size_bytes", 0)
+                entry["version"] = getattr(art, "version", 1)
+                entry["produced_by"] = getattr(art, "produced_by", "")
+                entry["path"] = getattr(art, "path", "")
+                # 尝试读真实文件内容
+                root = getattr(self.artifact_store, "_root_path", None)
+                rel = getattr(art, "path", "")
+                if root and rel:
+                    import os as _os
+                    full = _os.path.join(root, rel)
+                    if _os.path.isfile(full):
+                        try:
+                            with open(full, "r", encoding="utf-8", errors="ignore") as f:
+                                content = f.read()
+                            entry.setdefault("content", content[:5000])
+                            entry["content_full_available"] = True
+                        except Exception:
+                            entry["content_full_available"] = False
+                artifacts[key] = entry
+        except Exception as exc:
+            logger.warning(f"[Verifier] enrich_with_artifact_store 失败: {exc}")
+        return artifacts
 
     def validate(
         self,
@@ -376,6 +427,8 @@ class Verifier:
         Returns:
             最终验证结果（取各层最差 verdict）
         """
+        # Phase Two #16: 接入 ArtifactStore 读取真实文件 + 元数据
+        artifacts = self._enrich_with_artifact_store(artifacts)
         all_results: list[ValidationResult] = []
 
         # 1. 程序化验证

@@ -263,10 +263,15 @@ class TaskScheduler:
             logger.error(f"[Scheduler] graph invoke 失败：{exc}")
             return {"status": "failed", "error": str(exc)}
 
-    def _run_sync_fallback(self) -> dict[str, Any]:
-        """无 langgraph 时的同步调度循环。"""
+    def _run_sync_fallback(self, task_input: dict | None = None) -> dict[str, Any]:
+        """无 langgraph 时的同步调度循环。
+
+        Args:
+            task_input: 可选的 task 输入字典（传递 run_id / workspace_root 给 executor）
+        """
         round_n = 0
         termination_reason = None
+        task_input = task_input or {}
         while round_n < self.max_rounds:
             round_n += 1
             ready = self.task_dag.ready_tasks()
@@ -293,7 +298,7 @@ class TaskScheduler:
             for task in ready:
                 self.task_dag.update_status(task.id, TaskNodeStatus.READY)
                 self.task_dag.update_status(task.id, TaskNodeStatus.RUNNING)
-                result = self.worker_executor.execute_task(self.task_dag, task.id, {})
+                result = self.worker_executor.execute_task(self.task_dag, task.id, task_input)
                 if result.success:
                     self.task_dag.update_status(task.id, TaskNodeStatus.SUCCEEDED)
                     for art in result.artifact_ids:

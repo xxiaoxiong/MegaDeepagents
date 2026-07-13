@@ -58,6 +58,45 @@ def build_model():
     return init_chat_model(s.resolved_model)
 
 
+def build_model_for_policy(model_policy) -> "Any":
+    """根据 AgentProfile.model_policy 装饰模型。
+
+    让 profile 真正影响模型选择（任务书 §23#15）。
+    设计：始终从 build_model() 出发（确保测试 monkeypatch 路径不中断），
+    然后应用 model_policy 上的 temperature / max_tokens / timeout 超参。
+
+    provider / model_name 的切换通过 build_model() 内部的 settings 实现；
+    本函数只对返回值做 bind 修饰。
+    profile 如需切换 provider：通过 settings 的 llm_provider / llm_model 控制，
+    或通过 monkeypatch build_model 注入。
+
+    Args:
+        model_policy: AgentProfile.model_policy（ModelPolicy 实例），可为 None。
+    """
+    if model_policy is None:
+        return build_model()
+
+    model = build_model()
+    temperature = getattr(model_policy, "temperature", None)
+    max_tokens = getattr(model_policy, "max_tokens", None)
+    timeout = getattr(model_policy, "timeout_seconds", None)
+
+    try:
+        kwargs: dict = {}
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        if max_tokens and max_tokens != 4096:
+            kwargs["max_tokens"] = max_tokens
+        if timeout and timeout != 60.0:
+            kwargs["request_timeout"] = timeout
+        if kwargs and hasattr(model, "bind"):
+            model = model.bind(**kwargs)
+    except Exception as exc:
+        logger.debug(f"build_model_for_policy: bind 超参失败（忽略）: {exc}")
+
+    return model
+
+
 def build_aux_model():
     """辅助模型（用于 Curator/Evolution 等非主链路）。"""
     s = settings

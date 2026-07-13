@@ -24,7 +24,9 @@ from datetime import datetime
 from typing import Any
 
 from app.core.logging import logger
+from app.multiagent.team_run_context import TeamRunContext
 from app.multiagent.scheduler import TaskScheduler, _InMemoryWorkerExecutor, WorkerExecutor
+from app.multiagent.task_graph import TaskGraph, TaskNodeStatus
 
 try:
     from langgraph.graph import StateGraph, END
@@ -68,6 +70,7 @@ class SimpleOrchestrator:
         max_repair_rounds: int = 3,
         max_rounds: int = 30,
         checkpoint_path: str | None = None,
+        ctx: TeamRunContext | None = None,
     ):
         self.planner = planner
         self._executor = executor or _InMemoryWorkerExecutor()
@@ -76,6 +79,7 @@ class SimpleOrchestrator:
         self.max_repair_rounds = max_repair_rounds
         self.max_rounds = max_rounds
         self.checkpoint_path = checkpoint_path
+        self._ctx = ctx  # TeamRunContext for workspace/run_id
 
         self._result: OrchestrationResult = OrchestrationResult()
         self._task_graph = None
@@ -87,13 +91,18 @@ class SimpleOrchestrator:
 
     # ===== 运行入口 =====
 
-    def run(self, goal: str, context: str = "", mode_override: str | None = None) -> OrchestrationResult:
+    def run(self, goal: str, context: str = "", mode_override: str | None = None, ctx: TeamRunContext | None = None) -> OrchestrationResult:
         """执行一次完整的多-agent 编排。"""
+        if ctx is not None:
+            self._ctx = ctx
         try:
             self._result = OrchestrationResult(mode="single")
             self.trace = []
             self._log(f"开始编排: {goal[:80]}")
             self.phase = "routing"
+
+            # 0. 遥测：run开始
+            self._emit_event("orchestrator_started", {"goal": goal[:80]})
 
             # 1. 复杂度路由
             mode = self._route(goal, mode_override)
@@ -105,33 +114,41 @@ class SimpleOrchestrator:
 
             # 2. 规划
             self.phase = "planning"
+            self._emit_event("planning_started", {})
             dag = self._plan(goal, context)
             self._task_graph = dag
             if dag is None:
                 self._result.status = "failed"
                 self._result.error = "planner_failed"
+                self._emit_event("planning_failed", {"error": "planner_failed"})
                 return self._result
+            self._emit_event("planning_finished", {"task_count": len(dag.nodes)})
 
             # 3. 调度 + 执行
             self.phase = "scheduling"
             self._result.total_tasks = len(dag.nodes)
+            self._emit_event("scheduling_started", {"total_tasks": len(dag.nodes)})
             success = self._schedule(dag)
             if not success:
                 self._result.status = "failed"
                 self._result.error = "scheduler_failed"
+                self._emit_event("scheduling_failed", {"error": "scheduler_failed"})
                 return self._result
+            self._emit_event("scheduling_finished", {})
 
             # 4. 验证
             self.phase = "verifying"
             verdict = self._verify(goal, dag)
             self._result.verification_verdict = verdict
             self._log(f"验证结果: {verdict}")
+            self._emit_event("verification_done", {"verdict": verdict})
 
             # 5. Repair / Replan 循环
             repair_round = 0
             while verdict in ("repair",) and repair_round < self.max_repair_rounds:
                 repair_round += 1
                 self._log(f"Repair 第 {repair_round} 轮")
+                self._emit_event("repair_started", {"round": repair_round})
                 dag = self._repair(dag, self._result.verification_verdict)
                 if dag is None:
                     break
@@ -139,6 +156,7 @@ class SimpleOrchestrator:
                 self._schedule(dag)
                 verdict = self._verify(goal, dag)
                 self._result.verification_verdict = verdict
+                self._emit_event("repair_finished", {"round": repair_round, "verdict": verdict})
 
             # 6. 最终结果
             if verdict == "pass":
@@ -162,10 +180,18 @@ class SimpleOrchestrator:
             )
             self._result.task_graph_version = dag.version if dag else 0
 
+            self._emit_event("orchestrator_finished", {
+                "status": self._result.status,
+                "succeeded": self._result.succeeded_tasks,
+                "failed": self._result.failed_tasks,
+                "verdict": verdict,
+            })
+
         except Exception as exc:
             logger.error(f"[Orchestrator] 异常: {exc}")
             self._result.status = "failed"
             self._result.error = str(exc)
+            self._emit_event("orchestrator_failed", {"error": str(exc)})
 
         return self._result
 
@@ -197,10 +223,10 @@ class SimpleOrchestrator:
 
         except Exception as exc:
             logger.error(f"[Orchestrator single] 异常: {exc}")
-            # 单 Agent 降级：即使 LLM 失败也返回 completed（只记录错误）
-            self._result.status = "completed"
-            self._result.summary = goal[:200]
-            self.phase = "completed"
+            # 禁止伪成功：LLM 失败则返回 failed
+            self._result.status = "failed"
+            self._result.error = f"single_agent_llm_failed: {exc}"
+            self.phase = "failed"
 
         return self._result
 
@@ -238,16 +264,145 @@ class SimpleOrchestrator:
         return dag
 
     def _schedule(self, dag) -> bool:
-        """使用 TaskScheduler 执行 DAG。"""
-        scheduler = TaskScheduler(
-            task_dag=dag,
-            max_rounds=self.max_rounds,
-            worker_executor=self._executor,
-        )
-        result = scheduler._run_sync_fallback()
-        self.current_round = result.get("rounds", 0)
-        self._log(f"调度完成: status={result['status']}, rounds={self.current_round}")
-        return True
+        """执行 DAG 主链。
+
+        优先走 ParallelTeamScheduler（真正的并行 + AgentRegistry 调度 + 心跳租约），
+        这是 Phase Two §三/§七要求的主路径——多 Agent 并行运行而非旧的同步串行 fallback。
+
+        当 ParallelTeamScheduler 不可用（无 run_id、缺 asyncio 运行时）时，
+        回退到 TaskScheduler._run_sync_fallback——仅作为缺异步运行时保护的兜底，
+        不能成为默认主链。
+        """
+        run_id = self._ctx.run_id if self._ctx else None
+        if not run_id:
+            # 无 run_id → 无法走 team board 路径；回退 sync fallback
+            self._log("无 run_id，回退 sync fallback 调度")
+            scheduler = TaskScheduler(
+                task_dag=dag,
+                max_rounds=self.max_rounds,
+                worker_executor=self._executor,
+            )
+            result = scheduler._run_sync_fallback(task_input={
+                "workspace_root": self._ctx.workspace_root if self._ctx else "",
+            })
+            self.current_round = result.get("rounds", 0)
+            status = result.get("status", "failed")
+            self._log(f"调度完成(回退): status={status}, rounds={self.current_round}")
+            return status in ("completed", "incomplete")
+
+        # ===== 主路径：ParallelTeamScheduler =====
+        # 把 DAG 节点同步到 TaskBoard（ParallelTeamScheduler 的工作载体）
+        self._sync_dag_to_board(run_id, dag)
+
+        try:
+            from app.multiagent.parallel_scheduler import ParallelTeamScheduler
+            from app.multiagent.agent_registry import get_agent_registry
+            from app.multiagent.task_board import get_task_board
+
+            sched = ParallelTeamScheduler(run_id=run_id, max_rounds=self.max_rounds)
+            # 调用方传入的真实 executor（DeepAgentExecutor / 测试 stub）
+            executor_used = self._executor or _InMemoryWorkerExecutor()
+            run_result = self._run_parallel(sched, executor_used)
+            self.current_round = getattr(run_result, "rounds", 0) or 0
+            status = getattr(run_result, "status", "failed") or "failed"
+            self._log(
+                f"调度完成(并行): status={status}, rounds={self.current_round}, "
+                f"error={getattr(run_result, 'error', None)}"
+            )
+            # 把 BoardTask 终态反映回 dag.nodes，让 _verify 能判断
+            self._sync_board_to_dag(run_id, dag)
+            return True
+        except Exception as exc:
+            logger.error(f"[Orchestrator] ParallelTeamScheduler 不可用，回退 sync: {exc}")
+            # 兜底：sync fallback
+            scheduler = TaskScheduler(
+                task_dag=dag,
+                max_rounds=self.max_rounds,
+                worker_executor=self._executor,
+            )
+            result = scheduler._run_sync_fallback(task_input={
+                "run_id": run_id,
+                "workspace_root": self._ctx.workspace_root if self._ctx else "",
+            })
+            self.current_round = result.get("rounds", 0)
+            status = result.get("status", "failed")
+            self._log(f"调度完成(回退): status={status}, rounds={self.current_round}")
+            return status in ("completed", "incomplete")
+
+    def _run_parallel(self, sched, executor):
+        """在事件循环中跑 ParallelTeamScheduler.run。
+
+        兼容嵌套 event loop 场景（pytest-asyncio/已有 loop）：新建独立线程跑 loop。
+        """
+        import asyncio
+        try:
+            asyncio.get_running_loop()
+            # 已有 loop（async 上下文调用）：在独立线程上跑新 loop 避免冲突
+            import threading
+            box: dict[str, Any] = {}
+
+            def _runner():
+                box["result"] = asyncio.run(sched.run(executor))
+
+            t = threading.Thread(target=_runner, daemon=False)
+            t.start()
+            t.join()
+            return box.get("result")
+        except RuntimeError:
+            # 无运行中 loop：直接 asyncio.run
+            return asyncio.run(sched.run(executor))
+
+    def _sync_dag_to_board(self, run_id: str, dag) -> None:
+        """把 TaskGraph.nodes 同步到 TaskBoard（如尚未注册）。
+
+        ParallelTeamScheduler 工作在 board 之上，而 planner 输出 dag；
+        本方法把每个 TaskNode 投放到 board 上一个对应 BoardTask。
+        已存在同 (run_id, task_id) 的 BoardTask 跳过——保持幂等。
+        """
+        from app.multiagent.task_board import get_task_board
+        board = get_task_board()
+        existing = {t.task_id for t in board.list_by_run(run_id)}
+        for node in dag.nodes.values():
+            if node.id in existing:
+                continue
+            board.create_task(
+                task_id=node.id,
+                run_id=run_id,
+                title=node.title,
+                objective=node.objective,
+                dependencies=list(getattr(node, "dependencies", []) or []),
+                required_capabilities=list(getattr(node, "required_capabilities", []) or []),
+            )
+
+    def _sync_board_to_dag(self, run_id: str, dag) -> None:
+        """把 board 上的任务终态反映回 dag.nodes。
+
+        ParallelTeamScheduler 推动的是 BoardTask，而 _verify /repair 路径
+        看 dag.nodes；两者要一致。
+        """
+        from app.multiagent.task_board import get_task_board, BoardTaskStatus
+        board = get_task_board()
+        for bt in board.list_by_run(run_id):
+            node = dag.nodes.get(bt.task_id)
+            if node is None:
+                continue
+            target: TaskNodeStatus | None = None
+            if bt.status == BoardTaskStatus.SUCCEEDED:
+                target = TaskNodeStatus.SUCCEEDED
+            elif bt.status == BoardTaskStatus.FAILED:
+                target = TaskNodeStatus.FAILED
+            elif bt.status in (BoardTaskStatus.RUNNING, BoardTaskStatus.CLAIMED):
+                target = TaskNodeStatus.RUNNING
+            elif bt.status == BoardTaskStatus.PENDING:
+                target = TaskNodeStatus.PENDING
+            if target is not None and node.status != target:
+                dag.update_status(bt.task_id, target)
+            # 接受 artifact（BoardTask 用 produced_artifact_ids）
+            for art_id in (bt.produced_artifact_ids or []):
+                try:
+                    dag.accept_artifact(bt.task_id, art_id)
+                except Exception:
+                    pass
 
     def _verify(self, goal: str, dag) -> str:
         if self.verifier is None:
@@ -257,14 +412,35 @@ class SimpleOrchestrator:
             except Exception:
                 return "pass"
         try:
-            # 构造 artifacts dict
+            # 构造 artifacts dict — 优先读取真实文件内容
             artifacts: dict[str, dict] = {}
+            workspace_root = self._ctx.workspace_root if self._ctx else None
+
             for node in dag.nodes.values():
                 if node.status.value == "succeeded":
-                    artifacts[f"task:{node.id}"] = {
+                    entry: dict[str, Any] = {
                         "content_preview": node.objective[:200],
                         "status": node.status.value,
                     }
+                    # 尝试读取真实产物
+                    if workspace_root:
+                        import os
+                        task_dir = os.path.join(workspace_root, "tasks", node.id)
+                        if os.path.isdir(task_dir):
+                            file_contents = []
+                            for fname in os.listdir(task_dir)[:5]:
+                                fpath = os.path.join(task_dir, fname)
+                                if os.path.isfile(fpath):
+                                    try:
+                                        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                                            content = f.read()
+                                        file_contents.append(f"--- {fname} ---\n{content[:2000]}")
+                                    except Exception:
+                                        file_contents.append(f"--- {fname} ---\n(无法读取)")
+                            if file_contents:
+                                entry["content"] = "\n".join(file_contents)[:5000]
+                    artifacts[f"task:{node.id}"] = entry
+
             result = self.verifier.validate(goal=goal, artifacts=artifacts)
             return result.verdict.value
         except Exception as exc:
@@ -298,6 +474,23 @@ class SimpleOrchestrator:
         logger.info(f"[Orchestrator/{self.phase}] {msg}")
         self.trace.append(f"[{datetime.utcnow().isoformat()}] {msg}")
 
+    def _emit_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        """把事件写入 team_events 表（Phase G 可观测性）。"""
+        run_id = (getattr(self._ctx, "run_id", None) or "unknown")
+        try:
+            from app.multiagent.phase_g_store import get_agent_run_history
+            h = get_agent_run_history()
+            from app.multiagent.phase_g_store import make_run_event_id
+            h.record_event(
+                event_id=make_run_event_id(),
+                run_id=run_id,
+                event_type=f"orchestrator:{event_type}",
+                payload=payload,
+                timestamp=datetime.utcnow(),
+            )
+        except Exception as exc:
+            logger.debug(f"[Orchestrator] emit_event {event_type} 失败: {exc}")
+
 
 # ===== 直观工厂函数 =====
 
@@ -311,6 +504,7 @@ def run_orchestrated(
     verifier: Any = None,
     router: Any = None,
     max_repair_rounds: int = 3,
+    ctx: TeamRunContext | None = None,
 ) -> OrchestrationResult:
     """一站式编排执行入口。"""
     orch = SimpleOrchestrator(
@@ -319,5 +513,6 @@ def run_orchestrated(
         verifier=verifier,
         router=router,
         max_repair_rounds=max_repair_rounds,
+        ctx=ctx,
     )
-    return orch.run(goal=goal, context=context, mode_override=mode_override)
+    return orch.run(goal=goal, context=context, mode_override=mode_override, ctx=ctx)

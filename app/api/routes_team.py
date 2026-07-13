@@ -19,6 +19,8 @@ from app.multiagent.default_teams import list_teams as _list_teams
 from app.multiagent.event_emitter import get_event_emitter
 from app.multiagent.messages import AgentMessage, MessageType, make_message_id
 from app.multiagent.team_runner import TeamRunner
+from app.multiagent.team_runtime import get_team_runtime
+from app.multiagent.team_run_context import TeamRunMode
 from app.multiagent.store import get_multiagent_store
 
 router = APIRouter()
@@ -174,44 +176,70 @@ def list_team_tasks(limit: int = 50):
 
 @router.post("/team-tasks", response_model=CreateTeamTaskResponse)
 def create_team_task(req: CreateTeamTaskRequest):
-    """创建并启动多 Agent 团队任务。"""
+    """创建并启动多 Agent 团队任务。
+
+    默认走 TASK_TEAM 模式（TeamRuntimeFacade → ParallelTeamScheduler）。
+    保留旧 TeamRunner（DISCUSSION 模式）作为可选项。
+
+    设计：
+    - create_run 轻量同步完成（只建 TeamRunContext，不涉及 LLM），
+      让 API 能立即返回 task_id。
+    - start_run 在后台线程执行（涉及 LLM，可以是长耗时操作）。
+    - 使用 asyncio.new_event_loop() / set_event_loop() 避免嵌套 loop 冲突。
+    """
     available = _list_teams()
     if req.team not in available:
         raise HTTPException(
             status_code=400,
             detail=f"Team '{req.team}' not found. Available: {available}",
         )
-    runner = TeamRunner.create(
-        goal=req.goal,
-        team_name=req.team,
-        max_rounds=req.max_rounds,
-        review_required=req.review_required,
-    )
-    # 后台运行：用 copy_context 传播 contextvar（含 LangSmith 的 _PARENT_RUN_TREE_REF），
-    # 否则跨线程会丢失 trace 父子链，LangSmith 上所有 run 变成独立根。
+
+    import asyncio
     import threading
     import contextvars
+    from app.multiagent.team_runtime import get_team_runtime
 
-    from app.multiagent.team_runner import _run_team_traced
+    runtime = get_team_runtime()
 
-    def _safe_run():
+    # 1. 同步创建 run（轻量，不涉及 LLM）
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        ctx = loop.run_until_complete(runtime.create_run(
+            goal=req.goal,
+            team_name=req.team,
+            mode=TeamRunMode.TASK_TEAM,
+            max_rounds=req.max_rounds,
+            review_required=req.review_required,
+        ))
+        loop.close()
+    except Exception as exc:
+        logger.error(f"[TeamTask] create_run failed: {exc}")
+        raise HTTPException(status_code=500, detail=f"create_run failed: {exc}")
+
+    # 2. 后台线程执行 start_run（涉及 LLM 调用）
+    def _bg_run():
         try:
-            _run_team_traced(runner)
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            result = new_loop.run_until_complete(runtime.start_run(
+                ctx=ctx, goal=req.goal, team_name=req.team,
+                max_rounds=req.max_rounds, review_required=req.review_required,
+            ))
+            new_loop.close()
+            logger.info(f"[TeamTask] run completed: id={ctx.run_id} status={result.status}")
         except Exception as exc:
-            logger.error(f"[TeamTask] run failed for task={runner.task_id}: {exc}")
+            logger.error(f"[TeamTask] start_run failed for {ctx.run_id}: {exc}")
 
-    ctx = contextvars.copy_context()
-    thread = threading.Thread(target=ctx.run, args=(_safe_run,), daemon=True)
+    thread = threading.Thread(target=_bg_run, daemon=True)
     thread.start()
-    # 在响应中暴露 EfficientRunPolicy 派生字段（Req 6：API 必须暴露真实生效的策略）
-    policy = runner.effective_policy
+
     return CreateTeamTaskResponse(
-        task_id=runner.task_id,
-        room_id=runner.room_id,
+        task_id=ctx.run_id,
+        room_id=ctx.run_id,
         status="running",
-        max_rounds=policy.max_rounds,
-        review_required=policy.review_required,
-        max_review_cycles=policy.max_review_cycles,
+        max_rounds=req.max_rounds,
+        review_required=req.review_required,
     )
 
 

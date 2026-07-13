@@ -180,8 +180,136 @@ def _init_multiagent_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_memory_tier ON memory_entries(tier);
         CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory_entries(agent_scope);
         CREATE INDEX IF NOT EXISTS idx_memory_task ON memory_entries(task_id);
+
+        -- Phase G: AgentInstance 持久化
+        CREATE TABLE IF NOT EXISTS agent_instances (
+            agent_id TEXT PRIMARY KEY,
+            team_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            profile_id TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            role TEXT NOT NULL DEFAULT '',
+            session_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL,
+            checkpoint_namespace TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'created',
+            current_task_id TEXT,
+            workspace_root TEXT NOT NULL DEFAULT '',
+            last_heartbeat_at TEXT,
+            capabilities TEXT NOT NULL DEFAULT '[]',
+            metadata TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            stopped_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_inst_run ON agent_instances(run_id);
+        CREATE INDEX IF NOT EXISTS idx_agent_inst_status ON agent_instances(status);
+
+        -- Phase G: TaskRun 记录
+        CREATE TABLE IF NOT EXISTS task_runs (
+            task_run_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            attempt INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'created',
+            checkpoint_id TEXT,
+            artifact_ids TEXT NOT NULL DEFAULT '[]',
+            tool_calls TEXT NOT NULL DEFAULT '[]',
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            error TEXT,
+            metadata TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_task_runs_task ON task_runs(task_id);
+        CREATE INDEX IF NOT EXISTS idx_task_runs_run ON task_runs(run_id);
+
+        -- Phase G: Artifact 持久化（替代内存注册表）
+        CREATE TABLE IF NOT EXISTS artifacts (
+            artifact_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            type TEXT NOT NULL DEFAULT 'any',
+            relative_path TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL DEFAULT 0,
+            version INTEGER NOT NULL DEFAULT 1,
+            produced_by TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'published',
+            predecessor_id TEXT,
+            parent_artifact_id TEXT,
+            created_at TEXT NOT NULL,
+            metadata TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id);
+        CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts(run_id);
+
+        -- Phase G: Permission Requests
+        CREATE TABLE IF NOT EXISTS permission_requests (
+            request_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            target TEXT NOT NULL DEFAULT '',
+            reason TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            decided_by TEXT,
+            decision TEXT,
+            created_at TEXT NOT NULL,
+            decided_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_perm_req_run ON permission_requests(run_id);
+
+        -- Phase G: Team Events 审计日志
+        CREATE TABLE IF NOT EXISTS team_events (
+            event_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            agent_id TEXT,
+            task_id TEXT,
+            task_run_id TEXT,
+            timestamp TEXT NOT NULL,
+            trace_id TEXT,
+            payload TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_team_events_run ON team_events(run_id);
+        CREATE INDEX IF NOT EXISTS idx_team_events_type ON team_events(event_type);
+
+        -- Phase G: Mailbox 消息持久化
+        CREATE TABLE IF NOT EXISTS mailbox_messages (
+            message_id TEXT PRIMARY KEY,
+            from_agent_id TEXT NOT NULL,
+            from_agent_name TEXT NOT NULL DEFAULT '',
+            from_role TEXT NOT NULL DEFAULT '',
+            to_agent_id TEXT,           -- NULL = broadcast
+            to_role TEXT,
+            run_id TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            content TEXT NOT NULL DEFAULT '',
+            severity TEXT NOT NULL DEFAULT 'info',
+            thread_id TEXT,
+            reply_to TEXT,
+            delivery_attempts INTEGER NOT NULL DEFAULT 0,
+            consumed_at TEXT,
+            status TEXT NOT NULL DEFAULT 'delivered',
+            created_at TEXT NOT NULL,
+            metadata TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_mailbox_run ON mailbox_messages(run_id);
+        CREATE INDEX IF NOT EXISTS idx_mailbox_to ON mailbox_messages(to_agent_id);
+        CREATE INDEX IF NOT EXISTS idx_mailbox_thread ON mailbox_messages(thread_id);
+        CREATE INDEX IF NOT EXISTS idx_mailbox_blocklist ON mailbox_messages(run_id, from_agent_id);
+
+        -- Phase G: Schema Version
+        CREATE TABLE IF NOT EXISTS schema_version (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        );
         """
     )
+    # 检查并更新 schema version
+    _ensure_schema_version(conn)
+
     # 兼容旧库：如果 team_rounds 表已存在但缺 langsmith_run_url 列，则补上
     try:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(team_rounds)").fetchall()}
@@ -199,6 +327,20 @@ def _init_multiagent_db(conn: sqlite3.Connection) -> None:
     except Exception as exc:
         logger.warning(f"[store] ALTER TABLE memory_entries 失败（可能已存在）：{exc}")
     conn.commit()
+
+
+def _ensure_schema_version(conn) -> None:
+    """检查并记录当前 schema version。"""
+    cur = conn.execute("SELECT MAX(version) FROM schema_version")
+    row = cur.fetchone()
+    current_version = row[0] if row and row[0] else 0
+    target_version = 3  # v3: 增加 mailbox_messages 表
+    if current_version < target_version:
+        conn.execute(
+            "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)",
+            (target_version, datetime.utcnow().isoformat()),
+        )
+        logger.info(f"[store] schema version updated: {current_version} → {target_version}")
 
 
 def close_connection() -> None:

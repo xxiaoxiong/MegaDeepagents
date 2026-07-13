@@ -39,86 +39,67 @@ def run_team(
     max_rounds: int = Option(10, "--max-rounds", "-m", help="最大轮次"),
     review_required: bool = Option(True, "--review/--no-review", help="是否需要评审"),
     workspace: str = Option("", "--workspace", "-w", help="产出文件目录（默认 runtime/workspaces/）"),
-    legacy: bool = Option(False, "--legacy", help="使用旧 TeamRunner 主循环（不走 Phase Two 流程）"),
+    legacy: bool = Option(False, "--legacy", help="使用旧 TeamRunner DISCUSSION 模式（不走 TASK_TEAM 主链）"),
 ):
     """运行多 Agent 团队任务。
 
-    默认走 Phase Two 编排（TaskGraph + DeepAgentExecutor + 真实文件产出）。
-    加 --legacy 回退旧 TeamRunner。
+    默认走统一 TeamRuntimeFacade（TASK_TEAM：TaskGraph + DeepAgentExecutor + 真实验证）。
+    加 --legacy 回退 DISCUSSION 模式（旧 TeamRunner 轮替发言）。
     """
-    from app.core.observability import init_observability
-    from app.multiagent.orchestrator import run_orchestrated
-    from app.multiagent.executor import DeepAgentExecutor
-    from app.multiagent.verifier import Verifier, LLMRubricVerifier
-    from app.multiagent.planner import plan_with_llm
-    from app.multiagent.artifact import ArtifactStore, ArtifactType, compute_content_hash
-    from app.multiagent.run_workspace import RunWorkspace, create_run_workspace
-    from app.multiagent.task_graph import TaskNode, TaskNodeStatus
-    import uuid, os
+    import asyncio
+    import uuid
+    import os
     from pathlib import Path
 
+    from app.core.observability import init_observability
+    from app.multiagent.team_runtime import get_team_runtime
+    from app.multiagent.team_run_context import TeamRunMode
+
     init_observability(component="cli")
+    mode = TeamRunMode.DISCUSSION if legacy else TeamRunMode.TASK_TEAM
 
-    if legacy:
-        from app.multiagent.team_runner import run_team_task
-        with console.status("[bold green]Team running (legacy)..."):
-            result = run_team_task(
-                goal=goal, team_name=team,
-                max_rounds=max_rounds, review_required=review_required,
-            )
-        console.print(f"[bold]Status:[/bold] {result.status}")
-        console.print(f"[bold]Phase:[/bold] {result.phase}")
-        console.print(f"[bold]Rounds:[/bold] {result.total_rounds}")
-        console.print(f"[bold]Reason:[/bold] {result.termination_reason}")
-        if result.final_output:
-            console.print(f"[bold]Final:[/bold]\n{result.final_output[:500]}")
-        return
-
-    # ---- Phase Two 路径 ----
-    run_id = "cli_" + uuid.uuid4().hex[:12]
+    runtime = get_team_runtime()
     base = workspace or os.path.join(os.getcwd(), "runtime", "workspaces")
-    ws = create_run_workspace(run_id, base_root=base)
-    console.print(f"[dim]Workspace: {ws.workspace_root}[/dim]")
+    workspace_root = os.path.join(base, "run_" + uuid.uuid4().hex[:12])
 
-    # executor + verifier
-    executor = DeepAgentExecutor()
-    verifier = Verifier(llm_rubric=LLMRubricVerifier(model_available=False))
-
-    # planner: 用真实 LLM 生成 TaskGraph（不假，走 build_model）
-    planner = lambda g, c: plan_with_llm(g, context=c)
-
-    with console.status("[bold green]Phase Two team running..."):
-        result = run_orchestrated(
-            goal=goal,
-            mode_override="full_multi",
-            planner=planner,
-            executor=executor,
-            verifier=verifier,
+    async def _go():
+        ctx = await runtime.create_run(
+            goal=goal, team_name=team, mode=mode,
+            max_rounds=max_rounds, review_required=review_required,
+            workspace_root=workspace_root,
         )
+        result = await runtime.start_run(
+            ctx=ctx, goal=goal, team_name=team,
+            max_rounds=max_rounds, review_required=review_required,
+        )
+        return ctx, result
 
-    # ---- 输出 ----
+    with console.status(f"[bold green]{'Legacy' if legacy else 'TASK_TEAM'} run starting..."):
+        ctx, result = asyncio.run(_go())
+
+    console.print(f"[bold]Run ID:[/bold] {ctx.run_id}")
+    console.print(f"[bold]Mode:[/bold] {ctx.mode.value}")
+    console.print(f"[bold]Workspace:[/bold] {ctx.workspace_root}")
     console.print(f"[bold]Status:[/bold] {result.status}")
-    console.print(f"[bold]Mode:[/bold] {result.mode}")
-    console.print(f"[bold]Verdict:[/bold] {result.verification_verdict}")
-    console.print(f"[bold]Tasks:[/bold] {result.total_tasks} total, "
-                  f"{result.succeeded_tasks} succeeded, {result.failed_tasks} failed")
-    if result.summary:
-        console.print(f"[bold]Summary:[/bold] {result.summary[:300]}")
+    console.print(f"[bold]Rounds:[/bold] {result.total_rounds}")
+    if getattr(result, "termination_reason", None):
+        console.print(f"[bold]Reason:[/bold] {result.termination_reason}")
+    if result.final_output:
+        console.print(f"[bold]Final:[/bold]\n{result.final_output[:500]}")
+    if getattr(result, "error", None):
+        console.print(f"[red]Error:[/red] {result.error}")
 
-    # 列出 workspace 中实际产出的文件
-    output_files = list(Path(ws.workspace_root).rglob("*"))
+    output_files = list(Path(ctx.workspace_root).rglob("*"))
     real_files = [f for f in output_files if f.is_file()]
     if real_files:
         console.print(f"\n[bold green]产出文件 ({len(real_files)}):[/bold green]")
         for f in sorted(real_files):
-            rel = os.path.relpath(str(f), ws.workspace_root)
+            rel = os.path.relpath(str(f), ctx.workspace_root)
             size = f.stat().st_size
             console.print(f"  [cyan]{rel}[/cyan] ({size} bytes)")
-        console.print(f"\nWorkspace 根目录: [yellow]{ws.workspace_root}[/yellow]")
     else:
         console.print("[yellow]未产生磁盘文件（Agent 可能只输出了文本）。[/yellow]")
-    if result.error:
-        console.print(f"[red]Error:[/red] {result.error}")
+    return
 
 
 @team_app.command("list")

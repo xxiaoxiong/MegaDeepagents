@@ -36,6 +36,7 @@ where = ["."]
 observability = ["langsmith>=0.10.0"]
 
 [tool.pytest.ini_options]
+asyncio_mode = "auto"
 markers = [
     "real_langsmith: 需要 LANGSMITH_API_KEY 才运行的集成测试",
     "live_model: 需要真实 LLM API Key 才能运行的端到端测试（默认 skip）",

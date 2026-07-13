@@ -128,7 +128,9 @@ class ModelDecisionExecutor:
 
         start = time.time()
         try:
-            llm = build_model()
+            # Phase Two #17: model_policy 影响模型选择
+            from app.llm_factory import build_model_for_policy
+            llm = build_model_for_policy(getattr(profile, "model_policy", None))
             try:
                 json_llm = llm.bind(response_format={"type": "json_object"})
             except Exception:
@@ -205,7 +207,15 @@ def _make_create_file_tool(task_workspace: str):
     def create_file(file_path: str, content: str) -> str:
         """创建或覆写文件。路径相对于工作目录。"""
         import os
+        # 路径遍历防护
+        if ".." in file_path.split(os.sep) or ".." in file_path.split("/"):
+            return f"错误: 路径包含 '..' 遍历，已拒绝: {file_path}"
         abs_path = os.path.join(task_workspace, file_path) if not os.path.isabs(file_path) else file_path
+        # 绝对路径必须限制在 task_workspace 内
+        if os.path.isabs(file_path):
+            abs_path = os.path.abspath(file_path)
+            if not abs_path.startswith(os.path.abspath(task_workspace)):
+                return f"错误: 路径越权: {file_path}"
         os.makedirs(os.path.dirname(abs_path), exist_ok=True)
         with open(abs_path, "w", encoding="utf-8") as f:
             f.write(content)
@@ -220,7 +230,14 @@ def _make_edit_file_tool(task_workspace: str):
     def edit_file(file_path: str, old_string: str, new_string: str) -> str:
         """编辑文件的字符串替换。"""
         import os
+        # 路径遍历防护
+        if ".." in file_path.split(os.sep) or ".." in file_path.split("/"):
+            return f"错误: 路径包含 '..' 遍历，已拒绝: {file_path}"
         abs_path = os.path.join(task_workspace, file_path) if not os.path.isabs(file_path) else file_path
+        if os.path.isabs(file_path):
+            abs_path = os.path.abspath(file_path)
+            if not abs_path.startswith(os.path.abspath(task_workspace)):
+                return f"错误: 路径越权: {file_path}"
         if not os.path.isfile(abs_path):
             return f"错误: 文件不存在 {abs_path}"
         with open(abs_path, "r", encoding="utf-8") as f:
@@ -237,10 +254,22 @@ def _make_edit_file_tool(task_workspace: str):
 def _make_execute_tool(task_workspace: str):
     from langchain.tools import tool
 
+    # 危险命令黑名单
+    DANGEROUS_COMMANDS = [
+        "rm -rf /", "rm -rf ~", "rm -rf .", "del /f", "format ",
+        "mkfs", "dd if=", "> /dev/sda", ":(){ :|:& };:", "wget ",
+        "curl -o ", "chmod 777 ", "sudo ",
+    ]
+
     @tool
     def execute(command: str) -> str:
-        """执行 shell 命令。"""
+        """执行 shell 命令。注意：危险命令将被拒绝。"""
         import subprocess
+        # 危险命令检查
+        cmd_lower = command.lower().strip()
+        for dangerous in DANGEROUS_COMMANDS:
+            if cmd_lower.startswith(dangerous.lower()):
+                return f"错误: 危险命令已被安全管理器拒绝: {command[:80]}"
         try:
             result = subprocess.run(
                 command, shell=True, capture_output=True, text=True,
@@ -250,6 +279,8 @@ def _make_execute_tool(task_workspace: str):
             if result.stderr:
                 output += f"\nSTDERR:\n{result.stderr[:1000]}"
             return output or "(无输出)"
+        except subprocess.TimeoutExpired:
+            return f"执行超时 (30s): {command[:80]}"
         except Exception as exc:
             return f"执行失败: {exc}"
     return execute
@@ -305,9 +336,22 @@ class DeepAgentExecutor:
                 execute_task 调用方必须通过 task_input 传入。
         """
         self.workspace_root = workspace_root
+        # ArtifactStore 注入（Phase A 修复断链）
+        self._artifact_store: Any | None = None
         # 测试 hook：设置后 execute 跳过真实 agent 创建
         self._mock_response: AgentExecutionResult | None = None
         self._mock_invoke: callable | None = None
+
+    def set_artifact_store(self, store: Any) -> None:
+        """注入 ArtifactStore，让 execute_task 生成的产物作为真实 Artifact 注册。"""
+        self._artifact_store = store
+
+    def set_run_id(self, run_id: str) -> None:
+        """注入 TeamRunContext.run_id，避免回退到 'cli_run' 硬编码。"""
+        self._run_id = run_id
+
+    def _ctx_run_id(self) -> str | None:
+        return getattr(self, "_run_id", None)
 
     # ===== Scheduler 协议适配（WorkerExecutor.execute_task） =====
 
@@ -370,7 +414,7 @@ class DeepAgentExecutor:
             metadata={"priority": node.priority},
         )
         context = ExecutionContext(
-            run_id=task_input.get("run_id") or "cli_run",
+            run_id=task_input.get("run_id") or self._ctx_run_id() or "cli_run",
             workspace_root=workspace_root,
             task_dag=task_dag,
         )
@@ -418,7 +462,9 @@ class DeepAgentExecutor:
         start = time.time()
 
         try:
-            model = build_model()
+            # Phase Two #17: 让 profile.model_policy 真正影响模型选择
+            from app.llm_factory import build_model_for_policy
+            model = build_model_for_policy(getattr(profile, "model_policy", None))
             checkpointer = _get_sqlite_saver()
 
             allowed_tools = profile.tool_policy.allowed_tools
@@ -465,12 +511,34 @@ class DeepAgentExecutor:
             elapsed = time.time() - start
             tool_calls = _extract_tool_calls(response)
 
-            produced_files = list(task_workspace.glob("*"))
+            produced_files = [
+                f for f in task_workspace.rglob("*")
+                if f.is_file() and not f.name.startswith(".")
+            ]
             produced_artifact_ids = []
-            if produced_files:
-                from app.multiagent.artifact import make_artifact_id
-                for f in produced_files:
-                    produced_artifact_ids.append(f"{assignment.task_id}:{f.name}")
+            # 移除"兼容回退"伪 ID：所有 artifact ID 必须来自真实 ArtifactStore.create
+            if self._artifact_store is not None and context.run_id:
+                try:
+                    with open(f, "r", encoding="utf-8", errors="ignore") as fp:
+                        content = fp.read()
+                    artifact = self._artifact_store.create(
+                        run_id=context.run_id,
+                        task_id=assignment.task_id,
+                        type=self._infer_artifact_type(f.name),
+                        relative_path=relative_path,
+                        content=content,
+                        produced_by=profile.name,
+                    )
+                    produced_artifact_ids.append(artifact.id)
+                except Exception as exc:
+                    logger.warning(f"[DeepAgentExecutor] artifact create failed: {exc}")
+                    # 不降级为伪 ID：让上游能感知失败
+                    raise
+            else:
+                logger.warning(
+                    f"[DeepAgentExecutor] no artifact_store or run_id configured for "
+                    f"run={context.run_id} – artifact {relative_path} not registered"
+                )
 
             final_messages = response.get("messages", [{}]) if isinstance(response, dict) else [{}]
             last = final_messages[-1] if final_messages else {}
@@ -492,6 +560,22 @@ class DeepAgentExecutor:
                 error=str(exc),
                 execution_time=elapsed,
             )
+
+    @staticmethod
+    def _infer_artifact_type(filename: str) -> str:
+        """根据文件名推断 ArtifactType。"""
+        lower = filename.lower()
+        if lower.endswith(".py") or lower.endswith(".js") or lower.endswith(".ts"):
+            return "code"
+        if lower.startswith("test_") or lower.endswith("_test.py") or lower.endswith(".test.js"):
+            return "test"
+        if lower.endswith(".md") or lower.endswith(".txt"):
+            return "document"
+        if lower.endswith(".json") or lower.endswith(".yaml") or lower.endswith(".yml"):
+            return "config"
+        if lower.endswith(".patch") or lower.endswith(".diff"):
+            return "patch"
+        return "any"
 
 
 def _build_boundary_prompt(profile: AgentProfile) -> str:
