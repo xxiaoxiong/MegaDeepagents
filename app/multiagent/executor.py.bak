@@ -203,24 +203,9 @@ def _make_create_file_tool(task_workspace: str):
 
     @tool
     def create_file(file_path: str, content: str) -> str:
-        """创建或覆写文件。路径相对于工作目录。
-
-        安全护栏：
-        - 拒绝包含 `..` 的路径（防 path traversal 逃出 task_workspace）
-        - 拒绝绝对路径标签开头（drive + `\`)
-        """
+        """创建或覆写文件。路径相对于工作目录。"""
         import os
-        # 路径穿越保护
-        if ".." in file_path.replace("\\", "/").split("/"):
-            return f"错误: 拒绝包含 '..' 的路径 {file_path}（禁止越界）"
         abs_path = os.path.join(task_workspace, file_path) if not os.path.isabs(file_path) else file_path
-        # 二次保护：解析后必须在 task_workspace 之内
-        try:
-            real = os.path.realpath(abs_path)
-            if not real.startswith(os.path.realpath(task_workspace)):
-                return f"错误: 拒绝越界写入 {file_path}（必须在 {task_workspace} 之内）"
-        except Exception as exc:
-            return f"错误: 路径解析失败 {file_path}：{exc}"
         os.makedirs(os.path.dirname(abs_path), exist_ok=True)
         with open(abs_path, "w", encoding="utf-8") as f:
             f.write(content)
@@ -233,23 +218,9 @@ def _make_edit_file_tool(task_workspace: str):
 
     @tool
     def edit_file(file_path: str, old_string: str, new_string: str) -> str:
-        """编辑文件的字符串替换。
-
-        安全护栏：
-        - 拒绝包含 `..` 的路径（防 path traversal 逃出 task_workspace）
-        """
+        """编辑文件的字符串替换。"""
         import os
-        # 路径穿越保护
-        if ".." in file_path.replace("\\", "/").split("/"):
-            return f"错误: 拒绝包含 '..' 的路径 {file_path}（禁止越界）"
         abs_path = os.path.join(task_workspace, file_path) if not os.path.isabs(file_path) else file_path
-        # 二次保护：解析后必须在 task_workspace 之内
-        try:
-            real = os.path.realpath(abs_path)
-            if not real.startswith(os.path.realpath(task_workspace)):
-                return f"错误: 拒绝越界编辑 {file_path}（必须在 {task_workspace} 之内）"
-        except Exception as exc:
-            return f"错误: 路径解析失败 {file_path}：{exc}"
         if not os.path.isfile(abs_path):
             return f"错误: 文件不存在 {abs_path}"
         with open(abs_path, "r", encoding="utf-8") as f:
@@ -268,77 +239,20 @@ def _make_execute_tool(task_workspace: str):
 
     @tool
     def execute(command: str) -> str:
-        """执行 shell 命令。
-
-        安全护栏：
-        - BLOCK 命令黑名单（rm -rf /、del /f、format、mkfs、shutdown、reboot 等）
-        - 最大 60s 超时（防止僵死进程）
-        - 输出大小限制 8KB（防止日志打爆上下文）
-        """
+        """执行 shell 命令。"""
         import subprocess
-        # 命令黑名单检查
-        blocked = _is_blocked_command(command)
-        if blocked:
-            return f"错误: 拒绝执行危险命令（命中黑名单：{blocked}）"
         try:
             result = subprocess.run(
                 command, shell=True, capture_output=True, text=True,
-                cwd=task_workspace, timeout=60,
+                cwd=task_workspace, timeout=30,
             )
-            # 输出大小限制 8KB
-            max_out = 4000
-            max_err = 4000
-            output = result.stdout[:max_out] if result.stdout else ""
+            output = result.stdout[:2000]
             if result.stderr:
-                output += f"\nSTDERR:\n{result.stderr[:max_err]}"
-            output = output or "(无输出)"
-            return output
-        except subprocess.TimeoutExpired:
-            return f"执行超时（>60s），已终止: {command[:100]}"
+                output += f"\nSTDERR:\n{result.stderr[:1000]}"
+            return output or "(无输出)"
         except Exception as exc:
             return f"执行失败: {exc}"
     return execute
-
-
-# Shell 工具危险命令黑名单（小写匹配）。
-# 触发任一关键词即拒绝（避免 `rm -rf /`、`del /f /s /q C:\`、`format C:`、
-# `mkfs`、`shutdown`、`reboot`、`:(){:|:&};:` fork 炸弹之类）。
-_BLOCKED_COMMAND_PATTERNS: tuple[str, ...] = (
-    "rm -rf /",
-    "rm -rf /*",
-    "rm -rf ~",
-    "rm -rf *",
-    "del /f",
-    "del /s",
-    "rmdir /s",
-    "format ",
-    "mkfs",
-    "shutdown",
-    "reboot",
-    ":(){:|:&};:",
-    ":(){ :|: & };:",
-    "dd if=/dev/zero",
-    "dd if=/dev/null",
-    "chmod -R 777 /",
-    "chown -R",
-    "kill -9 1",
-    "kill -9 -1",
-    "killall",
-    "> /dev/sda",
-    "> /dev/null",
-    "shutdown.exe",
-)
-
-
-def _is_blocked_command(command: str) -> str | None:
-    """命中黑名单返回触发模式；否则返回 None。"""
-    if not command:
-        return None
-    lowered = command.lower()
-    for pat in _BLOCKED_COMMAND_PATTERNS:
-        if pat in lowered:
-            return pat
-    return None
 
 
 def _build_restricted_tools(
@@ -394,28 +308,6 @@ class DeepAgentExecutor:
         # 测试 hook：设置后 execute 跳过真实 agent 创建
         self._mock_response: AgentExecutionResult | None = None
         self._mock_invoke: callable | None = None
-        # Phase A+B：注入的 ArtifactStore。orchestrator 在 _run_task_team 中设置：
-        #   executor._artifact_store = ArtifactStore(root_path=ctx.artifacts_dir())
-        # 设置后 execute() 把产物写入此 store，并通过 store 获取真实 artifact_id；
-        # 为 None 时回退到旧的伪 artifact_id 生成方式。
-        self._artifact_store: Any | None = None
-        # Phase A+B：注入的 TeamRunContext，用于把 run_id / workspace_root
-        # 透传给下游 ArtifactStore.create 等调用，避免硬编码 "cli_run"。
-        self._run_ctx: Any | None = None
-
-    def _inject_run_context(self, ctx: Any) -> None:
-        """由 SimpleOrchestrator._schedule 注入 TeamRunContext。
-
-        设置后 execute_task 使用 ctx.run_id 而非硬编码 "cli_run"。
-        """
-        self._run_ctx = ctx
-        # 同步顺带更新 workspace_root，使后续产物落到 ctx 的 workspace 内
-        try:
-            ws = getattr(ctx, "workspace_root", None)
-            if ws and not self.workspace_root:
-                self.workspace_root = ws
-        except Exception:
-            pass
 
     # ===== Scheduler 协议适配（WorkerExecutor.execute_task） =====
 
@@ -477,16 +369,8 @@ class DeepAgentExecutor:
             max_attempts=node.max_attempts,
             metadata={"priority": node.priority},
         )
-        # Phase A+B：优先用注入的 TeamRunContext.run_id，否则 task_input.run_id，
-        # 再否则回退到 "cli_run"（向后兼容旧 CLI 入口）。
-        ctx_run_id = "cli_run"
-        if self._run_ctx is not None:
-            try:
-                ctx_run_id = getattr(self._run_ctx, "run_id", None) or ctx_run_id
-            except Exception:
-                pass
         context = ExecutionContext(
-            run_id=task_input.get("run_id") or ctx_run_id,
+            run_id=task_input.get("run_id") or "cli_run",
             workspace_root=workspace_root,
             task_dag=task_dag,
         )
@@ -584,38 +468,9 @@ class DeepAgentExecutor:
             produced_files = list(task_workspace.glob("*"))
             produced_artifact_ids = []
             if produced_files:
-                # Phase A+B：当注入 _artifact_store 时，通过 store.create 获得
-                # 真实 artifact_id（可用于 Verifier 读取、下游 trace 追溯）。
-                # 未注入时回退到旧伪 ID 方式（向后兼容）。
-                store = self._artifact_store
-                if store is not None:
-                    for f in produced_files:
-                        try:
-                            rel = f"tasks/{assignment.task_id}/{f.name}"
-                            content = f.read_bytes()
-                            art = store.create(
-                                run_id=context.run_id,
-                                task_id=assignment.task_id,
-                                type="any",
-                                relative_path=rel,
-                                content=content,
-                                produced_by=getattr(profile, "id", "unknown"),
-                            )
-                            produced_artifact_ids.append(art.id)
-                        except Exception as exc:
-                            logger.warning(
-                                f"[DeepAgentExecutor] artifact store create failed "
-                                f"for {f.name}: {exc}; fallback to fake ID"
-                            )
-                            produced_artifact_ids.append(
-                                f"{assignment.task_id}:{f.name}"
-                            )
-                else:
-                    from app.multiagent.artifact import make_artifact_id
-                    for f in produced_files:
-                        produced_artifact_ids.append(
-                            f"{assignment.task_id}:{f.name}"
-                        )
+                from app.multiagent.artifact import make_artifact_id
+                for f in produced_files:
+                    produced_artifact_ids.append(f"{assignment.task_id}:{f.name}")
 
             final_messages = response.get("messages", [{}]) if isinstance(response, dict) else [{}]
             last = final_messages[-1] if final_messages else {}
