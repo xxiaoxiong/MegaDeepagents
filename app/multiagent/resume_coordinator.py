@@ -75,6 +75,12 @@ class ResumeCoordinator:
         self.board.restore_run(run_id)
         self.board.prepare_for_resume(run_id)
 
+        # A user/peer message is work input.  It must be available before the
+        # scheduler reserves a restored teammate; otherwise a restart loses a
+        # wake-up that was already durably delivered.
+        from app.multiagent.mailbox import get_mailbox
+        get_mailbox().restore_from_db(run_id, history=self.history)
+
         # 1. 从持久化读 Agent 列表
         persisted_agents = self.history.list_by_run(run_id)
 
