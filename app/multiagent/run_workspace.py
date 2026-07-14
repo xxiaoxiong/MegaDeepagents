@@ -66,9 +66,12 @@ class RunWorkspace:
 
     def task_dir(self, task_id: str) -> str:
         """返回 task 子目录（自动创建）。"""
-        path = os.path.join(self.tasks_dir, task_id)
-        os.makedirs(path, exist_ok=True)
-        return path
+        root = Path(self.tasks_dir).resolve()
+        path = (root / task_id).resolve()
+        if not path.is_relative_to(root):
+            raise ValueError(f"task path escapes workspace: {task_id}")
+        path.mkdir(parents=True, exist_ok=True)
+        return str(path)
 
     def task_relative_path(self, task_id: str, relative: str) -> str:
         """构 task 文件的相对路径（用于 ArtifactStore）。"""
@@ -132,9 +135,9 @@ class RunWorkspace:
 
 def is_within_run(abs_path: str, run_workspace: RunWorkspace) -> bool:
     """检查 abs_path 是否在 Run workspace 之内（防止 ../ 越权）。"""
-    abs_path = os.path.abspath(abs_path)
-    root = os.path.abspath(run_workspace.workspace_root)
-    return abs_path == root or abs_path.startswith(root + os.sep)
+    path = Path(abs_path).resolve()
+    root = Path(run_workspace.workspace_root).resolve()
+    return path.is_relative_to(root)
 
 
 def check_write_permission(
@@ -152,11 +155,13 @@ def check_write_permission(
     3. 写入 shared：仅 Finalizer / Planner
     4. 写入 artifacts：仅 ArtifactStore 内部接口（不开放给 worker）
     """
-    abs_path = os.path.abspath(abs_path)
+    # Resolve before both the containment check and path classification, so a
+    # symlink cannot turn an apparently valid tasks/<id> path into an escape.
+    abs_path = str(Path(abs_path).resolve())
     if not is_within_run(abs_path, run_workspace):
         return False, "path outside run workspace"
 
-    root = os.path.abspath(run_workspace.workspace_root)
+    root = str(Path(run_workspace.workspace_root).resolve())
     rel = os.path.relpath(abs_path, root)
     parts = rel.split(os.sep) if rel != "." else []
 

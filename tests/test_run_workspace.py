@@ -125,6 +125,21 @@ def test_is_within_run_rejects_prefix_attack(tmp_path):
     assert not is_within_run(abs_path, ws_evil)
 
 
+def test_is_within_run_rejects_symlink_escape(tmp_path):
+    """A path lexically under the run may still resolve outside through a symlink."""
+    ws = RunWorkspace(run_id="r_link", base_root=str(tmp_path))
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    os.symlink(outside, os.path.join(ws.tasks_dir, "escaped"))
+    assert not is_within_run(os.path.join(ws.tasks_dir, "escaped", "owned.py"), ws)
+
+
+def test_task_dir_rejects_traversal_task_id(tmp_path):
+    ws = RunWorkspace(run_id="r_task_id", base_root=str(tmp_path))
+    with pytest.raises(ValueError, match="escapes"):
+        ws.task_dir("../outside")
+
+
 # ===== check_write_permission =====
 
 

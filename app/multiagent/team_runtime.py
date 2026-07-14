@@ -166,31 +166,48 @@ class TeamRuntimeFacade:
         )
 
     def _task_graph_from_persisted_board(self, run_id: str):
-        """Rebuild only the durable board projection; never re-plan a resume."""
+        """Load the full persisted plan and overlay current TaskBoard state.
+
+        Older runs created before graph snapshots still fall back to rebuilding
+        the board projection.  New runs never discard output contracts/budgets
+        merely because the process restarted.
+        """
         from app.multiagent.task_board import get_task_board, BoardTaskStatus
         from app.multiagent.task_graph import TaskGraph, TaskNode, TaskNodeStatus
+        from app.multiagent.phase_g_store import get_agent_run_history
 
         board = get_task_board()
         board.restore_run(run_id)
         tasks = board.list_by_run(run_id)
-        if not tasks:
+        snapshot = get_agent_run_history().load_task_graph(run_id)
+        if snapshot:
+            try:
+                graph = TaskGraph.model_validate(snapshot)
+            except Exception as exc:
+                logger.warning("[TeamRuntime] invalid TaskGraph snapshot run=%s: %s", run_id, exc)
+                graph = None
+        else:
+            graph = None
+        if graph is None and not tasks:
             return None
-        graph = TaskGraph(root_task_id=tasks[0].task_id)
+        if graph is None:
+            graph = TaskGraph(root_task_id=tasks[0].task_id)
         status_map = {
             BoardTaskStatus.SUCCEEDED: TaskNodeStatus.SUCCEEDED,
             BoardTaskStatus.FAILED: TaskNodeStatus.FAILED,
             BoardTaskStatus.CANCELLED: TaskNodeStatus.CANCELLED,
         }
         for task in tasks:
-            graph.add_node(TaskNode(
-                id=task.task_id, title=task.title, objective=task.objective,
-                dependencies=task.dependencies,
-                required_capabilities=task.required_capabilities,
-                status=status_map.get(task.status, TaskNodeStatus.PENDING),
-                output_artifact_ids=task.produced_artifact_ids,
-                priority=task.priority,
-                max_attempts=task.max_attempts,
-            ))
+            if task.task_id not in graph.nodes:
+                graph.add_node(TaskNode(
+                    id=task.task_id, title=task.title, objective=task.objective,
+                    dependencies=task.dependencies,
+                    required_capabilities=task.required_capabilities,
+                    priority=task.priority, max_attempts=task.max_attempts,
+                ))
+            node = graph.nodes[task.task_id]
+            node.status = status_map.get(task.status, TaskNodeStatus.PENDING)
+            node.output_artifact_ids = list(task.produced_artifact_ids)
         return graph
 
     async def _run_discussion(
@@ -337,6 +354,22 @@ class TeamRuntimeFacade:
             }
             for rid, info in self._active_runs.items()
         ]
+
+    def list_run_records(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Return active and cold-restart TASK_TEAM runs without a second store."""
+        from app.multiagent.phase_g_store import get_agent_run_history
+        records = {record["run_id"]: record for record in get_agent_run_history().list_team_runs(limit)}
+        for run_id, active in self._active_runs.items():
+            records[run_id] = {
+                "run_id": run_id, "goal": active.get("goal", ""),
+                "team_id": active.get("team_name", ""),
+                "mode": getattr(active.get("mode"), "value", active.get("mode")),
+                "status": active.get("status", "unknown"),
+                "max_rounds": active.get("max_rounds"),
+                "review_required": active.get("review_required"),
+                "created_at": active.get("created_at", ""),
+            }
+        return list(records.values())[:limit]
 
 
 # ===== 全局单例 =====

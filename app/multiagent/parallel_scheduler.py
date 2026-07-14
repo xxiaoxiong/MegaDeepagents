@@ -215,8 +215,10 @@ class ParallelTeamScheduler:
 
             # Agent 状态机：IDLE → RUNNING
             from app.multiagent.agent_instance import AgentStatus
-            agent.update_status(AgentStatus.RUNNING)
-            from app.multiagent.agent_registry import AgentRegistry
+            if not self.registry.transition(agent.agent_id, AgentStatus.RUNNING):
+                self.board.release(task.task_id, agent.agent_id, "agent_transition_failed", run_id=self.run_id)
+                self.registry.release_reservation(agent.agent_id, task.task_id)
+                return
             # 这里的 registry 调用是为了发心跳
 
             # 心跳任务（执行长时间时记录进度）

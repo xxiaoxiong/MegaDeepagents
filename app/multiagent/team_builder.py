@@ -70,15 +70,6 @@ class TeamBuilder:
             # Force creation of a dedicated inbox; Mailbox owns no shared
             # implicit "None" inbox for teammates.
             mailbox._inboxes[agent.agent_id]
-            history.upsert_agent_instance(
-                agent_id=agent.agent_id, team_id=agent.team_id, run_id=agent.run_id,
-                profile_id=agent.profile_id, name=agent.name, role=agent.role,
-                session_id=agent.session_id, thread_id=agent.thread_id,
-                checkpoint_namespace=agent.checkpoint_namespace, status=agent.status.value,
-                workspace_root=agent.workspace_root, last_heartbeat_at=agent.last_heartbeat_at,
-                capabilities=agent.capabilities, metadata=agent.metadata,
-                created_at=agent.created_at,
-            )
             history.record_event(
                 event_id=make_run_event_id(), run_id=ctx.run_id, event_type="agent_spawned",
                 agent_id=agent.agent_id,
