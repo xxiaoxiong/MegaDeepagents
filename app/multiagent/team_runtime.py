@@ -239,12 +239,48 @@ class TeamRuntimeFacade:
         run = self._active_runs.get(run_id)
         if not run:
             from app.multiagent.phase_g_store import get_agent_run_history
-            return get_agent_run_history().update_team_run_status(run_id, "cancelled")
+            history = get_agent_run_history()
+            if not history.get_team_run(run_id):
+                return False
+            # A cold cancellation must mutate the persisted board too.  On a
+            # later resume, pending work may not silently revive.
+            from app.multiagent.agent_runtime_manager import get_agent_runtime_manager
+            from app.multiagent.task_board import get_task_board
+            get_agent_runtime_manager().cancel_run(run_id)
+            board = get_task_board()
+            board.restore_run(run_id)
+            board.cancel_run(run_id)
+            return history.update_team_run_status(run_id, "cancelled")
         run["cancel_event"].set()
+        from app.multiagent.agent_runtime_manager import get_agent_runtime_manager
+        get_agent_runtime_manager().cancel_run(run_id)
+        from app.multiagent.task_board import get_task_board
+        get_task_board().cancel_run(run_id)
         run["status"] = "cancelled"
         from app.multiagent.phase_g_store import get_agent_run_history
         get_agent_run_history().update_team_run_status(run_id, "cancelled")
         return True
+
+    async def pause_agent(self, run_id: str, agent_id: str) -> bool:
+        """Pause one idle teammate in the same registry the Scheduler uses."""
+        if not await self.get_run(run_id):
+            return False
+        from app.multiagent.agent_runtime_manager import get_agent_runtime_manager
+        return get_agent_runtime_manager().pause_agent(run_id, agent_id)
+
+    async def resume_agent(self, run_id: str, agent_id: str) -> bool:
+        """Make one paused teammate eligible for atomic reservation again."""
+        if not await self.get_run(run_id):
+            return False
+        from app.multiagent.agent_runtime_manager import get_agent_runtime_manager
+        return get_agent_runtime_manager().resume_agent(run_id, agent_id)
+
+    async def stop_agent(self, run_id: str, agent_id: str) -> bool:
+        """Cooperatively stop one teammate owned by this TeamRuntime run."""
+        if not await self.get_run(run_id):
+            return False
+        from app.multiagent.agent_runtime_manager import get_agent_runtime_manager
+        return get_agent_runtime_manager().stop_agent(run_id, agent_id)
 
     async def get_run(self, run_id: str) -> dict[str, Any] | None:
         run = self._active_runs.get(run_id)
