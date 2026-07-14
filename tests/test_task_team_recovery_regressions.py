@@ -170,3 +170,86 @@ def test_facade_cold_resume_reconstructs_context_and_continues_execution(monkeyp
     assert continued == [("run_cold", "finish persisted work", 7)]
     run = asyncio.run(runtime.get_run("run_cold"))
     assert run["status"] == "completed"
+
+
+def test_resume_restores_full_task_graph_not_only_board_projection(tmp_path):
+    """A restart must retain contracts and graph version needed by verification."""
+    from app.multiagent.phase_g_store import get_agent_run_history
+    from app.multiagent.team_runtime import TeamRuntimeFacade
+    from app.multiagent.task_graph import OutputContract, TaskGraph, TaskNode
+
+    graph = TaskGraph(root_task_id="implement", version=7)
+    graph.add_node(TaskNode(
+        id="implement", title="Implement", objective="produce a checked module",
+        dependencies=[], required_capabilities=["coding", "testing"],
+        output_contract=OutputContract(
+            artifact_type="code", required_artifacts=["module.py"],
+            acceptance_criteria=["pytest -q passes"], allow_parallel=False,
+        ),
+        metadata={"plan_revision": "v7"},
+    ))
+    history = get_agent_run_history()
+    history.save_task_graph("run_graph_restore", graph.model_dump(mode="json"))
+
+    restored = TeamRuntimeFacade()._task_graph_from_persisted_board("run_graph_restore")
+    assert restored is not None
+    node = restored.nodes["implement"]
+    assert restored.version == graph.version
+    assert node.output_contract.required_artifacts == ["module.py"]
+    assert node.output_contract.acceptance_criteria == ["pytest -q passes"]
+    assert node.required_capabilities == ["coding", "testing"]
+    assert node.metadata["plan_revision"] == "v7"
+
+
+def test_resume_rehydrates_unconsumed_mailbox_messages_after_process_restart():
+    """A wake-up message sent before a restart must reach the restored teammate."""
+    from app.multiagent.agent_registry import reset_agent_registry
+    from app.multiagent.mailbox import MailboxMessage, get_mailbox, reset_mailbox
+    from app.multiagent.phase_g_store import get_agent_run_history
+    from app.multiagent.resume_coordinator import ResumeCoordinator
+    from app.multiagent.task_board import reset_task_board
+
+    history = get_agent_run_history()
+    history.upsert_agent_instance(
+        agent_id="agent_mail_restore", team_id="team", run_id="run_mail_restore",
+        profile_id="coder", name="Coder", role="coder", session_id="session",
+        thread_id="thread", checkpoint_namespace="team:run_mail_restore:coder",
+        status="idle", capabilities=["coding"],
+    )
+    assert get_mailbox().send(MailboxMessage(
+        message_id="mail_after_restart", from_agent_id="user",
+        to_agent_id="agent_mail_restore", run_id="run_mail_restore",
+        title="continue", content="Prioritize the failing test.",
+    ))
+
+    reset_agent_registry()
+    reset_task_board()
+    reset_mailbox()
+    ResumeCoordinator().resume("run_mail_restore")
+
+    received = get_mailbox().receive("agent_mail_restore")
+    assert [message.content for message in received] == ["Prioritize the failing test."]
+
+
+def test_agent_registry_persists_each_lease_transition_without_team_builder():
+    """A claim is durable even when it was made by the scheduler, not TeamBuilder."""
+    from app.multiagent.agent_registry import AgentRegistry
+    from app.multiagent.phase_g_store import get_agent_run_history
+
+    registry = AgentRegistry()
+    agent = registry.create_agent(
+        profile_id="coder", name="Coder", role="coder", team_id="team",
+        run_id="run_registry_persist", capabilities=["coding"], workspace_root=".",
+    )
+    reserved = registry.reserve_idle_agent("run_registry_persist", {"coding"}, "task_a")
+    assert reserved is not None
+
+    stored = get_agent_run_history().get_agent_instance(agent.agent_id)
+    assert stored is not None
+    assert stored["status"] == "claiming"
+    assert stored["current_task_id"] == "task_a"
+
+    assert registry.release_reservation(agent.agent_id, "task_a")
+    stored = get_agent_run_history().get_agent_instance(agent.agent_id)
+    assert stored["status"] == "idle"
+    assert stored["current_task_id"] is None
