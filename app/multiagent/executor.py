@@ -48,6 +48,7 @@ class ExecutionContext:
     task_dag: TaskGraph | None = None
     langsmith_trace_id: str | None = None
     thread_id: str | None = None
+    cancel_event: Any | None = None
 
 
 @dataclass
@@ -298,8 +299,16 @@ def _build_restricted_tools(
     allow_file_read: bool = True,
     allow_file_write: bool = True,
     allow_shell: bool = True,
+    cancel_event: Any | None = None,
 ) -> list[Any]:
-    """根据权限构造受限工具列表。"""
+    """根据权限构造受限工具列表。
+
+    ``create_deep_agent`` does not expose a portable hard-kill API.  The
+    executor checks this event before/after invocation and the scheduler owns
+    final task cancellation; the optional parameter is carried here so future
+    tool adapters can apply the same cooperative signal without changing the
+    executor contract again.
+    """
     tools = []
 
     # 白名单查表
@@ -430,6 +439,7 @@ class DeepAgentExecutor:
             workspace_root=workspace_root,
             task_dag=task_dag,
             thread_id=task_input.get("thread_id"),
+            cancel_event=task_input.get("cancel_event"),
         )
 
         result = self.execute(assignment, profile, context)
@@ -459,6 +469,12 @@ class DeepAgentExecutor:
         """
         import time
         from pathlib import Path
+
+        # Cancellation wins over every execution path, including test seams.
+        # A worker that returns after a runtime stop may never create a
+        # successful result that the Scheduler could accidentally verify.
+        if context.cancel_event is not None and context.cancel_event.is_set():
+            return AgentExecutionResult(success=False, error="cancelled")
 
         # mock 路径
         if self._mock_response is not None:
@@ -495,6 +511,7 @@ class DeepAgentExecutor:
                 allow_file_read=profile.tool_policy.allow_file_read,
                 allow_file_write=profile.tool_policy.allow_file_write,
                 allow_shell=profile.tool_policy.allow_shell,
+                cancel_event=context.cancel_event,
             )
 
             system_prompt = (
@@ -520,7 +537,7 @@ class DeepAgentExecutor:
                 )
 
             agent = create_deep_agent(
-                name=f"{profile.id}:{assignment.task_id}",
+                name=f"{profile.id}:{context.thread_id or assignment.task_id}",
                 model=model,
                 tools=tools,
                 system_prompt=system_prompt,
@@ -542,6 +559,8 @@ class DeepAgentExecutor:
             })
 
             elapsed = time.time() - start
+            if context.cancel_event is not None and context.cancel_event.is_set():
+                return AgentExecutionResult(success=False, error="cancelled", execution_time=elapsed)
             tool_calls = _extract_tool_calls(response)
 
             ignored_parts = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".cache"}
