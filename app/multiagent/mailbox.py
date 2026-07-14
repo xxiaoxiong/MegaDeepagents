@@ -116,7 +116,10 @@ class Mailbox:
 
         # 顺序读出（绕内存即可）
         self._all_messages: dict[str, MailboxMessage] = {}
-        self._wake_events: dict[str, asyncio.Event] = {}
+        # API handlers and scheduler workers run on different event loops.
+        # ``asyncio.Event.set`` is not safe across those loops; a threading
+        # event is, and wait_for_message bridges it with asyncio.to_thread.
+        self._wake_events: dict[str, threading.Event] = {}
 
     # ===== 治理 API =====
 
@@ -223,16 +226,15 @@ class Mailbox:
         messages = self.receive(agent_id, max_count=1)
         if messages:
             return messages[0]
-        event = self._wake_events.setdefault(agent_id, asyncio.Event())
+        event = self._wake_events.setdefault(agent_id, threading.Event())
         try:
-            if timeout is None:
-                await event.wait()
-            else:
-                await asyncio.wait_for(event.wait(), timeout)
-        except asyncio.TimeoutError:
+            awakened = await asyncio.to_thread(event.wait, timeout)
+        except Exception:
             return None
-        finally:
+        if not awakened:
             event.clear()
+            return None
+        event.clear()
         messages = self.receive(agent_id, max_count=1)
         return messages[0] if messages else None
 

@@ -89,7 +89,7 @@ class ParallelTeamScheduler:
         heartbeat_interval_seconds: float = 3.0,
         lease_timeout_seconds: int = 120,
         task_graph: Any | None = None,
-        cancel_event: asyncio.Event | None = None,
+        cancel_event: Any | None = None,
         verifier: Any | None = None,
     ) -> None:
         self.run_id = run_id
@@ -103,6 +103,8 @@ class ParallelTeamScheduler:
 
         self.board = get_task_board()
         self.registry = get_agent_registry()
+        from app.multiagent.agent_runtime_manager import get_agent_runtime_manager
+        self.runtime_manager = get_agent_runtime_manager()
 
     # ===== 主循环 =====
 
@@ -116,6 +118,7 @@ class ParallelTeamScheduler:
             round_n += 1
 
             if self.cancel_event.is_set():
+                self.board.cancel_run(self.run_id)
                 return self._finalize(round_n, status=ScheduleStatus.CANCELLED.value, error="cancelled")
 
             # 租约清理
@@ -148,6 +151,10 @@ class ParallelTeamScheduler:
                 for task in pending
             ]
             await asyncio.gather(*coros, return_exceptions=False)
+
+            if self.cancel_event.is_set():
+                self.board.cancel_run(self.run_id)
+                return self._finalize(round_n, status=ScheduleStatus.CANCELLED.value, error="cancelled")
 
             if self.board.all_succeeded(self.run_id) or self.board.all_produced(self.run_id):
                 return self._finalize(round_n, status="completed")
@@ -261,9 +268,22 @@ class ParallelTeamScheduler:
                     for message in get_mailbox().receive(agent.agent_id, max_count=20)
                 ]
                 dag = self.task_graph or self._task_graph_from_board()
-                result = await asyncio.to_thread(
-                    executor.execute_task, dag, task.task_id, task_input,
+                result = await self.runtime_manager.execute_assignment(
+                    executor=executor, task_graph=dag, task_id=task.task_id,
+                    task_input=task_input, cancel_event=self.cancel_event,
+                    agent_registry=self.registry,
                 )
+
+                if task_input["cancel_event"].is_set():
+                    if self.cancel_event.is_set():
+                        self.board.cancel(task.task_id, "cancelled_during_execution", run_id=self.run_id)
+                    else:
+                        # A stopped teammate must not turn a late success into
+                        # verified completion.  Release its work so another
+                        # compatible teammate can claim it.
+                        self.board.release(task.task_id, agent.agent_id, "agent_stopped", run_id=self.run_id)
+                    history.update_task_run_status(task_run_id, "cancelled", error="cancelled")
+                    return
 
                 if result.success:
                     # A worker only produces evidence.  It never marks its

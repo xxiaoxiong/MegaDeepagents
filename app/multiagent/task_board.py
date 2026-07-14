@@ -298,6 +298,27 @@ class TaskBoard:
             self._persist(task)
             return True
 
+    def cancel(self, task_id: str, reason: str = "cancelled", run_id: str | None = None) -> bool:
+        """Terminal cancellation owned by the runtime, never by the worker."""
+        with self._lock:
+            task = self.get(task_id, run_id=run_id)
+            if task is None or task.status in (
+                BoardTaskStatus.SUCCEEDED, BoardTaskStatus.FAILED, BoardTaskStatus.CANCELLED,
+            ):
+                return False
+            task.status = BoardTaskStatus.CANCELLED
+            task.last_error = reason
+            task.completed_at = datetime.utcnow()
+            task.updated_at = datetime.utcnow()
+            self._persist(task)
+            return True
+
+    def cancel_run(self, run_id: str, reason: str = "run_cancelled") -> int:
+        """Cancel every non-terminal task so a persisted run cannot revive it."""
+        with self._lock:
+            task_ids = [task.task_id for task in self.list_by_run(run_id)]
+        return sum(1 for task_id in task_ids if self.cancel(task_id, reason, run_id))
+
     # ===== restart recovery =====
 
     def restore_run(self, run_id: str) -> int:

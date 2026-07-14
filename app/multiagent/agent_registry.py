@@ -157,9 +157,17 @@ class AgentRegistry:
                 return False
             if task_id and agent.current_task_id != task_id:
                 return False
-            if agent.status not in (AgentStatus.CLAIMING, AgentStatus.RUNNING):
+            if agent.status not in (
+                AgentStatus.CLAIMING, AgentStatus.RUNNING, AgentStatus.STOPPING,
+            ):
                 return False
-            agent.update_status(AgentStatus.IDLE)
+            # A per-agent stop is cooperative: the executor returns, then
+            # this final release is the single place that clears its lease.
+            # Never revive a STOPPING teammate back to IDLE.
+            if agent.status == AgentStatus.STOPPING:
+                agent.update_status(AgentStatus.STOPPED)
+            else:
+                agent.update_status(AgentStatus.IDLE)
             agent.current_task_id = None
             agent.heartbeat()
             self._persist(agent)
@@ -205,12 +213,20 @@ class AgentRegistry:
     # ===== 销毁 =====
 
     def stop(self, agent_id: str, reason: str = "") -> bool:
-        a = self._agents.get(agent_id)
-        if a is None:
-            return False
-        a.update_status(AgentStatus.STOPPING)
-        a.update_status(AgentStatus.STOPPED)
-        self._persist(a)
+        with self._lock:
+            a = self._agents.get(agent_id)
+            if a is None or a.status == AgentStatus.STOPPED:
+                return False
+            if a.status in (AgentStatus.CLAIMING, AgentStatus.RUNNING):
+                # The scheduler will finalize this after its executor returns.
+                if not a.update_status(AgentStatus.STOPPING):
+                    return False
+            else:
+                if not a.update_status(AgentStatus.STOPPING):
+                    return False
+                if not a.update_status(AgentStatus.STOPPED):
+                    return False
+            self._persist(a)
         logger.info(f"[AgentRegistry] stopped agent={agent_id} reason={reason}")
         return True
 
