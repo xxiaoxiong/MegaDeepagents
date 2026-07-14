@@ -41,6 +41,7 @@ class AgentRegistry:
         with self._lock:
             instance.heartbeat()
             self._agents[instance.agent_id] = instance
+            self._persist(instance)
         logger.info(
             f"[AgentRegistry] registered agent={instance.agent_id} "
             f"role={instance.role} run={instance.run_id}"
@@ -145,6 +146,7 @@ class AgentRegistry:
                     continue
                 agent.current_task_id = task_id
                 agent.heartbeat()
+                self._persist(agent)
                 return agent
         return None
 
@@ -160,6 +162,16 @@ class AgentRegistry:
             agent.update_status(AgentStatus.IDLE)
             agent.current_task_id = None
             agent.heartbeat()
+            self._persist(agent)
+            return True
+
+    def transition(self, agent_id: str, status: AgentStatus) -> bool:
+        """Apply and persist a lifecycle transition owned by the registry."""
+        with self._lock:
+            agent = self._agents.get(agent_id)
+            if agent is None or not agent.update_status(status):
+                return False
+            self._persist(agent)
             return True
 
     # ===== 心跳租约 =====
@@ -169,6 +181,7 @@ class AgentRegistry:
         if a is None:
             return False
         a.heartbeat()
+        self._persist(a)
         return True
 
     def cleanup_expired(self) -> list[str]:
@@ -182,6 +195,7 @@ class AgentRegistry:
             idle_time = (now - a.last_heartbeat_at).total_seconds()
             if idle_time > self._lease_timeout and a.is_alive():
                 a.update_status(AgentStatus.FAILED)
+                self._persist(a)
                 expiry.append(agent_id)
                 logger.warning(
                     f"[AgentRegistry] agent {agent_id} lease expired ({idle_time:.0f}s)"
@@ -196,11 +210,39 @@ class AgentRegistry:
             return False
         a.update_status(AgentStatus.STOPPING)
         a.update_status(AgentStatus.STOPPED)
+        self._persist(a)
         logger.info(f"[AgentRegistry] stopped agent={agent_id} reason={reason}")
         return True
 
     def remove(self, agent_id: str) -> bool:
         return self._agents.pop(agent_id, None) is not None
+
+    @staticmethod
+    def _persist(agent: AgentInstance) -> None:
+        """Make registry lifecycle mutations durable at their source.
+
+        Callers must not need to remember a second persistence operation after
+        every reserve/release/heartbeat transition; a restart should observe
+        the same agent lease that the scheduler just made.
+        """
+        try:
+            from app.multiagent.phase_g_store import get_agent_run_history
+            get_agent_run_history().upsert_agent_instance(
+                agent_id=agent.agent_id, team_id=agent.team_id, run_id=agent.run_id,
+                profile_id=agent.profile_id, name=agent.name, role=agent.role,
+                session_id=agent.session_id, thread_id=agent.thread_id,
+                checkpoint_namespace=agent.checkpoint_namespace,
+                status=agent.status.value, current_task_id=agent.current_task_id,
+                workspace_root=agent.workspace_root,
+                last_heartbeat_at=agent.last_heartbeat_at,
+                capabilities=agent.capabilities, metadata=agent.metadata,
+                created_at=agent.created_at, stopped_at=agent.stopped_at,
+            )
+        except Exception as exc:
+            # Scheduling must observe the transition even if durable storage is
+            # temporarily unavailable; the run will fail/recover explicitly,
+            # never silently become completed.
+            logger.error("[AgentRegistry] persist agent=%s failed: %s", agent.agent_id, exc)
 
 
 # ===== 全局单例 =====
