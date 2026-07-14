@@ -69,6 +69,14 @@ class AgentRunHistory:
         self.conn.commit()
         return cur.rowcount > 0
 
+    def list_team_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+        """List durable runs for one unified API control plane."""
+        _ensure_team_runs(self.conn)
+        rows = self.conn.execute(
+            "SELECT * FROM team_runs ORDER BY updated_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
     # ===== TaskBoard durable data plane =====
 
     def upsert_task_board_task(self, payload: dict[str, Any]) -> None:
@@ -100,6 +108,40 @@ class AgentRunHistory:
             except (TypeError, json.JSONDecodeError):
                 logger.warning("[PhaseG] skipped corrupt persisted TaskBoard row run=%s", run_id)
         return result
+
+    # ===== Durable TaskGraph snapshots =====
+
+    def save_task_graph(self, run_id: str, graph: dict[str, Any]) -> None:
+        """Store the complete versioned plan, not merely its TaskBoard projection.
+
+        TaskBoard is authoritative for claims and attempts.  The graph retains
+        contracts, budgets, artifact lineage and plan revision data required to
+        resume verification/replanning without silently changing the plan.
+        """
+        _ensure_task_graph_snapshots(self.conn)
+        version = int(graph.get("version", 1))
+        self.conn.execute(
+            """INSERT INTO task_graph_snapshots (run_id, version, graph_json, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(run_id) DO UPDATE SET version=excluded.version,
+                 graph_json=excluded.graph_json, updated_at=excluded.updated_at""",
+            (run_id, version, json.dumps(graph), datetime.utcnow().isoformat()),
+        )
+        self.conn.commit()
+
+    def load_task_graph(self, run_id: str) -> dict[str, Any] | None:
+        """Return the last complete TaskGraph snapshot for a run."""
+        _ensure_task_graph_snapshots(self.conn)
+        row = self.conn.execute(
+            "SELECT graph_json FROM task_graph_snapshots WHERE run_id=?", (run_id,)
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            return json.loads(row["graph_json"])
+        except (TypeError, json.JSONDecodeError):
+            logger.warning("[PhaseG] corrupt TaskGraph snapshot run=%s", run_id)
+            return None
 
     # ===== AgentInstance =====
 
@@ -563,6 +605,18 @@ def _ensure_task_board_tasks(conn) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_task_board_tasks_run ON task_board_tasks(run_id)"
+    )
+    conn.commit()
+
+
+def _ensure_task_graph_snapshots(conn) -> None:
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS task_graph_snapshots (
+            run_id TEXT PRIMARY KEY,
+            version INTEGER NOT NULL,
+            graph_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )"""
     )
     conn.commit()
 
