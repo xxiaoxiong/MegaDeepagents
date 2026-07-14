@@ -107,6 +107,46 @@ class RoundResponse(BaseModel):
     created_at: str
 
 
+async def _task_team_run(run_id: str) -> dict[str, Any] | None:
+    """Return a TASK_TEAM run from the unified control plane, if it exists."""
+    run = await get_team_runtime().get_run(run_id)
+    if not run:
+        return None
+    mode = run.get("mode")
+    mode_value = getattr(mode, "value", mode)
+    return run if mode_value == TeamRunMode.TASK_TEAM.value else None
+
+
+def _task_team_agents(run_id: str) -> list[dict[str, Any]]:
+    """Read teammates from the runtime registry, then durable history on cold runs."""
+    from app.multiagent.agent_registry import get_agent_registry
+    agents = get_agent_registry().list_by_run(run_id)
+    if agents:
+        return [agent.model_dump(mode="json") for agent in agents]
+    from app.multiagent.phase_g_store import get_agent_run_history
+    return get_agent_run_history().list_by_run(run_id)
+
+
+def _task_team_meta(run_id: str, run: dict[str, Any]) -> TeamTaskMetaResponse:
+    agents = _task_team_agents(run_id)
+    ctx = run.get("ctx")
+    created_at = ctx.created_at if ctx is not None else run.get("created_at", "")
+    created_at = created_at.isoformat() if hasattr(created_at, "isoformat") else str(created_at)
+    updated_at = run.get("updated_at", "")
+    updated_at = updated_at.isoformat() if hasattr(updated_at, "isoformat") else str(updated_at)
+    return TeamTaskMetaResponse(
+        task_id=run_id, room_id=run_id,
+        goal=run.get("goal", ""),
+        team_name=run.get("team_name", run.get("team_id", "")),
+        status=run.get("status", "unknown"),
+        phase=run.get("status"), current_round=None,
+        max_rounds=run.get("max_rounds"),
+        review_required=run.get("review_required"),
+        agents=[agent.get("name", agent.get("agent_id", "")) for agent in agents],
+        created_at=created_at, updated_at=updated_at,
+    )
+
+
 # ========== Endpoints ==========
 
 
@@ -203,6 +243,17 @@ def list_team_tasks(limit: int = 50):
 
     实现上从 store 的 team_rooms 表读所有 room，逆序返回。
     """
+    runtime = get_team_runtime()
+    task_team_rows = [
+        row for row in runtime.list_run_records(limit)
+        if getattr(row.get("mode"), "value", row.get("mode")) == TeamRunMode.TASK_TEAM.value
+    ]
+    out: list[TeamTaskMetaResponse] = [
+        _task_team_meta(row["run_id"], row)
+        for row in task_team_rows
+    ]
+    known_task_ids = {entry.task_id for entry in out}
+
     store = get_multiagent_store()
     # store 暴露的接口未直接给 list_rooms，这里用前 N 个 task_id 反查
     # 兼容：若 store 有 list_rooms 方法优先用
@@ -216,11 +267,12 @@ def list_team_tasks(limit: int = 50):
         ).fetchall()
         rows = [{"task_id": r[0], "room_id": r[1]} for r in rows]
 
-    out: list[TeamTaskMetaResponse] = []
     for r in rows:
         room_id = r["room_id"] if isinstance(r, dict) else r[1]
         task_id = r["task_id"] if isinstance(r, dict) else r[0]
         if not room_id:
+            continue
+        if task_id in known_task_ids:
             continue
         meta = store.load_room(room_id)
         if not meta:
@@ -326,8 +378,11 @@ def create_team_task(req: CreateTeamTaskRequest):
 
 
 @router.get("/team-tasks/{task_id}", response_model=TeamTaskMetaResponse)
-def get_team_task(task_id: str):
+async def get_team_task(task_id: str):
     """查询多 Agent 任务状态。"""
+    task_team_run = await _task_team_run(task_id)
+    if task_team_run is not None:
+        return _task_team_meta(task_id, task_team_run)
     store = get_multiagent_store()
     # 先按 task_id 查 room
     meta = store.get_room_by_task(task_id)
@@ -371,8 +426,21 @@ def get_team_task(task_id: str):
 
 
 @router.get("/team-tasks/{task_id}/messages", response_model=list[MessageResponse])
-def get_team_task_messages(task_id: str):
+async def get_team_task_messages(task_id: str):
     """获取多 Agent 任务的消息流。可在 AgentMessage 之间看到 to/from 关系。"""
+    if await _task_team_run(task_id) is not None:
+        from app.multiagent.mailbox import get_mailbox
+        mailbox = get_mailbox()
+        mailbox.restore_from_db(task_id)
+        return [
+            MessageResponse(
+                id=message.message_id, from_agent=message.from_agent_id,
+                to_agent=message.to_agent_id, visibility="team",
+                message_type="mailbox", content=message.content,
+                reply_to=message.reply_to, created_at=message.created_at.isoformat(),
+            )
+            for message in mailbox.list_messages_in_run(task_id)
+        ]
     store = get_multiagent_store()
     meta = store.get_room_by_task(task_id)
     if not meta:
@@ -403,8 +471,19 @@ def get_team_task_messages(task_id: str):
 
 
 @router.get("/team-tasks/{task_id}/state", response_model=TeamStateResponse)
-def get_team_task_state(task_id: str):
+async def get_team_task_state(task_id: str):
     """获取当前共享团队状态。"""
+    task_team_run = await _task_team_run(task_id)
+    if task_team_run is not None:
+        from app.multiagent.task_board import get_task_board
+        tasks = get_task_board().list_by_run(task_id)
+        return TeamStateResponse(
+            goal=task_team_run.get("goal", ""), phase=task_team_run.get("status", "unknown"),
+            plan="TaskGraph/TaskBoard", current_round=0,
+            max_rounds=int(task_team_run.get("max_rounds") or 0),
+            completed_steps=[task.task_id for task in tasks if task.status.value == "succeeded"],
+            blocked_steps=[task.task_id for task in tasks if task.status.value in ("failed", "repair_required")],
+        )
     store = get_multiagent_store()
     meta = store.get_room_by_task(task_id)
     if not meta:
@@ -436,8 +515,10 @@ def get_team_task_state(task_id: str):
 
 
 @router.get("/team-tasks/{task_id}/agents")
-def get_team_task_agents(task_id: str):
+async def get_team_task_agents(task_id: str):
     """获取多 Agent 任务中的所有 Agent 列表。"""
+    if await _task_team_run(task_id) is not None:
+        return _task_team_agents(task_id)
     store = get_multiagent_store()
     meta = store.get_room_by_task(task_id)
     if not meta:
@@ -461,8 +542,16 @@ def get_team_task_agents(task_id: str):
 
 
 @router.post("/team-tasks/{task_id}/messages")
-def inject_team_task_message(task_id: str, msg: CreateTeamTaskRequest):
+async def inject_team_task_message(task_id: str, msg: CreateTeamTaskRequest):
     """人工向多 Agent 任务注入新消息。"""
+    if await _task_team_run(task_id) is not None:
+        agents = _task_team_agents(task_id)
+        if not agents:
+            raise HTTPException(status_code=409, detail="TASK_TEAM has no teammate to receive the message")
+        agent_id = agents[0]["agent_id"]
+        if not await get_team_runtime().send_message(task_id, agent_id, msg.goal):
+            raise HTTPException(status_code=409, detail="Message delivery failed")
+        return {"status": "injected", "task_id": task_id, "agent_id": agent_id}
     store = get_multiagent_store()
     meta = store.get_room_by_task(task_id)
     if not meta:
@@ -481,8 +570,12 @@ def inject_team_task_message(task_id: str, msg: CreateTeamTaskRequest):
 
 
 @router.post("/team-tasks/{task_id}/cancel")
-def cancel_team_task(task_id: str):
+async def cancel_team_task(task_id: str):
     """取消多 Agent 任务。"""
+    if await _task_team_run(task_id) is not None:
+        if not await get_team_runtime().cancel_run(task_id):
+            raise HTTPException(status_code=409, detail="TASK_TEAM cancellation failed")
+        return {"status": "cancelled", "task_id": task_id, "room_id": task_id}
     store = get_multiagent_store()
     meta = store.get_room_by_task(task_id)
     if not meta:
