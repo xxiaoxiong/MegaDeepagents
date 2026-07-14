@@ -130,6 +130,7 @@ class SimpleOrchestrator:
                 self._result.error = "planner_failed"
                 self._emit_event("planning_failed", {"error": "planner_failed"})
                 return self._result
+            self._persist_task_graph(dag)
             self._emit_event("planning_finished", {"task_count": len(dag.nodes)})
 
             # TASK_TEAM normal runs must create real teammates before the
@@ -144,6 +145,7 @@ class SimpleOrchestrator:
             self._result.total_tasks = len(dag.nodes)
             self._emit_event("scheduling_started", {"total_tasks": len(dag.nodes)})
             success = self._schedule(dag)
+            self._persist_task_graph(dag)
             if not success:
                 self._result.status = "failed"
                 self._result.error = "scheduler_failed"
@@ -159,6 +161,7 @@ class SimpleOrchestrator:
             self._emit_event("verification_done", {"verdict": verdict})
             if verdict == "pass":
                 self._mark_produced_verified(dag)
+                self._persist_task_graph(dag)
 
             # 5. Repair / Replan 循环
             repair_round = 0
@@ -170,7 +173,9 @@ class SimpleOrchestrator:
                 if dag is None:
                     break
                 self._receive_repaired_dag(dag)
+                self._persist_task_graph(dag)
                 self._schedule(dag)
+                self._persist_task_graph(dag)
                 verdict = self._verify(goal, dag)
                 self._result.verification_verdict = verdict
                 self._emit_event("repair_finished", {"round": repair_round, "verdict": verdict})
@@ -196,6 +201,7 @@ class SimpleOrchestrator:
                 if n.status.value == "failed"
             )
             self._result.task_graph_version = dag.version if dag else 0
+            self._persist_task_graph(dag)
 
             self._emit_event("orchestrator_finished", {
                 "status": self._result.status,
@@ -529,6 +535,21 @@ class SimpleOrchestrator:
 
     def _receive_repaired_dag(self, dag) -> None:
         self._task_graph = dag
+
+    def _persist_task_graph(self, dag: TaskGraph | None) -> None:
+        """Checkpoint the complete plan at every durable control-plane edge."""
+        if not self._ctx or dag is None:
+            return
+        try:
+            from app.multiagent.phase_g_store import get_agent_run_history
+            get_agent_run_history().save_task_graph(
+                self._ctx.run_id, dag.model_dump(mode="json"),
+            )
+        except Exception as exc:
+            # Persistence errors must surface in the run's event stream but
+            # never be mistaken for a completed schedule.
+            logger.error("[Orchestrator] TaskGraph checkpoint failed: %s", exc)
+            self._emit_event("task_graph_checkpoint_failed", {"error": str(exc)})
 
     def _log(self, msg: str) -> None:
         logger.info(f"[Orchestrator/{self.phase}] {msg}")
