@@ -228,6 +228,27 @@ async def send_team_run_message(run_id: str, agent_id: str, req: TeamRunMessageR
     return {"run_id": run_id, "agent_id": agent_id, "status": "delivered"}
 
 
+@router.post("/team-runs/{run_id}/agents/{agent_id}/pause")
+async def pause_team_run_agent(run_id: str, agent_id: str):
+    if not await get_team_runtime().pause_agent(run_id, agent_id):
+        raise HTTPException(status_code=409, detail="Agent is not an idle teammate in this run")
+    return {"run_id": run_id, "agent_id": agent_id, "status": "blocked"}
+
+
+@router.post("/team-runs/{run_id}/agents/{agent_id}/resume")
+async def resume_team_run_agent(run_id: str, agent_id: str):
+    if not await get_team_runtime().resume_agent(run_id, agent_id):
+        raise HTTPException(status_code=409, detail="Agent is not paused in this run")
+    return {"run_id": run_id, "agent_id": agent_id, "status": "idle"}
+
+
+@router.post("/team-runs/{run_id}/agents/{agent_id}/stop")
+async def stop_team_run_agent(run_id: str, agent_id: str):
+    if not await get_team_runtime().stop_agent(run_id, agent_id):
+        raise HTTPException(status_code=409, detail="Agent is not active in this run")
+    return {"run_id": run_id, "agent_id": agent_id, "status": "stopping"}
+
+
 @router.get("/teams")
 def list_available_teams():
     """列出所有可用团队模板（B4 前端用）。"""
