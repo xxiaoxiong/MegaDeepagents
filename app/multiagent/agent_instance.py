@@ -39,7 +39,8 @@ class AgentStatus(str, Enum):
 _AGENT_LEGAL_TRANSITIONS: dict[AgentStatus, set[AgentStatus]] = {
     AgentStatus.CREATED: {AgentStatus.SPAWNING, AgentStatus.IDLE, AgentStatus.STOPPED},
     AgentStatus.SPAWNING: {AgentStatus.IDLE, AgentStatus.FAILED},
-    AgentStatus.IDLE: {AgentStatus.CLAIMING, AgentStatus.RUNNING, AgentStatus.FAILED, AgentStatus.STOPPING, AgentStatus.STOPPED},
+    AgentStatus.IDLE: {AgentStatus.CLAIMING, AgentStatus.RUNNING, AgentStatus.BLOCKED,
+                       AgentStatus.FAILED, AgentStatus.STOPPING, AgentStatus.STOPPED},
     AgentStatus.CLAIMING: {AgentStatus.RUNNING, AgentStatus.IDLE, AgentStatus.FAILED},
     AgentStatus.RUNNING: {AgentStatus.IDLE, AgentStatus.WAITING_TOOL, AgentStatus.WAITING_PERMISSION,
                           AgentStatus.BLOCKED, AgentStatus.FAILED, AgentStatus.STOPPING},
