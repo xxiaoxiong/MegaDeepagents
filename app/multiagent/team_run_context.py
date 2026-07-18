@@ -84,7 +84,7 @@ class TeamRunContext(BaseModel):
         return path
 
     def checkpoints_dir(self) -> str:
-        path = os.path.join(self.workspace_root, "checkpoints")
+        path = os.path.join(self.workspace_root, "control", "checkpoints")
         os.makedirs(path, exist_ok=True)
         return path
 
@@ -122,7 +122,8 @@ class TeamRunContext(BaseModel):
 
         # 初始化目录
         os.makedirs(ctx.workspace_root, exist_ok=True)
-        os.makedirs(ctx.artifacts_dir(), exist_ok=True)
+        for directory in ("control", "artifacts", "worktrees", "integration", "logs"):
+            os.makedirs(os.path.join(ctx.workspace_root, directory), exist_ok=True)
         os.makedirs(ctx.checkpoints_dir(), exist_ok=True)
 
         return ctx

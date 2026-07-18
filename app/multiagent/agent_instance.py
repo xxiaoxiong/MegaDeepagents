@@ -25,6 +25,8 @@ class AgentStatus(str, Enum):
     SPAWNING = "spawning"
     IDLE = "idle"
     CLAIMING = "claiming"
+    PLANNING = "planning"
+    WAITING_PLAN_APPROVAL = "waiting_plan_approval"
     RUNNING = "running"
     WAITING_TOOL = "waiting_tool"
     WAITING_PERMISSION = "waiting_permission"
@@ -41,7 +43,18 @@ _AGENT_LEGAL_TRANSITIONS: dict[AgentStatus, set[AgentStatus]] = {
     AgentStatus.SPAWNING: {AgentStatus.IDLE, AgentStatus.FAILED},
     AgentStatus.IDLE: {AgentStatus.CLAIMING, AgentStatus.RUNNING, AgentStatus.BLOCKED,
                        AgentStatus.FAILED, AgentStatus.STOPPING, AgentStatus.STOPPED},
-    AgentStatus.CLAIMING: {AgentStatus.RUNNING, AgentStatus.IDLE, AgentStatus.FAILED},
+    AgentStatus.CLAIMING: {
+        AgentStatus.PLANNING, AgentStatus.RUNNING, AgentStatus.IDLE,
+        AgentStatus.FAILED, AgentStatus.STOPPING,
+    },
+    AgentStatus.PLANNING: {
+        AgentStatus.WAITING_PLAN_APPROVAL, AgentStatus.RUNNING,
+        AgentStatus.IDLE, AgentStatus.FAILED, AgentStatus.STOPPING,
+    },
+    AgentStatus.WAITING_PLAN_APPROVAL: {
+        AgentStatus.PLANNING, AgentStatus.RUNNING, AgentStatus.IDLE,
+        AgentStatus.FAILED, AgentStatus.STOPPING,
+    },
     AgentStatus.RUNNING: {AgentStatus.IDLE, AgentStatus.WAITING_TOOL, AgentStatus.WAITING_PERMISSION,
                           AgentStatus.BLOCKED, AgentStatus.FAILED, AgentStatus.STOPPING},
     AgentStatus.WAITING_TOOL: {AgentStatus.RUNNING, AgentStatus.IDLE, AgentStatus.FAILED},
@@ -78,6 +91,8 @@ class AgentInstance(BaseModel):
     current_task_id: str | None = None
 
     workspace_root: str = ""
+    worktree_path: str = ""
+    mailbox_cursor: int = 0
     last_heartbeat_at: datetime | None = None
 
     capabilities: list[str] = Field(default_factory=list)

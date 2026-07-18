@@ -45,13 +45,9 @@ class TeamBuilder:
                 )
             required_profile_ids.add(profile.id)
 
-        # Verification and final hand-off are control-plane roles.  They are
-        # added only as needed to reach a viable 3-person minimum, never by
-        # blindly spawning every template member.
-        if len(required_profile_ids) < 3:
-            required_profile_ids.update({"reviewer", "finalizer"})
-        if len(required_profile_ids) < 3:
-            required_profile_ids.add("planner")
+        # Team size follows actual graph capability demand.  Verification and
+        # finalization are control-plane services, not a reason to spawn three
+        # decorative teammates for a one-worker plan.
         selected = [p for p in profiles.list_profiles() if p.id in required_profile_ids][:5]
         if not selected:
             raise RuntimeError("no_executable_teammates")
@@ -70,6 +66,8 @@ class TeamBuilder:
             # Force creation of a dedicated inbox; Mailbox owns no shared
             # implicit "None" inbox for teammates.
             mailbox._inboxes[agent.agent_id]
+            from app.multiagent.teammate_session import get_teammate_supervisor
+            get_teammate_supervisor().ensure_session(agent)
             history.record_event(
                 event_id=make_run_event_id(), run_id=ctx.run_id, event_type="agent_spawned",
                 agent_id=agent.agent_id,
