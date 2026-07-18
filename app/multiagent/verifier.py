@@ -18,12 +18,13 @@ Run/Graph 才能进入 COMPLETED。
 from __future__ import annotations
 
 import os
-import subprocess
+import shlex
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Literal
 
 from app.core.logging import logger
@@ -48,6 +49,7 @@ class CriterionFailure:
     detail: str
     severity: str = "medium"  # low / medium / high
     proposed_fix: str = ""
+    affected_files: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -57,6 +59,7 @@ class EvidenceRef:
     source: str  # file_path / tool_output / message_id
     content: str = ""
     artifact_id: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -81,6 +84,74 @@ class ValidationResult:
     proposed_tasks: list[TaskProposal] = field(default_factory=list)
     error: str | None = None
     summary: str = ""
+
+
+@dataclass
+class VerificationCommand:
+    kind: str
+    argv: list[str]
+    cwd: str | None = None
+    timeout: int = 120
+    expected_returncode: int = 0
+
+
+@dataclass
+class VerificationPlan:
+    """Executable verification contract compiled from planner output."""
+
+    required_files: list[str] = field(default_factory=list)
+    file_hashes: dict[str, str] = field(default_factory=dict)
+    json_schema: dict[str, Any] | None = None
+    json_data: Any | None = None
+    expected_output_format: str | None = None
+    commands: list[VerificationCommand] = field(default_factory=list)
+    acceptance_criteria: list[str] = field(default_factory=list)
+    semantic_rubric: list[str] = field(default_factory=list)
+    diff_scope: list[str] = field(default_factory=list)
+    forbidden_changes: list[str] = field(default_factory=list)
+    workspace_root: str | None = None
+
+    @classmethod
+    def from_output_contract(cls, contract: Any, workspace_root: str | None = None) -> "VerificationPlan":
+        plan = cls(workspace_root=workspace_root)
+        for required in getattr(contract, "required_artifacts", []) or []:
+            # Artifact roles such as "repair_patch" are semantic.  Values
+            # that look like real paths become programmatic file checks.
+            if "/" in required or "\\" in required or "." in Path(required).name:
+                plan.required_files.append(
+                    str(Path(workspace_root, required)) if workspace_root and not Path(required).is_absolute()
+                    else required
+                )
+            else:
+                plan.semantic_rubric.append(f"required artifact role: {required}")
+        for criterion in getattr(contract, "acceptance_criteria", []) or []:
+            plan.acceptance_criteria.append(criterion)
+            prefix, separator, value = criterion.partition(":")
+            kind = prefix.strip().lower()
+            if separator and kind in {"test", "lint", "type-check", "typecheck", "build", "security", "command"}:
+                argv = shlex.split(value.strip(), posix=os.name != "nt")
+                if argv:
+                    plan.commands.append(VerificationCommand(kind=kind, argv=argv,
+                                                             cwd=workspace_root))
+            else:
+                plan.semantic_rubric.append(criterion)
+        return plan
+
+    def to_checks(self) -> dict[str, Any]:
+        return {
+            "verification_plan": self,
+            "files": self.required_files,
+            "file_hashes": self.file_hashes,
+            "json_schema": self.json_schema,
+            "data": self.json_data,
+            "format": self.expected_output_format,
+            "commands": self.commands,
+            "acceptance_criteria": self.acceptance_criteria,
+            "rubrics": self.semantic_rubric,
+            "diff_scope": self.diff_scope,
+            "forbidden_changes": self.forbidden_changes,
+            "cwd": self.workspace_root,
+        }
 
 
 # ===== 具体验证器 =====
@@ -116,26 +187,29 @@ class ProgrammaticVerifier:
 
     def verify_command(
         self,
-        command: str,
+        command: str | list[str],
         cwd: str | None = None,
         timeout: int = 30,
         expected_returncode: int = 0,
     ) -> ValidationResult:
         """执行命令，检查返回码。"""
         try:
-            result = subprocess.run(
-                command, shell=True, capture_output=True, text=True,
-                cwd=cwd, timeout=timeout,
-            )
+            from app.multiagent.shell_policy import ShellCommandRunner
+            argv = shlex.split(command, posix=os.name != "nt") if isinstance(command, str) else command
+            result = ShellCommandRunner().run(argv, cwd=cwd or os.getcwd(), timeout=timeout)
             success = result.returncode == expected_returncode
             evidence = EvidenceRef(
-                source=f"cmd:{command[:80]}",
-                content=f"rc={result.returncode}, stdout={result.stdout[:200]}",
+                source=f"cmd:{' '.join(argv)[:80]}",
+                content=f"rc={result.returncode}\nstdout={result.stdout[:2000]}\nstderr={result.stderr[:1000]}",
+                metadata={"argv": argv, "returncode": result.returncode,
+                          "stdout": result.stdout, "stderr": result.stderr,
+                          "environment": result.environment,
+                          "duration_seconds": result.duration_seconds},
             )
             failed = []
             if not success:
                 failed.append(CriterionFailure(
-                    criterion=f"command:{command[:60]}",
+                    criterion=f"command:{' '.join(argv)[:60]}",
                     detail=f"期望 rc={expected_returncode}，实际 rc={result.returncode}",
                     severity="high",
                 ))
@@ -144,25 +218,51 @@ class ProgrammaticVerifier:
                 scores={"command": 1.0 if success else 0.0},
                 failed_criteria=failed,
                 evidence=[evidence],
-                summary=f"命令 {'成功' if success else '失败'}: {command[:60]}...",
+                summary=f"命令 {'成功' if success else '失败'}: {' '.join(argv)[:60]}...",
             )
-        except subprocess.TimeoutExpired:
+        except Exception as exc:
             return ValidationResult(
                 verdict=Verdict.REPAIR,
                 scores={"command": 0.0},
                 failed_criteria=[CriterionFailure(
-                    criterion=f"command_timeout:{command[:60]}",
-                    detail=f"超时 {timeout}s",
-                    severity="medium",
+                    criterion="command_execution", detail=str(exc), severity="high",
+                    proposed_fix="use structured argv or request required permission",
                 )],
-                summary=f"命令超时: {command[:60]}...",
-            )
-        except Exception as exc:
-            return ValidationResult(
-                verdict=Verdict.FAIL,
                 error=str(exc),
                 summary=f"命令异常: {exc}",
             )
+
+    def verify_hashes(self, expected: dict[str, str]) -> ValidationResult:
+        from app.multiagent.artifact import compute_content_hash
+        failures: list[CriterionFailure] = []
+        for path, expected_hash in expected.items():
+            candidate = Path(path)
+            if not candidate.is_file():
+                failures.append(CriterionFailure("file_hash", f"file missing: {path}",
+                                                 "high", affected_files=[path]))
+                continue
+            actual = compute_content_hash(candidate.read_bytes())
+            if actual != expected_hash:
+                failures.append(CriterionFailure("file_hash", f"hash mismatch: {path}",
+                                                 "high", affected_files=[path]))
+        return ValidationResult(verdict=Verdict.PASS if not failures else Verdict.REPAIR,
+                                failed_criteria=failures,
+                                scores={"file_hash": 1.0 if not failures else 0.0})
+
+    def verify_forbidden_changes(self, changed_files: list[str], forbidden: list[str],
+                                 allowed_scope: list[str] | None = None) -> ValidationResult:
+        import fnmatch
+        violations = [path for path in changed_files
+                      if any(fnmatch.fnmatch(path, pattern) for pattern in forbidden)]
+        if allowed_scope:
+            violations.extend(path for path in changed_files
+                              if not any(fnmatch.fnmatch(path, pattern) for pattern in allowed_scope))
+        violations = sorted(set(violations))
+        failures = [CriterionFailure("forbidden_changes", "change outside allowed diff scope",
+                                     "high", affected_files=violations)] if violations else []
+        return ValidationResult(verdict=Verdict.REPAIR if failures else Verdict.PASS,
+                                failed_criteria=failures,
+                                scores={"diff_scope": 0.0 if failures else 1.0})
 
     def verify_json_schema(self, data: dict, schema: dict) -> ValidationResult:
         """检查 JSON 数据是否符合 schema。"""
@@ -219,8 +319,9 @@ class LLMRubricVerifier:
     造成的假 REPAIR。
     """
 
-    def __init__(self, model_available: bool = True) -> None:
+    def __init__(self, model_available: bool = True, fail_closed: bool = True) -> None:
         self._model_available = model_available
+        self._fail_closed = fail_closed
 
     def verify(
         self,
@@ -311,7 +412,7 @@ class LLMRubricVerifier:
         goal: str,
         artifacts: dict[str, dict[str, Any]],
     ) -> ValidationResult:
-        """LLM/模型不可用时的基于规则回退验证。"""
+        """Fail closed when semantic correctness cannot be established."""
         if not artifacts:
             return ValidationResult(
                 verdict=Verdict.FAIL,
@@ -319,7 +420,8 @@ class LLMRubricVerifier:
                 failed_criteria=[CriterionFailure("no_artifacts", "无产物供评估", severity="high")],
                 summary="无产物，验证失败",
             )
-        # 基础规则
+        # Basic inspection can prove incompleteness, never semantic
+        # correctness.  Non-empty wrong code therefore remains REPAIR.
         failed: list[CriterionFailure] = []
         scores: dict[str, float] = {}
         # 完整性：每个产物非空
@@ -335,7 +437,17 @@ class LLMRubricVerifier:
         scores["correctness"] = 0.5
         scores["consistency"] = 0.7
         scores["evidence"] = 0.3 if not artifacts else 0.6
-        verdict = Verdict.REPAIR if failed else Verdict.PASS
+        if self._fail_closed:
+            failed.append(CriterionFailure(
+                "semantic_verifier_unavailable",
+                "LLM rubric verifier is unavailable; non-empty output is not correctness evidence",
+                severity="high", proposed_fix="restore verifier model or provide programmatic test/reviewer evidence",
+            ))
+            verdict = Verdict.REPAIR
+        else:
+            # Explicit legacy-only mode for old deterministic harnesses.  The
+            # TASK_TEAM facade never enables this.
+            verdict = Verdict.REPAIR if failed else Verdict.PASS
         return ValidationResult(
             verdict=verdict,
             scores=scores,
@@ -379,7 +491,18 @@ class Verifier:
         try:
             # 取所有 artifact 元数据
             registry = getattr(self.artifact_store, "_registry", {})
+            # Per-task verification passes explicit artifact ids.  In that
+            # case never leak unrelated artifacts from the same run into the
+            # evidence set.  Run-level verification (path-like keys only)
+            # may still enrich from the complete registry.
+            requested_ids = {
+                str(info.get("artifact_id") or key.removeprefix("artifact:"))
+                for key, info in artifacts.items()
+                if info.get("artifact_id") or key.startswith("artifact:") or key in registry
+            }
             for aid, art in registry.items():
+                if requested_ids and aid not in requested_ids:
+                    continue
                 key = f"artifact:{aid}"
                 entry = artifacts.get(key, {"status": "registered"})
                 # 注入注册表元数据
@@ -442,6 +565,21 @@ class Verifier:
                     cwd=checks.get("cwd"),
                     timeout=checks.get("timeout", 30),
                 ))
+            for command in checks.get("commands", []) or []:
+                if isinstance(command, VerificationCommand):
+                    all_results.append(self.programmatic.verify_command(
+                        command.argv, cwd=command.cwd or checks.get("cwd"),
+                        timeout=command.timeout,
+                        expected_returncode=command.expected_returncode,
+                    ))
+                else:
+                    all_results.append(self.programmatic.verify_command(
+                        command.get("argv", []), cwd=command.get("cwd") or checks.get("cwd"),
+                        timeout=command.get("timeout", 120),
+                        expected_returncode=command.get("expected_returncode", 0),
+                    ))
+            if checks.get("file_hashes"):
+                all_results.append(self.programmatic.verify_hashes(checks["file_hashes"]))
             if "json_schema" in checks and "data" in checks:
                 all_results.append(self.programmatic.verify_json_schema(
                     checks["data"], checks["json_schema"]
@@ -449,9 +587,35 @@ class Verifier:
             if "format" in checks:
                 content = checks.get("content", "")
                 all_results.append(self.programmatic.verify_output_format(content, checks["format"]))
+            if checks.get("changed_files") is not None and (
+                checks.get("forbidden_changes") or checks.get("diff_scope")
+            ):
+                all_results.append(self.programmatic.verify_forbidden_changes(
+                    checks.get("changed_files", []), checks.get("forbidden_changes", []),
+                    checks.get("diff_scope", []),
+                ))
 
         # 2. LLM Rubric
-        rubric_result = self.llm_rubric.verify(goal, artifacts, checks.get("rubrics"))
+        semantic_rubrics = checks.get("rubrics") or []
+        programmatic_pass = any(
+            result.verdict == Verdict.PASS and any(
+                key in result.scores for key in ("command", "json_schema", "file_hash")
+            ) for result in all_results
+        )
+        rubric_result = self.llm_rubric.verify(goal, artifacts, semantic_rubrics)
+        # A real passing test/build/static check is valid evidence even when a
+        # semantic model is unavailable.  Natural-language criteria still
+        # require semantic review.
+        if (rubric_result.verdict == Verdict.REPAIR and programmatic_pass
+                and not semantic_rubrics
+                and all(f.criterion == "semantic_verifier_unavailable"
+                        for f in rubric_result.failed_criteria)):
+            rubric_result = ValidationResult(
+                verdict=Verdict.PASS, scores={"programmatic_evidence": 1.0},
+                evidence=[EvidenceRef(source="verification_plan",
+                                      content="programmatic command/hash/schema evidence passed")],
+                summary="programmatic evidence satisfies the contract",
+            )
         all_results.append(rubric_result)
 
         # 3. 合成
