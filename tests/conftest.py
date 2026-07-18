@@ -15,7 +15,20 @@
 
 from __future__ import annotations
 
+import os
 import pytest
+
+
+def pytest_collection_modifyitems(config, items):
+    """Live suites are opt-in and never consume credentials in default CI."""
+    if os.environ.get("RUN_LIVE_MODEL_TESTS") == "1":
+        return
+    skip_live = pytest.mark.skip(
+        reason="set RUN_LIVE_MODEL_TESTS=1 with real model credentials",
+    )
+    for item in items:
+        if "live_model" in item.keywords or "real_langsmith" in item.keywords:
+            item.add_marker(skip_live)
 
 
 @pytest.fixture(autouse=True)
@@ -31,6 +44,32 @@ def _isolate_multiagent_store(tmp_path):
 
     # 2. 指向本次测试专属的 sqlite 文件
     cfg.settings.sqlite_path = str(tmp_path / "test.sqlite3")
+    from app.multiagent.agent_registry import reset_agent_registry
+    from app.multiagent.agent_runtime_manager import reset_agent_runtime_manager
+    from app.multiagent.task_board import reset_task_board
+    from app.multiagent.mailbox import reset_mailbox
+    from app.multiagent.phase_g_store import reset_agent_run_history
+    from app.multiagent.teammate_session import reset_teammate_supervisor
+    from app.multiagent.permission import reset_permission_broker
+    from app.multiagent.lifecycle_hooks import reset_lifecycle_hook_engine
+    from app.multiagent.agent_profile import reset_capability_registry
+    from app.multiagent.artifact import reset_default_artifact_store
+    from app.multiagent.resume_coordinator import reset_resume_coordinator
+    from app.multiagent.run_workspace import reset_workspaces
+    from app.multiagent.team_runtime import reset_team_runtime
+    reset_agent_registry()
+    reset_agent_runtime_manager()
+    reset_task_board()
+    reset_mailbox()
+    reset_agent_run_history()
+    reset_teammate_supervisor()
+    reset_permission_broker()
+    reset_lifecycle_hook_engine()
+    reset_capability_registry()
+    reset_default_artifact_store()
+    reset_resume_coordinator()
+    reset_workspaces()
+    reset_team_runtime()
 
     yield
 

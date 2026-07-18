@@ -196,7 +196,9 @@ def test_04_e2e_plan_schedule_verify(tmp_path):
         return plan_with_llm(goal, llm=fake)
 
     executor = FileWritingWorker(workspace_root)
-    verifier = Verifier(llm_rubric=LLMRubricVerifier(model_available=False))
+    verifier = Verifier(
+        llm_rubric=LLMRubricVerifier(model_available=False, fail_closed=False)
+    )
 
     orch = SimpleOrchestrator(
         planner=_planner,
@@ -259,7 +261,9 @@ def test_05_e2e_repair_cycle(tmp_path):
         return g
 
     executor = FailOnceWorker(workspace_root)
-    verifier = Verifier(llm_rubric=LLMRubricVerifier(model_available=False))
+    verifier = Verifier(
+        llm_rubric=LLMRubricVerifier(model_available=False, fail_closed=False)
+    )
 
     orch = SimpleOrchestrator(
         planner=_planner,
@@ -277,7 +281,9 @@ def test_05_e2e_repair_cycle(tmp_path):
 
 def test_06_e2e_verifier_rejects_missing_artifact(tmp_path):
     """§十五-11: 产物不存在 → Verifier 不通过。"""
-    verifier = Verifier(llm_rubric=LLMRubricVerifier(model_available=False))
+    verifier = Verifier(
+        llm_rubric=LLMRubricVerifier(model_available=False, fail_closed=False)
+    )
     # 无产物
     result = verifier.validate(
         goal="build api",
@@ -293,7 +299,9 @@ def test_07_e2e_verifier_pass_with_real_files(tmp_path):
     f = tmp_path / "main.py"
     f.write_text("print(1)", encoding="utf-8")
 
-    verifier = Verifier(llm_rubric=LLMRubricVerifier(model_available=False))
+    verifier = Verifier(
+        llm_rubric=LLMRubricVerifier(model_available=False, fail_closed=False)
+    )
     result = verifier.validate(
         goal="build api",
         artifacts={str(f): {"content": "print(1)"}},
@@ -400,16 +408,20 @@ class _RestServiceWorker(WorkerExecutor):
             # §十六 验收关键点：真实运行 pytest
             import subprocess
             import sys
+            import os
             impl_dir = self.ws / "tasks/impl_api"
             env_root = str(impl_dir)
             # 把 impl_api 目录加到 PYTHONPATH 让 `from main import app` 能 import
+            existing_pythonpath = os.environ.get("PYTHONPATH", "")
             proc = subprocess.run(
                 [sys.executable, "-m", "pytest", str(tdir / "test_main.py"), "-v", "--tb=short"],
                 cwd=env_root,
                 capture_output=True,
                 text=True,
                 timeout=60,
-                env={**__import__("os").environ, "PYTHONPATH": env_root},
+                env={**os.environ, "PYTHONPATH": os.pathsep.join(
+                    part for part in (env_root, existing_pythonpath) if part
+                )},
             )
             self.pytest_runs.append({
                 "returncode": proc.returncode,
@@ -440,7 +452,9 @@ def test_16_e2e_rest_service_pipeline(tmp_path):
     Path(ws_root).mkdir(parents=True, exist_ok=True)
 
     worker = _RestServiceWorker(ws_root)
-    verifier = Verifier(llm_rubric=LLMRubricVerifier(model_available=False))
+    verifier = Verifier(
+        llm_rubric=LLMRubricVerifier(model_available=False, fail_closed=False)
+    )
 
     from app.multiagent.orchestrator_graph import UnifiedOrchestratorGraph
 

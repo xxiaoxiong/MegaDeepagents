@@ -30,11 +30,21 @@ from app.core.observability import (
 
 
 @pytest.fixture(autouse=True)
-def _reset_obs():
+def _reset_obs(monkeypatch):
     """每个测试前重置 observability 状态。"""
+    # Offline/mock tests may construct a real RunTree object to validate its
+    # shape, but must never send it to LangSmith.  real_langsmith remains a
+    # separately marked, opt-in suite.
+    try:
+        from langsmith.run_trees import RunTree
+        monkeypatch.setattr(RunTree, "post", lambda self, *a, **k: None)
+        monkeypatch.setattr(RunTree, "patch", lambda self, *a, **k: None)
+    except ImportError:
+        pass
     reset_for_test()
     # 保证 settings 恢复默认
     config.settings.langsmith_enabled = False
+    config.settings.langsmith_tracing = False
     config.settings.langsmith_api_key = ""
     config.settings.langsmith_offline_log = True
     yield
@@ -191,6 +201,7 @@ class TestObservabilityMockEnabled:
 
     def test_enabled_with_key_sets_env(self):
         config.settings.langsmith_enabled = True
+        config.settings.langsmith_tracing = True
         config.settings.langsmith_api_key = "lsv2_fake_00000000000000000000000000000000"
         config.settings.langsmith_project = "test-project"
         config.settings.langsmith_endpoint = "https://api.smith.langchain.com"

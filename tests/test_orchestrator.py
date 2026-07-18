@@ -105,7 +105,9 @@ def test_orchestrator_with_verifier_pass():
         ))
         return dag
 
-    verifier = Verifier(llm_rubric=LLMRubricVerifier(model_available=False))
+    verifier = Verifier(
+        llm_rubric=LLMRubricVerifier(model_available=False, fail_closed=False)
+    )
     executor = ScriptedWorkerExecutor(script_success={"task1": True})
     orch = SimpleOrchestrator(
         planner=_planner,

@@ -34,6 +34,15 @@ class CreateTeamTaskRequest(BaseModel):
     team: str = Field(default="software_dev_team", description="团队模板名")
     max_rounds: int = Field(default=20, ge=1, le=200)
     review_required: bool = Field(default=True)
+    source_repository_path: str | None = Field(
+        default=None, description="Git coding run source repository; omit only for explicit non-Git work"
+    )
+    base_branch: str | None = None
+    base_commit_sha: str | None = None
+    environment_file_allowlist: list[str] = Field(
+        default_factory=list,
+        description="Explicit gitignored environment files to copy into each worktree",
+    )
 
 
 class CreateTeamTaskResponse(BaseModel):
@@ -47,6 +56,16 @@ class CreateTeamTaskResponse(BaseModel):
 
 class TeamRunMessageRequest(BaseModel):
     content: str = Field(..., min_length=1)
+
+
+class PermissionDecisionRequest(BaseModel):
+    decision: str
+    reason: str = ""
+
+
+class PlanDecisionRequest(BaseModel):
+    approved: bool
+    feedback: str = ""
 
 
 class TeamTaskMetaResponse(BaseModel):
@@ -158,6 +177,9 @@ async def create_team_run(req: CreateTeamTaskRequest):
     ctx = await runtime.create_run(
         goal=req.goal, team_name=req.team, mode=TeamRunMode.TASK_TEAM,
         max_rounds=req.max_rounds, review_required=req.review_required,
+        source_repository_path=req.source_repository_path,
+        base_branch=req.base_branch, base_commit_sha=req.base_commit_sha,
+        environment_file_allowlist=req.environment_file_allowlist,
     )
     import asyncio
     asyncio.create_task(runtime.start_run(ctx, req.goal, req.team, req.max_rounds, req.review_required))
@@ -178,6 +200,13 @@ async def cancel_team_run(run_id: str):
     if not await get_team_runtime().cancel_run(run_id):
         raise HTTPException(status_code=404, detail="Team run not found")
     return {"run_id": run_id, "status": "cancelled"}
+
+
+@router.post("/team-runs/{run_id}/pause")
+async def pause_team_run(run_id: str):
+    if not await get_team_runtime().pause_run(run_id):
+        raise HTTPException(status_code=404, detail="Team run not found")
+    return {"run_id": run_id, "status": "paused"}
 
 
 @router.post("/team-runs/{run_id}/resume")
@@ -210,15 +239,194 @@ def get_team_run_artifacts(run_id: str):
 
 
 @router.get("/team-runs/{run_id}/events")
-def get_team_run_events(run_id: str):
+def get_team_run_events(run_id: str, after_sequence: int = 0, limit: int = 500):
     from app.multiagent.phase_g_store import get_agent_run_history
-    return get_agent_run_history().list_events(run_id)
+    return get_agent_run_history().list_event_envelopes(run_id, after_sequence, limit)
+
+
+@router.get("/team-runs/{run_id}/stream")
+def stream_team_run_events(run_id: str, after_sequence: int = 0):
+    """Replayable SSE stream using the monotonic event envelope sequence."""
+    def generate():
+        cursor = after_sequence
+        idle = 0
+        while idle < 300:
+            from app.multiagent.phase_g_store import get_agent_run_history
+            events = get_agent_run_history().list_event_envelopes(run_id, cursor, 200)
+            if events:
+                idle = 0
+                for event in events:
+                    cursor = max(cursor, int(event["sequence"]))
+                    yield f"id: {cursor}\nevent: {event['event_type']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+            else:
+                idle += 1
+                yield ": keepalive\n\n"
+                time.sleep(1)
+    return StreamingResponse(generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache"})
 
 
 @router.get("/team-runs/{run_id}/messages")
 def get_team_run_messages(run_id: str):
     from app.multiagent.mailbox import get_mailbox
     return [message.model_dump(mode="json") for message in get_mailbox().list_messages_in_run(run_id)]
+
+
+@router.get("/team-runs/{run_id}/task-graph")
+def get_team_run_graph(run_id: str):
+    from app.multiagent.phase_g_store import get_agent_run_history
+    graph = get_agent_run_history().load_task_graph(run_id)
+    if graph is None:
+        raise HTTPException(status_code=404, detail="TaskGraph not found")
+    return graph
+
+
+@router.get("/team-runs/{run_id}/agents/{agent_id}/peek")
+def peek_team_run_agent(run_id: str, agent_id: str):
+    from app.multiagent.agent_registry import get_agent_registry
+    from app.multiagent.mailbox import get_mailbox
+    agent = get_agent_registry().get(agent_id)
+    if agent is None or agent.run_id != run_id:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return {"agent": agent.model_dump(mode="json"),
+            "messages": [item.model_dump(mode="json") for item in get_mailbox().peek(agent_id)[-20:]]}
+
+
+@router.get("/team-runs/{run_id}/agents/{agent_id}/transcript")
+def get_team_run_agent_transcript(run_id: str, agent_id: str):
+    from app.multiagent.phase_g_store import get_agent_run_history
+    messages = [row for row in get_agent_run_history().list_mailbox_messages(run_id=run_id)
+                if row.get("to_agent_id") == agent_id or row.get("from_agent_id") == agent_id]
+    events = [row for row in get_agent_run_history().list_event_envelopes(run_id, 0, 2000)
+              if row.get("agent_id") == agent_id]
+    return {"messages": messages, "events": events}
+
+
+@router.post("/team-runs/{run_id}/attach")
+def attach_team_run(run_id: str, after_sequence: int = 0):
+    events = get_team_run_events(run_id, after_sequence)
+    return {"run_id": run_id, "attached": True, "events": events,
+            "next_sequence": events[-1]["sequence"] if events else after_sequence}
+
+
+@router.post("/team-runs/{run_id}/detach")
+def detach_team_run(run_id: str):
+    return {"run_id": run_id, "attached": False}
+
+
+@router.get("/team-runs/{run_id}/permissions")
+def list_team_run_permissions(run_id: str):
+    from app.multiagent.permission import get_permission_broker
+    return [item.model_dump(mode="json") for item in get_permission_broker().list_pending(run_id)]
+
+
+@router.post("/team-runs/{run_id}/permissions/{request_id}/decision")
+def decide_team_run_permission(run_id: str, request_id: str, req: PermissionDecisionRequest):
+    from app.multiagent.permission import PermissionDecision, get_permission_broker
+    try:
+        item = get_permission_broker().decide(
+            request_id, PermissionDecision(req.decision), decided_by="user", reason=req.reason,
+        )
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if item.run_id != run_id:
+        raise HTTPException(status_code=404, detail="Permission request not in run")
+    return item.model_dump(mode="json")
+
+
+@router.get("/team-runs/{run_id}/plans")
+def list_team_run_plans(run_id: str):
+    from app.multiagent.plan_approval import PlanApprovalService
+    return [plan.model_dump(mode="json") for plan in PlanApprovalService().list_pending(run_id)]
+
+
+@router.post("/team-runs/{run_id}/plans/{plan_id}/decision")
+def decide_team_run_plan(run_id: str, plan_id: str, req: PlanDecisionRequest):
+    from app.multiagent.plan_approval import PlanApprovalService
+    try:
+        plan = PlanApprovalService().decide(plan_id, req.approved, decided_by="user",
+                                            feedback=req.feedback)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if plan.run_id != run_id:
+        raise HTTPException(status_code=404, detail="Plan not in run")
+    return plan.model_dump(mode="json")
+
+
+@router.get("/team-runs/{run_id}/worktrees")
+def list_team_run_worktrees(run_id: str):
+    from app.multiagent.git_workspace import _ensure_schema
+    _ensure_schema()
+    from app.multiagent.store import _get_conn
+    rows = _get_conn().execute(
+        "SELECT payload FROM worktree_leases WHERE run_id=? ORDER BY acquired_at", (run_id,)
+    ).fetchall()
+    return [json.loads(row["payload"]) for row in rows]
+
+
+@router.get("/team-runs/{run_id}/git")
+def get_team_run_git_state(run_id: str):
+    """Expose governed worktree branches, commits, integration and PR metadata."""
+    from app.multiagent.git_workspace import _ensure_schema
+    from app.multiagent.phase_g_store import get_agent_run_history
+    from app.multiagent.store import _get_conn
+    _ensure_schema()
+    leases = _get_conn().execute(
+        "SELECT payload FROM worktree_leases WHERE run_id=? ORDER BY acquired_at", (run_id,)
+    ).fetchall()
+    merges = _get_conn().execute(
+        "SELECT payload FROM merge_queue WHERE run_id=? ORDER BY created_at", (run_id,)
+    ).fetchall()
+    run = get_agent_run_history().get_team_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Team run not found")
+    metadata = run.get("metadata") or {}
+    return {
+        "repository": metadata.get("repository"),
+        "worktrees": [json.loads(row["payload"]) for row in leases],
+        "merge_queue": [json.loads(row["payload"]) for row in merges],
+        "pull_request": metadata.get("pull_request"),
+    }
+
+
+@router.get("/team-runs/{run_id}/verification")
+def get_team_run_verification(run_id: str):
+    from app.multiagent.phase_g_store import get_agent_run_history
+    events = get_agent_run_history().list_event_envelopes(run_id, 0, 5000)
+    return [event for event in events
+            if "Verification" in event.get("event_type", "")
+            or event.get("event_type") in {"BeforeToolUse", "AfterToolUse"}]
+
+
+@router.get("/team-runs/{run_id}/errors")
+def get_team_run_errors(run_id: str):
+    from app.multiagent.phase_g_store import get_agent_run_history
+    from app.multiagent.task_board import get_task_board
+    tasks = [task.model_dump(mode="json") for task in get_task_board().list_by_run(run_id)
+             if task.last_error or task.status.value in {"failed", "repair_required", "blocked"}]
+    events = get_agent_run_history().list_event_envelopes(run_id, 0, 5000)
+    failures = [event for event in events
+                if any(token in event.get("event_type", "").lower()
+                       for token in ("failed", "conflict", "repair"))]
+    return {"tasks": tasks, "events": failures}
+
+
+@router.get("/team-runs/{run_id}/artifacts/{artifact_id}/lineage")
+def get_team_run_artifact_lineage(run_id: str, artifact_id: str):
+    from app.multiagent.phase_g_store import get_agent_run_history
+    artifacts = get_agent_run_history().list_artifacts_by_run(run_id)
+    by_id = {item["artifact_id"]: item for item in artifacts}
+    current = by_id.get(artifact_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    result = []
+    seen = set()
+    while current and current["artifact_id"] not in seen:
+        seen.add(current["artifact_id"])
+        result.append(current)
+        parent = current.get("predecessor_id") or current.get("parent_artifact_id")
+        current = by_id.get(parent) if parent else None
+    return list(reversed(result))
 
 
 @router.post("/team-runs/{run_id}/agents/{agent_id}/messages")
@@ -366,6 +574,10 @@ def create_team_task(req: CreateTeamTaskRequest):
             mode=TeamRunMode.TASK_TEAM,
             max_rounds=req.max_rounds,
             review_required=req.review_required,
+            source_repository_path=req.source_repository_path,
+            base_branch=req.base_branch,
+            base_commit_sha=req.base_commit_sha,
+            environment_file_allowlist=req.environment_file_allowlist,
         ))
         loop.close()
     except Exception as exc:

@@ -63,8 +63,8 @@ class TestResumeCoordinator:
         assert agent.name == "Alice"
         assert agent.role == "coder"
 
-    def test_resume_skips_succeeded_task(self):
-        """已 succeeded 的 task 应该被跳过（直接置 SUCCEEDED）。"""
+    def test_resume_does_not_promote_unverified_history(self):
+        """历史 task_run 不能绕过 Board/Verifier 直接晋升成功。"""
         from app.multiagent.resume_coordinator import ResumeCoordinator
         from app.multiagent.phase_g_store import get_agent_run_history
         from app.multiagent.task_board import get_task_board, BoardTaskStatus
@@ -81,9 +81,9 @@ class TestResumeCoordinator:
 
         c = ResumeCoordinator()
         result = c.resume("r_done")
-        assert result.skipped_tasks == 1, f"应跳过 1 个 task，实际 {result.skipped_tasks}"
+        assert result.skipped_tasks == 0
         t = board.get("t_done")
-        assert t.status == BoardTaskStatus.SUCCEEDED
+        assert t.status == BoardTaskStatus.PENDING
 
     def test_resume_does_not_touch_failed_task(self):
         """Failure 状态的 task 不应被置为成功（应留给主链重试）。"""
