@@ -65,6 +65,9 @@ class AgentRegistry:
         checkpoint_namespace_override: str | None = None,
         created_at_override: datetime | None = None,
         max_concurrency: int = 1,
+        metadata: dict[str, Any] | None = None,
+        worktree_path: str = "",
+        mailbox_cursor: int = 0,
     ) -> AgentInstance:
         """快捷创建并注册一个 AgentInstance。"""
         agent_id = agent_id_override or make_agent_id()
@@ -83,6 +86,9 @@ class AgentRegistry:
             capabilities=capabilities or [],
             created_at=created_at_override or datetime.utcnow(),
             max_concurrency=max_concurrency,
+            metadata=metadata or {},
+            worktree_path=worktree_path,
+            mailbox_cursor=mailbox_cursor,
         )
         # 创建后置 SPAWNING → IDLE
         instance.status = AgentStatus.IDLE
@@ -251,7 +257,9 @@ class AgentRegistry:
                 status=agent.status.value, current_task_id=agent.current_task_id,
                 workspace_root=agent.workspace_root,
                 last_heartbeat_at=agent.last_heartbeat_at,
-                capabilities=agent.capabilities, metadata=agent.metadata,
+                capabilities=agent.capabilities,
+                metadata={**agent.metadata, "worktree_path": agent.worktree_path,
+                          "mailbox_cursor": agent.mailbox_cursor},
                 created_at=agent.created_at, stopped_at=agent.stopped_at,
             )
         except Exception as exc:

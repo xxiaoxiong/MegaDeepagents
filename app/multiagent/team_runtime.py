@@ -38,6 +38,10 @@ class TeamRuntimeFacade:
         review_required: bool = True,
         workspace_root: str | None = None,
         user_id: str | None = None,
+        source_repository_path: str | None = None,
+        base_branch: str | None = None,
+        base_commit_sha: str | None = None,
+        environment_file_allowlist: list[str] | None = None,
     ) -> TeamRunContext:
         """创建一次新的团队运行，返回上下文。"""
         ctx = TeamRunContext.create(
@@ -51,6 +55,20 @@ class TeamRuntimeFacade:
             f"[TeamRuntime] run created: id={ctx.run_id} team={team_name} "
             f"mode={mode.value} workspace={ctx.workspace_root}"
         )
+        if source_repository_path:
+            from app.multiagent.git_workspace import RepositoryWorkspaceManager
+            repository = RepositoryWorkspaceManager(
+                source_repository_path, ctx.workspace_root,
+                base_branch=base_branch, base_commit_sha=base_commit_sha,
+            )
+            ctx.metadata["repository"] = {
+                "source_repository_path": repository.source_repository,
+                "base_branch": repository.base_branch,
+                "base_commit_sha": repository.base_commit_sha,
+                "environment_file_allowlist": list(environment_file_allowlist or ()),
+            }
+        else:
+            ctx.metadata["workspace_provider"] = "local"
         self._active_runs[ctx.run_id] = {
             "ctx": ctx,
             "goal": goal,
@@ -69,7 +87,18 @@ class TeamRuntimeFacade:
             run_id=ctx.run_id, goal=goal, team_id=team_name, mode=mode.value,
             workspace_root=ctx.workspace_root, status="created", max_rounds=max_rounds,
             review_required=review_required,
+            metadata=ctx.metadata,
         )
+        from app.multiagent.lifecycle_hooks import LifecycleEvent, get_lifecycle_hook_engine
+        hook = await get_lifecycle_hook_engine().emit_async(
+            LifecycleEvent.RUN_CREATED,
+            {"run_id": ctx.run_id, "goal": goal, "team_id": team_name,
+             "mode": mode.value, "metadata": ctx.metadata},
+        )
+        if hook.block or not hook.allow:
+            get_agent_run_history().update_team_run_status(ctx.run_id, "failed")
+            self._active_runs[ctx.run_id]["status"] = "failed"
+            raise PermissionError(hook.feedback or "RunCreated hook blocked run")
         return ctx
 
     async def start_run(
@@ -86,6 +115,19 @@ class TeamRuntimeFacade:
         self._active_runs[ctx.run_id]["status"] = "running"
         from app.multiagent.phase_g_store import get_agent_run_history
         get_agent_run_history().update_team_run_status(ctx.run_id, "running")
+        from app.multiagent.lifecycle_hooks import LifecycleEvent, get_lifecycle_hook_engine
+        hook = await get_lifecycle_hook_engine().emit_async(
+            LifecycleEvent.RUN_STARTED,
+            {"run_id": ctx.run_id, "goal": goal, "team_id": team_name},
+        )
+        if hook.block or not hook.allow:
+            self._active_runs[ctx.run_id]["status"] = "failed"
+            get_agent_run_history().update_team_run_status(ctx.run_id, "failed")
+            return TeamRunResult(
+                task_id=ctx.run_id, status="failed", final_output="",
+                termination_reason=hook.feedback or "RunStarted hook blocked run",
+                completed_at=datetime.utcnow(),
+            )
 
         if ctx.mode == TeamRunMode.DISCUSSION:
             return await self._run_discussion(
@@ -113,6 +155,7 @@ class TeamRuntimeFacade:
         from app.multiagent.planner import plan_with_llm
         from app.multiagent.orchestrator import run_orchestrated
         from app.multiagent.artifact import ArtifactStore
+        from app.multiagent.lifecycle_hooks import LifecycleEvent, get_lifecycle_hook_engine
 
         # 为本次 Run 创建 ArtifactStore（root_path = run workspace）
         artifact_store = ArtifactStore(root_path=ctx.workspace_root)
@@ -123,9 +166,10 @@ class TeamRuntimeFacade:
         executor = DeepAgentExecutor(workspace_root=ctx.workspace_root)
         executor.set_artifact_store(artifact_store)
 
-        # 构造 Verifier（带程序化 + LLM 回退）
+        # Production verification is fail-closed.  Model/configuration errors
+        # can never turn a non-empty artifact into PASS.
         verifier = Verifier(
-            llm_rubric=LLMRubricVerifier(model_available=False),
+            llm_rubric=LLMRubricVerifier(model_available=True, fail_closed=True),
             artifact_store=artifact_store,
         )
 
@@ -149,16 +193,28 @@ class TeamRuntimeFacade:
         status_map = {
             "completed": "completed",
             "failed": "failed",
-            "interrupted": "cancelled",
+            "interrupted": (
+                "paused" if result.error == "paused"
+                else "waiting_human" if result.error and "waiting" in result.error
+                else "cancelled"
+            ),
             "incomplete": "failed",
         }
         self._active_runs[ctx.run_id]["status"] = status_map.get(result.status, "failed")
         from app.multiagent.phase_g_store import get_agent_run_history
         get_agent_run_history().update_team_run_status(ctx.run_id, self._active_runs[ctx.run_id]["status"])
+        final_status = self._active_runs[ctx.run_id]["status"]
+        final_event = (LifecycleEvent.RUN_COMPLETED if final_status == "completed"
+                       else LifecycleEvent.RUN_FAILED)
+        await get_lifecycle_hook_engine().emit_async(
+            final_event,
+            {"run_id": ctx.run_id, "status": final_status,
+             "error": result.error, "verdict": result.verification_verdict},
+        )
 
         return TeamRunResult(
             task_id=ctx.run_id,
-            status=status_map.get(result.status, "failed"),
+            status=final_status,
             final_output=result.summary or goal[:200],
             total_rounds=result.rounds,
             termination_reason=result.error,
@@ -261,6 +317,20 @@ class TeamRuntimeFacade:
         get_agent_run_history().update_team_run_status(run_id, "cancelled")
         return True
 
+    async def pause_run(self, run_id: str) -> bool:
+        """Cooperatively pause scheduling without cancelling durable tasks."""
+        run = await self.get_run(run_id)
+        if not run:
+            return False
+        from app.multiagent.agent_runtime_manager import get_agent_runtime_manager
+        from app.multiagent.agent_registry import get_agent_registry
+        for agent in get_agent_registry().list_by_run(run_id):
+            get_agent_runtime_manager().pause_agent(run_id, agent.agent_id)
+        if run_id in self._active_runs:
+            self._active_runs[run_id]["status"] = "paused"
+        from app.multiagent.phase_g_store import get_agent_run_history
+        return get_agent_run_history().update_team_run_status(run_id, "paused")
+
     async def pause_agent(self, run_id: str, agent_id: str) -> bool:
         """Pause one idle teammate in the same registry the Scheduler uses."""
         if not await self.get_run(run_id):
@@ -293,6 +363,18 @@ class TeamRuntimeFacade:
         """向运行中的 Agent 发送消息（通过 Mailbox 治理钩子）。"""
         from app.multiagent.mailbox import MailboxMessage, get_mailbox, make_message_id
 
+        run = await self.get_run(run_id)
+        if not run:
+            return False
+        from app.multiagent.agent_registry import get_agent_registry
+        target = get_agent_registry().get(agent_id)
+        if target is None or target.run_id != run_id:
+            # Cold runs may not yet be rehydrated; durable identity is still
+            # authoritative for message routing.
+            from app.multiagent.phase_g_store import get_agent_run_history
+            stored = get_agent_run_history().get_agent_instance(agent_id)
+            if not stored or stored.get("run_id") != run_id:
+                return False
         mailbox = get_mailbox()
         try:
             msg = MailboxMessage(
@@ -305,6 +387,15 @@ class TeamRuntimeFacade:
                 content=message,
             )
             ok = mailbox.send(msg)
+            if ok:
+                from app.multiagent.teammate_session import (
+                    TeammateCommandQueue, TeammateCommandType, get_teammate_supervisor,
+                )
+                session = get_teammate_supervisor().load(agent_id)
+                if session is not None:
+                    TeammateCommandQueue(session.session_id).put(
+                        TeammateCommandType.MESSAGE.value, msg.model_dump(mode="json")
+                    )
             logger.info(
                 f"[TeamRuntime] send_message run={run_id} agent={agent_id} "
                 f"ok={ok} msg={message[:80]}"
@@ -334,6 +425,7 @@ class TeamRuntimeFacade:
                     workspace_root=stored["workspace_root"],
                     checkpoint_namespace=f"team:{run_id}",
                     user_goal=stored.get("goal", ""),
+                    metadata=stored.get("metadata") or {},
                 )
                 os.makedirs(ctx.workspace_root, exist_ok=True)
                 run = self._activate_restored_run(

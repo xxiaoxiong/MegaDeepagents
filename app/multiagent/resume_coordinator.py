@@ -80,6 +80,12 @@ class ResumeCoordinator:
         # wake-up that was already durably delivered.
         from app.multiagent.mailbox import get_mailbox
         get_mailbox().restore_from_db(run_id, history=self.history)
+        from app.multiagent.tool_runtime import ToolSideEffectJournal
+        incomplete_tools = ToolSideEffectJournal().recover_incomplete(run_id)
+        for invocation in incomplete_tools:
+            result.errors.append(
+                f"tool {invocation.invocation_id}: {invocation.status.value}"
+            )
 
         # 1. 从持久化读 Agent 列表
         persisted_agents = self.history.list_by_run(run_id)
@@ -119,6 +125,10 @@ class ResumeCoordinator:
                     session_id_override=stored.get("session_id"),
                     thread_id_override=stored.get("thread_id"),
                     checkpoint_namespace_override=stored.get("checkpoint_namespace"),
+                    workspace_root=stored.get("workspace_root") or "",
+                    metadata=stored.get("metadata") or {},
+                    worktree_path=(stored.get("metadata") or {}).get("worktree_path", ""),
+                    mailbox_cursor=int((stored.get("metadata") or {}).get("mailbox_cursor", 0)),
                 )
                 # A process cannot safely resume a RUNNING/CLAIMING lease.
                 # It is requeued above, therefore the teammate comes back IDLE
@@ -133,31 +143,55 @@ class ResumeCoordinator:
                         # 不合法转换，留为 idle
                         pass
                 result.resumed_agents += 1
+                from app.multiagent.teammate_session import (
+                    TeammateLifecycle, get_teammate_supervisor,
+                )
+                supervisor = get_teammate_supervisor()
+                session = supervisor.ensure_session(agent)
+                if session.lifecycle_state in (
+                    TeammateLifecycle.CLAIMING, TeammateLifecycle.PLANNING,
+                    TeammateLifecycle.RUNNING, TeammateLifecycle.WAITING_TOOL,
+                ):
+                    session.transition(TeammateLifecycle.IDLE)
+                    session.current_task_id = None
+                    supervisor.persist(session)
             except Exception as exc:
                 logger.error(f"[Resume] failed to reconstruct agent={agent_id}: {exc}")
                 result.errors.append(f"agent {agent_id}: {exc}")
 
-        # 3. 跳过已经 SUCCEEDED 的 task（不重新调度）
-        persisted_task_runs = self.history.list_task_runs_by_run_id(run_id)
-        for trun in persisted_task_runs:
-            if trun.get("status") != "succeeded":
+        # 3. TaskBoard itself is the runtime authority.  A historical
+        # task_runs row can never promote PENDING to SUCCEEDED: it may describe
+        # worker output that was never verified.  Already-SUCCEEDED Board rows
+        # were preserved by prepare_for_resume and are simply counted here.
+        result.skipped_tasks = sum(
+            1 for task in self.board.list_by_run(run_id)
+            if task.status == BoardTaskStatus.SUCCEEDED
+        )
+
+        # Approved permission requests unblock their exact task on resume.
+        from app.multiagent.permission import get_permission_broker
+        broker = get_permission_broker()
+        for task in self.board.list_by_run(run_id):
+            if task.status != BoardTaskStatus.BLOCKED:
                 continue
-            task_id = trun.get("task_id")
-            bd = self.board.get(task_id, run_id=run_id)
-            if bd is None:
-                continue
-            if bd.status != BoardTaskStatus.PENDING:
-                continue  # 不动旧状态
-            # 直接置为 SUCCEEDED（跳过执行）
-            bd_with = self.board.claim(task_id, "RESUME_BOT", run_id=run_id)
-            if bd_with.success:
-                self.board.start(task_id, "RESUME_BOT", run_id=run_id)
-                self.board.complete(
-                    task_id, "RESUME_BOT",
-                    artifact_ids=trun.get("artifact_ids") or [],
-                    run_id=run_id,
-                )
-                result.skipped_tasks += 1
+            request_id = task.metadata.get("permission_request_id")
+            if request_id:
+                request = broker.get(request_id)
+                if request and request.status == "approved":
+                    task.status = BoardTaskStatus.PENDING
+                    task.claimed_by = None
+                    task.claimed_at = None
+                    self.board.add(task)
+                    continue
+            plan_id = task.metadata.get("plan_id")
+            if plan_id:
+                from app.multiagent.plan_approval import PlanApprovalService, PlanStatus
+                plan = PlanApprovalService().get(plan_id)
+                if plan and plan.status == PlanStatus.PLAN_APPROVED:
+                    task.status = BoardTaskStatus.PENDING
+                    task.claimed_by = None
+                    task.claimed_at = None
+                    self.board.add(task)
 
         # 4. 留下未完成的（PENDING / RUNNING）task 由主链继续调度
         logger.info(

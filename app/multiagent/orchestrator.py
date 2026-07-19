@@ -25,7 +25,7 @@ from typing import Any
 
 from app.core.logging import logger
 from app.multiagent.team_run_context import TeamRunContext
-from app.multiagent.scheduler import TaskScheduler, _InMemoryWorkerExecutor, WorkerExecutor
+from app.multiagent.scheduler import TaskScheduler, WorkerExecutor
 from app.multiagent.task_graph import TaskGraph, TaskNodeStatus
 
 try:
@@ -74,7 +74,10 @@ class SimpleOrchestrator:
         cancel_event: Any | None = None,
     ):
         self.planner = planner
-        self._executor = executor or _InMemoryWorkerExecutor()
+        # Production multi-agent execution is fail-closed when no real worker
+        # is injected.  Test-only in-memory executors live in scheduler.py but
+        # are never selected by the TASK_TEAM orchestrator.
+        self._executor = executor
         self.verifier = verifier
         self.router = router
         self.max_repair_rounds = max_repair_rounds
@@ -147,9 +150,19 @@ class SimpleOrchestrator:
             success = self._schedule(dag)
             self._persist_task_graph(dag)
             if not success:
+                schedule_status = getattr(self, "_last_schedule_status", "failed")
+                schedule_error = getattr(self, "_last_schedule_error", "scheduler_failed")
+                if schedule_status in ("paused", "waiting_human"):
+                    self._result.status = "interrupted"
+                    self._result.error = schedule_error or schedule_status
+                    self.phase = "waiting_human"
+                    self._emit_event("scheduling_interrupted", {
+                        "status": schedule_status, "error": self._result.error,
+                    })
+                    return self._result
                 self._result.status = "failed"
-                self._result.error = "scheduler_failed"
-                self._emit_event("scheduling_failed", {"error": "scheduler_failed"})
+                self._result.error = schedule_error or "scheduler_failed"
+                self._emit_event("scheduling_failed", {"error": self._result.error})
                 return self._result
             self._emit_event("scheduling_finished", {})
 
@@ -289,14 +302,16 @@ class SimpleOrchestrator:
     def _schedule(self, dag) -> bool:
         """执行 DAG 主链。
 
-        优先走 ParallelTeamScheduler（真正的并行 + AgentRegistry 调度 + 心跳租约），
-        这是 Phase Two §三/§七要求的主路径——多 Agent 并行运行而非旧的同步串行 fallback。
-
-        当 ParallelTeamScheduler 不可用（无 run_id、缺 asyncio 运行时）时，
-        回退到 TaskScheduler._run_sync_fallback——仅作为缺异步运行时保护的兜底，
-        不能成为默认主链。
+        TASK_TEAM 生产路径走 ParallelTeamScheduler（真正并行 +
+        AgentRegistry 调度 + 心跳租约）。缺失真实 worker executor
+        时 fail closed，不会隐式选用内存伪执行器。无 run_id 的显式
+        单机调用仍可使用注入的真实 executor 同步执行。
         """
         run_id = self._ctx.run_id if self._ctx else None
+        if self._executor is None:
+            self._last_schedule_status = "failed"
+            self._last_schedule_error = "worker_executor_missing"
+            return False
         if not run_id:
             # 无 run_id → 无法走 team board 路径；回退 sync fallback
             self._log("无 run_id，回退 sync fallback 调度")
@@ -323,12 +338,14 @@ class SimpleOrchestrator:
             sched = ParallelTeamScheduler(
                 run_id=run_id, task_graph=dag, max_rounds=self.max_rounds,
                 verifier=self.verifier, cancel_event=self.cancel_event,
+                **self._workspace_runtime_components(),
             )
             # 调用方传入的真实 executor（DeepAgentExecutor / 测试 stub）
-            executor_used = self._executor or _InMemoryWorkerExecutor()
-            run_result = self._run_parallel(sched, executor_used)
+            run_result = self._run_parallel(sched, self._executor)
             self.current_round = getattr(run_result, "rounds", 0) or 0
             status = getattr(run_result, "status", "failed") or "failed"
+            self._last_schedule_status = status
+            self._last_schedule_error = getattr(run_result, "error", None)
             self._log(
                 f"调度完成(并行): status={status}, rounds={self.current_round}, "
                 f"error={getattr(run_result, 'error', None)}"
@@ -347,6 +364,33 @@ class SimpleOrchestrator:
         except Exception as exc:
             logger.error(f"[Orchestrator] ParallelTeamScheduler failed: {exc}")
             return False
+
+    def _workspace_runtime_components(self) -> dict[str, Any]:
+        if self._ctx is None:
+            return {}
+        repository_meta = self._ctx.metadata.get("repository") or {}
+        source = repository_meta.get("source_repository_path")
+        if not source:
+            return {}
+        from app.multiagent.git_workspace import (
+            AgentWorktreeManager, GitIntegrationManager, RepositoryWorkspaceManager,
+        )
+        from app.multiagent.permission import get_permission_broker
+        repository = RepositoryWorkspaceManager(
+            source, self._ctx.workspace_root,
+            base_branch=repository_meta.get("base_branch"),
+            base_commit_sha=repository_meta.get("base_commit_sha"),
+        )
+        worktrees = AgentWorktreeManager(
+            repository, permission_broker=get_permission_broker(),
+            environment_file_allowlist=repository_meta.get("environment_file_allowlist") or [],
+        )
+        integration = GitIntegrationManager(
+            repository, permission_broker=get_permission_broker(),
+        )
+        return {"worktree_manager": worktrees,
+                "integration_manager": integration,
+                "permission_broker": get_permission_broker()}
 
     def _run_parallel(self, sched, executor):
         """在事件循环中跑 ParallelTeamScheduler.run。
@@ -378,20 +422,8 @@ class SimpleOrchestrator:
         本方法把每个 TaskNode 投放到 board 上一个对应 BoardTask。
         已存在同 (run_id, task_id) 的 BoardTask 跳过——保持幂等。
         """
-        from app.multiagent.task_board import get_task_board
-        board = get_task_board()
-        existing = {t.task_id for t in board.list_by_run(run_id)}
-        for node in dag.nodes.values():
-            if node.id in existing:
-                continue
-            board.create_task(
-                task_id=node.id,
-                run_id=run_id,
-                title=node.title,
-                objective=node.objective,
-                dependencies=list(getattr(node, "dependencies", []) or []),
-                required_capabilities=list(getattr(node, "required_capabilities", []) or []),
-            )
+        from app.multiagent.transactional_task_service import TransactionalTaskService
+        TransactionalTaskService().register_initial_graph(run_id, dag)
 
     def _sync_board_to_dag(self, run_id: str, dag) -> None:
         """把 board 上的任务终态反映回 dag.nodes。
@@ -441,7 +473,7 @@ class SimpleOrchestrator:
             try:
                 return "pass" if dag.all_succeeded() else "repair"
             except Exception:
-                return "pass"
+                return "repair"
         try:
             # 构造 artifacts dict — 优先读取真实文件内容
             artifacts: dict[str, dict] = {}
@@ -516,15 +548,28 @@ class SimpleOrchestrator:
             if node.status != TaskNodeStatus.FAILED:
                 continue
             try:
-                repair_node = dag.add_repair_task(
-                    node_id,
-                    f"修复 {node.objective[:60]}",
-                    required_capabilities=node.required_capabilities,
-                )
                 if self._ctx:
                     from app.multiagent.task_board import get_task_board
-                    get_task_board().supersede_with_repair(
-                        node_id, repair_node.id, self._ctx.run_id,
+                    from app.multiagent.transactional_task_service import TransactionalTaskService
+                    board = get_task_board()
+                    source_task = board.get(node_id, run_id=self._ctx.run_id)
+                    mutation = TransactionalTaskService().create_repair(
+                        self._ctx.run_id, node_id,
+                        objective=f"修复 {node.objective[:60]}",
+                        required_capabilities=list(node.required_capabilities),
+                        source_artifact_ids=list(
+                            source_task.produced_artifact_ids if source_task else []
+                        ),
+                        verification_feedback=(
+                            source_task.metadata.get("verification", {}) if source_task else {}
+                        ),
+                    )
+                    dag = mutation.graph
+                else:
+                    dag.add_repair_task(
+                        node_id,
+                        f"修复 {node.objective[:60]}",
+                        required_capabilities=node.required_capabilities,
                     )
                 repair_count += 1
             except Exception as exc:

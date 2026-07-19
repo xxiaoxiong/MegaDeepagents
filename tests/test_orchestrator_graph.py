@@ -113,7 +113,7 @@ def test_graph_invoke_multi_mode():
     og = UnifiedOrchestratorGraph(
         planner=_FakePlanner(),
         executor=_FakeWorker(),
-        verifier=Verifier(llm_rubric=LLMRubricVerifier(model_available=False)),
+        verifier=Verifier(llm_rubric=LLMRubricVerifier(model_available=False, fail_closed=False)),
     )
     og.compile()
     result = og.invoke(
@@ -134,7 +134,7 @@ def test_graph_repair_cycle(tmp_path):
     og = UnifiedOrchestratorGraph(
         planner=_FakePlanner(),
         executor=executor,
-        verifier=Verifier(llm_rubric=LLMRubricVerifier(model_available=False)),
+        verifier=Verifier(llm_rubric=LLMRubricVerifier(model_available=False, fail_closed=False)),
         max_repair_rounds=3,
     )
     og.compile()
@@ -163,7 +163,7 @@ def test_graph_checkpoint_resume(tmp_path):
     og = UnifiedOrchestratorGraph(
         planner=_FakePlanner(),
         executor=_FakeWorker(),
-        verifier=Verifier(llm_rubric=LLMRubricVerifier(model_available=False)),
+        verifier=Verifier(llm_rubric=LLMRubricVerifier(model_available=False, fail_closed=False)),
     )
     og.compile(checkpoint_path=ckpt)
     result1 = og.invoke(goal="build api", mode_override="multi", thread_id="resume_test")
@@ -177,7 +177,7 @@ def test_graph_checkpoint_resume(tmp_path):
     og2 = UnifiedOrchestratorGraph(
         planner=_FakePlanner(),
         executor=_FakeWorker(),
-        verifier=Verifier(llm_rubric=LLMRubricVerifier(model_available=False)),
+        verifier=Verifier(llm_rubric=LLMRubricVerifier(model_available=False, fail_closed=False)),
     )
     og2.compile(checkpoint_path=ckpt)
     result2 = og2.resume(thread_id="resume_test")
@@ -193,7 +193,7 @@ def test_graph_checkpoint_resume_no_duplicate(tmp_path):
     og = UnifiedOrchestratorGraph(
         planner=_FakePlanner(),
         executor=executor,
-        verifier=Verifier(llm_rubric=LLMRubricVerifier(model_available=False)),
+        verifier=Verifier(llm_rubric=LLMRubricVerifier(model_available=False, fail_closed=False)),
     )
     og.compile(checkpoint_path=ckpt)
     og.invoke(goal="build api", mode_override="multi", thread_id="resume_no_dup")
@@ -208,7 +208,7 @@ def test_graph_checkpoint_resume_no_duplicate(tmp_path):
     og2 = UnifiedOrchestratorGraph(
         planner=_FakePlanner(),
         executor=executor2,
-        verifier=Verifier(llm_rubric=LLMRubricVerifier(model_available=False)),
+        verifier=Verifier(llm_rubric=LLMRubricVerifier(model_available=False, fail_closed=False)),
     )
     og2.compile(checkpoint_path=ckpt)
     og2.resume(thread_id="resume_no_dup")
@@ -225,7 +225,7 @@ def test_e2e_full_pipeline(tmp_path):
     og = UnifiedOrchestratorGraph(
         planner=_FakePlanner(),
         executor=_FakeWorker(),
-        verifier=Verifier(llm_rubric=LLMRubricVerifier(model_available=False)),
+        verifier=Verifier(llm_rubric=LLMRubricVerifier(model_available=False, fail_closed=False)),
     )
     og.compile()
     result = og.invoke(

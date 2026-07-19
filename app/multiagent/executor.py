@@ -13,6 +13,8 @@ docs/upgradePhaseTwo.md §三：
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -48,7 +50,11 @@ class ExecutionContext:
     task_dag: TaskGraph | None = None
     langsmith_trace_id: str | None = None
     thread_id: str | None = None
+    agent_id: str | None = None
+    session_id: str | None = None
     cancel_event: Any | None = None
+    permission_broker: Any | None = None
+    safety_point: Callable[[], dict[str, Any]] | None = None
 
 
 @dataclass
@@ -182,12 +188,71 @@ def _safe_workspace_path(root: str, requested: str) -> Path:
     return candidate
 
 
-def _make_read_file_tool(task_workspace: str):
+def _tool_boundary(cancel_event: Any | None, safety_point: Callable[[], Any] | None) -> None:
+    if safety_point is not None:
+        safety_point()
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("cancelled_before_tool")
+
+
+def _tool_hook(event: str, *, run_id: str, agent_id: str, task_id: str,
+               tool_name: str, arguments: dict[str, Any],
+               result: dict[str, Any] | None = None) -> None:
+    """Run lifecycle hooks at the same governed boundary as every local tool."""
+    if not run_id:
+        return
+    from app.multiagent.phase_g_store import get_agent_run_history, make_run_event_id
+    get_agent_run_history().record_event(
+        event_id=make_run_event_id(), run_id=run_id, event_type=event,
+        agent_id=agent_id, task_id=task_id,
+        payload={"tool": tool_name, "arguments": arguments, "result": result or {}},
+    )
+    from app.multiagent.lifecycle_hooks import LifecycleEvent, get_lifecycle_hook_engine
+    hook_result = get_lifecycle_hook_engine().emit(
+        LifecycleEvent(event),
+        {"run_id": run_id, "agent_id": agent_id, "task_id": task_id,
+         "tool": tool_name, "arguments": arguments, "result": result or {}},
+    )
+    if hook_result.block or not hook_result.allow:
+        raise PermissionError(hook_result.feedback or f"{event} hook blocked {tool_name}")
+
+
+def _atomic_write(path: Path, content: str, cancel_event: Any | None = None) -> None:
+    """Write in the destination directory and publish with one atomic replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("cancelled_before_tool")
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("cancelled_during_tool")
+        os.replace(temp_name, path)
+    finally:
+        try:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+        except OSError:
+            pass
+
+
+def _make_read_file_tool(
+    task_workspace: str, cancel_event: Any | None = None,
+    safety_point: Callable[[], Any] | None = None,
+    run_id: str = "", agent_id: str = "", task_id: str = "",
+):
     from langchain.tools import tool
 
     @tool
     def read_file(file_path: str) -> str:
         """读取指定文件的全部内容。"""
+        _tool_boundary(cancel_event, safety_point)
+        _tool_hook("BeforeToolUse", run_id=run_id, agent_id=agent_id,
+                   task_id=task_id, tool_name="read_file",
+                   arguments={"file_path": file_path})
         try:
             path = _safe_workspace_path(task_workspace, file_path)
         except ValueError as exc:
@@ -195,17 +260,28 @@ def _make_read_file_tool(task_workspace: str):
         if not path.is_file():
             return f"错误: 文件不存在 {file_path}"
         with path.open("r", encoding="utf-8") as f:
-            return f.read()
+            content = f.read()
+        _tool_hook("AfterToolUse", run_id=run_id, agent_id=agent_id,
+                   task_id=task_id, tool_name="read_file",
+                   arguments={"file_path": file_path}, result={"size": len(content)})
+        return content
     return read_file
 
 
-def _make_list_dir_tool(task_workspace: str):
+def _make_list_dir_tool(
+    task_workspace: str, cancel_event: Any | None = None,
+    safety_point: Callable[[], Any] | None = None,
+    run_id: str = "", agent_id: str = "", task_id: str = "",
+):
     from langchain.tools import tool
 
     @tool
     def list_dir(path: str = ".") -> str:
         """列出指定目录中的文件和子目录。"""
         import json
+        _tool_boundary(cancel_event, safety_point)
+        _tool_hook("BeforeToolUse", run_id=run_id, agent_id=agent_id,
+                   task_id=task_id, tool_name="list_dir", arguments={"path": path})
         try:
             resolved = _safe_workspace_path(task_workspace, path)
         except ValueError as exc:
@@ -213,33 +289,61 @@ def _make_list_dir_tool(task_workspace: str):
         if not resolved.is_dir():
             return f"错误: 目录不存在 {path}"
         items = [entry.name for entry in resolved.iterdir()]
+        _tool_hook("AfterToolUse", run_id=run_id, agent_id=agent_id,
+                   task_id=task_id, tool_name="list_dir", arguments={"path": path},
+                   result={"count": len(items)})
         return json.dumps(items, ensure_ascii=False)
     return list_dir
 
 
-def _make_create_file_tool(task_workspace: str):
+def _make_create_file_tool(
+    task_workspace: str, cancel_event: Any | None = None,
+    safety_point: Callable[[], Any] | None = None,
+    permission_broker: Any | None = None, run_id: str = "",
+    agent_id: str = "", task_id: str = "",
+):
     from langchain.tools import tool
 
     @tool
     def create_file(file_path: str, content: str) -> str:
         """创建或覆写文件。路径相对于工作目录。"""
+        _tool_boundary(cancel_event, safety_point)
+        _tool_hook("BeforeToolUse", run_id=run_id, agent_id=agent_id,
+                   task_id=task_id, tool_name="create_file",
+                   arguments={"file_path": file_path, "size": len(content)})
         try:
             path = _safe_workspace_path(task_workspace, file_path)
         except ValueError as exc:
             return f"错误: {exc}"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as f:
-            f.write(content)
+        if permission_broker is not None:
+            from app.multiagent.permission import PermissionKind
+            permission_broker.authorize(
+                run_id=run_id, agent_id=agent_id, kind=PermissionKind.FILE_WRITE,
+                operation="create_file", parameters={"path": str(path)},
+            )
+        _atomic_write(path, content, cancel_event)
+        _tool_hook("AfterToolUse", run_id=run_id, agent_id=agent_id,
+                   task_id=task_id, tool_name="create_file",
+                   arguments={"file_path": file_path}, result={"path": str(path)})
         return f"文件已写入: {path}"
     return create_file
 
 
-def _make_edit_file_tool(task_workspace: str):
+def _make_edit_file_tool(
+    task_workspace: str, cancel_event: Any | None = None,
+    safety_point: Callable[[], Any] | None = None,
+    permission_broker: Any | None = None, run_id: str = "",
+    agent_id: str = "", task_id: str = "",
+):
     from langchain.tools import tool
 
     @tool
     def edit_file(file_path: str, old_string: str, new_string: str) -> str:
         """编辑文件的字符串替换。"""
+        _tool_boundary(cancel_event, safety_point)
+        _tool_hook("BeforeToolUse", run_id=run_id, agent_id=agent_id,
+                   task_id=task_id, tool_name="edit_file",
+                   arguments={"file_path": file_path})
         try:
             path = _safe_workspace_path(task_workspace, file_path)
         except ValueError as exc:
@@ -250,44 +354,73 @@ def _make_edit_file_tool(task_workspace: str):
             content = f.read()
         if old_string not in content:
             return f"未找到要替换的字符串"
+        if permission_broker is not None:
+            from app.multiagent.permission import PermissionKind
+            permission_broker.authorize(
+                run_id=run_id, agent_id=agent_id, kind=PermissionKind.FILE_WRITE,
+                operation="edit_file", parameters={"path": str(path)},
+            )
         content = content.replace(old_string, new_string, 1)
-        with path.open("w", encoding="utf-8") as f:
-            f.write(content)
+        _atomic_write(path, content, cancel_event)
+        _tool_hook("AfterToolUse", run_id=run_id, agent_id=agent_id,
+                   task_id=task_id, tool_name="edit_file",
+                   arguments={"file_path": file_path}, result={"path": str(path)})
         return f"已编辑 {path}"
     return edit_file
 
 
-def _make_execute_tool(task_workspace: str):
+def _make_execute_tool(
+    task_workspace: str, cancel_event: Any | None = None,
+    safety_point: Callable[[], Any] | None = None,
+    permission_broker: Any | None = None,
+    run_id: str = "",
+    agent_id: str = "",
+    task_id: str = "",
+):
     from langchain.tools import tool
 
-    # 危险命令黑名单
-    DANGEROUS_COMMANDS = [
-        "rm -rf /", "rm -rf ~", "rm -rf .", "del /f", "format ",
-        "mkfs", "dd if=", "> /dev/sda", ":(){ :|:& };:", "wget ",
-        "curl -o ", "chmod 777 ", "sudo ",
-    ]
-
     @tool
-    def execute(command: str) -> str:
-        """执行 shell 命令。注意：危险命令将被拒绝。"""
-        import subprocess
-        # 危险命令检查
-        cmd_lower = command.lower().strip()
-        for dangerous in DANGEROUS_COMMANDS:
-            if cmd_lower.startswith(dangerous.lower()):
-                return f"错误: 危险命令已被安全管理器拒绝: {command[:80]}"
+    def execute(argv: list[str]) -> str:
+        """以结构化 argv 执行命令；不会经过 shell 字符串解析。"""
+        from app.multiagent.shell_policy import ShellCommandRunner
+        from app.multiagent.phase_g_store import get_agent_run_history, make_run_event_id
+        from app.multiagent.tool_runtime import ToolInvocation, ToolInvocationStatus, ToolSideEffectJournal
+        _tool_boundary(cancel_event, safety_point)
+        _tool_hook("BeforeToolUse", run_id=run_id, agent_id=agent_id,
+                   task_id=task_id, tool_name="execute", arguments={"argv": argv})
+        journal = ToolSideEffectJournal()
+        key = ToolInvocation.key_for(run_id, agent_id, task_id, "execute", {"argv": argv})
+        invocation, created = journal.begin(ToolInvocation(
+            idempotency_key=key, run_id=run_id, agent_id=agent_id,
+            task_id=task_id, tool_name="execute", arguments={"argv": argv},
+            side_effecting=True,
+        ))
+        if not created:
+            if invocation.status == ToolInvocationStatus.COMPLETED:
+                return json.dumps(invocation.result, ensure_ascii=False)
+            return f"执行被幂等日志阻止: {invocation.status.value}"
         try:
-            result = subprocess.run(
-                command, shell=True, capture_output=True, text=True,
-                cwd=task_workspace, timeout=30,
+            result = ShellCommandRunner(permission_broker=permission_broker).run(
+                argv, cwd=task_workspace, run_id=run_id, agent_id=agent_id,
+                timeout=30, cancel_token=cancel_event,
             )
-            output = result.stdout[:2000]
-            if result.stderr:
-                output += f"\nSTDERR:\n{result.stderr[:1000]}"
-            return output or "(无输出)"
-        except subprocess.TimeoutExpired:
-            return f"执行超时 (30s): {command[:80]}"
+            payload = {
+                "returncode": result.returncode, "stdout": result.stdout[:4000],
+                "stderr": result.stderr[:2000], "timed_out": result.timed_out,
+                "cancelled": result.cancelled,
+                "cancellation_phase": result.cancellation_phase,
+                "environment": result.environment,
+            }
+            _tool_hook("AfterToolUse", run_id=run_id, agent_id=agent_id,
+                       task_id=task_id, tool_name="execute",
+                       arguments={"argv": argv}, result=payload)
+            journal.complete(key, payload)
+            return json.dumps(payload, ensure_ascii=False)
         except Exception as exc:
+            journal.fail(key, str(exc), cancelled=bool(cancel_event and cancel_event.is_set()))
+            from app.multiagent.permission import PermissionRequired
+            if isinstance(exc, PermissionRequired):
+                raise
             return f"执行失败: {exc}"
     return execute
 
@@ -300,6 +433,12 @@ def _build_restricted_tools(
     allow_file_write: bool = True,
     allow_shell: bool = True,
     cancel_event: Any | None = None,
+    safety_point: Callable[[], Any] | None = None,
+    permission_broker: Any | None = None,
+    run_id: str = "",
+    agent_id: str = "",
+    task_id: str = "",
+    team_tools: list[Any] | None = None,
 ) -> list[Any]:
     """根据权限构造受限工具列表。
 
@@ -315,15 +454,25 @@ def _build_restricted_tools(
     allowed_set = set(allowed_tools)
 
     if allow_file_read and (not deny_default or "read_file" in allowed_set):
-        tools.append(_make_read_file_tool(task_workspace))
+        tools.append(_make_read_file_tool(task_workspace, cancel_event, safety_point,
+                                          run_id, agent_id, task_id))
     if allow_file_read and (not deny_default or "list_dir" in allowed_set):
-        tools.append(_make_list_dir_tool(task_workspace))
+        tools.append(_make_list_dir_tool(task_workspace, cancel_event, safety_point,
+                                         run_id, agent_id, task_id))
     if allow_file_write and (not deny_default or "create_file" in allowed_set):
-        tools.append(_make_create_file_tool(task_workspace))
+        tools.append(_make_create_file_tool(task_workspace, cancel_event, safety_point,
+                                             permission_broker, run_id, agent_id, task_id))
     if allow_file_write and (not deny_default or "edit_file" in allowed_set):
-        tools.append(_make_edit_file_tool(task_workspace))
+        tools.append(_make_edit_file_tool(task_workspace, cancel_event, safety_point,
+                                           permission_broker, run_id, agent_id, task_id))
     if allow_shell and (not deny_default or "execute" in allowed_set):
-        tools.append(_make_execute_tool(task_workspace))
+        tools.append(_make_execute_tool(
+            task_workspace, cancel_event, safety_point, permission_broker,
+            run_id, agent_id,
+            task_id,
+        ))
+
+    tools.extend(team_tools or [])
 
     return tools
 
@@ -358,6 +507,9 @@ class DeepAgentExecutor:
         # 测试 hook：设置后 execute 跳过真实 agent 创建
         self._mock_response: AgentExecutionResult | None = None
         self._mock_invoke: callable | None = None
+        # Stable teammate threads reuse the same DeepAgent graph.  This cache
+        # belongs to the executor for one run and is keyed by durable session.
+        self._session_agents: dict[str, tuple[Any, str]] = {}
 
     def set_artifact_store(self, store: Any) -> None:
         """注入 ArtifactStore，让 execute_task 生成的产物作为真实 Artifact 注册。"""
@@ -432,6 +584,11 @@ class DeepAgentExecutor:
             metadata={
                 "priority": node.priority,
                 "mailbox_messages": list(task_input.get("mailbox_messages", [])),
+                "artifact_refs": list(task_input.get("artifact_refs", [])),
+                "agent_id": task_input.get("agent_id"),
+                "session_id": task_input.get("session_id"),
+                "team_control_plane": task_input.get("team_control_plane"),
+                "worktree_mode": bool(task_input.get("worktree_mode")),
             },
         )
         context = ExecutionContext(
@@ -439,7 +596,11 @@ class DeepAgentExecutor:
             workspace_root=workspace_root,
             task_dag=task_dag,
             thread_id=task_input.get("thread_id"),
+            agent_id=task_input.get("agent_id"),
+            session_id=task_input.get("session_id"),
             cancel_event=task_input.get("cancel_event"),
+            permission_broker=task_input.get("permission_broker"),
+            safety_point=task_input.get("safety_point"),
         )
 
         result = self.execute(assignment, profile, context)
@@ -484,7 +645,11 @@ class DeepAgentExecutor:
 
         from deepagents import create_deep_agent
 
-        task_workspace = Path(context.workspace_root) / "tasks" / assignment.task_id
+        task_workspace = (
+            Path(context.workspace_root)
+            if assignment.metadata.get("worktree_mode")
+            else Path(context.workspace_root) / "tasks" / assignment.task_id
+        )
         task_workspace.mkdir(parents=True, exist_ok=True)
 
         start = time.time()
@@ -512,6 +677,12 @@ class DeepAgentExecutor:
                 allow_file_write=profile.tool_policy.allow_file_write,
                 allow_shell=profile.tool_policy.allow_shell,
                 cancel_event=context.cancel_event,
+                safety_point=context.safety_point,
+                permission_broker=context.permission_broker,
+                run_id=context.run_id,
+                agent_id=context.agent_id or "",
+                task_id=assignment.task_id,
+                team_tools=self._build_team_tools(assignment, context),
             )
 
             system_prompt = (
@@ -535,15 +706,26 @@ class DeepAgentExecutor:
                     "以下是已投递给你的任务级上下文；在不违反角色边界时应纳入执行。\n"
                     f"{directives}\n"
                 )
+            artifact_refs = assignment.metadata.get("artifact_refs", [])
+            if artifact_refs:
+                system_prompt += "\n## 已验证的上游产物\n" + "\n".join(
+                    f"- {item.get('artifact_id')}: path={item.get('path')} "
+                    f"hash={item.get('content_hash')} commit={item.get('commit_sha') or '(none)'} "
+                    f"summary={item.get('summary', '')}"
+                    for item in artifact_refs
+                ) + "\n"
 
-            agent = create_deep_agent(
-                name=f"{profile.id}:{context.thread_id or assignment.task_id}",
-                model=model,
-                tools=tools,
-                system_prompt=system_prompt,
-                checkpointer=checkpointer,
-                debug=False,
-            )
+            cache_key = context.session_id or context.thread_id or f"{context.run_id}:{assignment.task_id}"
+            cached = self._session_agents.get(cache_key)
+            if cached is not None and cached[1] == str(task_workspace):
+                agent = cached[0]
+            else:
+                agent = create_deep_agent(
+                    name=f"{profile.id}:{context.thread_id or assignment.task_id}",
+                    model=model, tools=tools, system_prompt=system_prompt,
+                    checkpointer=checkpointer, debug=False,
+                )
+                self._session_agents[cache_key] = (agent, str(task_workspace))
 
             response = agent.invoke({
                 "messages": [
@@ -564,17 +746,39 @@ class DeepAgentExecutor:
             tool_calls = _extract_tool_calls(response)
 
             ignored_parts = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".cache"}
-            produced_files = [
-                file_path for file_path in task_workspace.rglob("*")
-                if file_path.is_file() and not file_path.name.startswith(".")
-                and not any(part in ignored_parts for part in file_path.parts)
-            ]
+            if assignment.metadata.get("worktree_mode"):
+                import subprocess
+                status = subprocess.run(
+                    ["git", "-C", str(task_workspace), "status", "--porcelain"],
+                    shell=False, capture_output=True, text=True,
+                )
+                changed_paths = []
+                for line in status.stdout.splitlines():
+                    raw = line[3:].strip()
+                    if " -> " in raw:
+                        raw = raw.split(" -> ", 1)[1]
+                    candidate = _safe_workspace_path(str(task_workspace), raw)
+                    if candidate.is_file():
+                        changed_paths.append(candidate)
+                produced_files = changed_paths
+            else:
+                produced_files = [
+                    file_path for file_path in task_workspace.rglob("*")
+                    if file_path.is_file() and not file_path.name.startswith(".")
+                    and not any(part in ignored_parts for part in file_path.parts)
+                ]
             produced_artifact_ids = []
             # 移除"兼容回退"伪 ID：所有 artifact ID 必须来自真实 ArtifactStore.create
             if self._artifact_store is not None and context.run_id:
                 try:
                     for file_path in produced_files:
-                        relative_path = file_path.relative_to(Path(context.workspace_root)).as_posix()
+                        if assignment.metadata.get("worktree_mode"):
+                            relative_path = (
+                                Path("artifacts") / assignment.task_id /
+                                file_path.relative_to(task_workspace)
+                            ).as_posix()
+                        else:
+                            relative_path = file_path.relative_to(Path(context.workspace_root)).as_posix()
                         artifact = self._artifact_store.create(
                             run_id=context.run_id,
                             task_id=assignment.task_id,
@@ -615,6 +819,15 @@ class DeepAgentExecutor:
                 error=str(exc),
                 execution_time=elapsed,
             )
+
+    @staticmethod
+    def _build_team_tools(assignment: TaskAssignment, context: ExecutionContext) -> list[Any]:
+        control_plane = assignment.metadata.get("team_control_plane")
+        if control_plane is None or not context.agent_id:
+            return []
+        from app.multiagent.control_plane import build_team_tools
+        return build_team_tools(control_plane, context.run_id, context.agent_id,
+                                context.safety_point)
 
     @staticmethod
     def _infer_artifact_type(filename: str) -> str:
@@ -681,38 +894,6 @@ def create_executor(profile: AgentProfile) -> AgentExecutor:
     if is_decision_only:
         return ModelDecisionExecutor()
     return DeepAgentExecutor()
-
-
-# ===== 辅助函数（DeepAgentExecutor.execute_task 兜底用） =====
-
-
-def _fallback_coder_profile() -> AgentProfile:
-    """当 CapabilityRegistry 找不到匹配 worker 时返回的默认 coder profile。
-
-    避免在没人注册过 profile 的情况下 scheduler 路径空指针。
-    拥有 file_read + file_write + create_file + edit_file + execute 五件套，
-    覆盖典型编码任务所需工具。
-    """
-    from app.multiagent.agent_profile import (
-        AgentProfile, ToolPolicy, ModelPolicy,
-    )
-
-    return AgentProfile(
-        id="default_coder",
-        name="DefaultCoder",
-        role="coder",
-        description="默认 Coder profile（CapabilityRegistry 未匹配时的兜底）",
-        capabilities={"coding", "file_write", "file_read", "testing"},
-        tool_policy=ToolPolicy(
-            allowed_tools=["read_file", "list_dir",
-                           "create_file", "edit_file", "execute"],
-            deny_all_by_default=False,
-            allow_file_read=True,
-            allow_file_write=True,
-            allow_shell=True,
-        ),
-        model_policy=ModelPolicy(model_name="deepseek-chat"),
-    )
 
 
 def _default_workspace_root() -> str:

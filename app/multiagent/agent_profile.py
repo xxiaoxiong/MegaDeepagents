@@ -208,19 +208,18 @@ class CapabilityRegistry:
         scored.sort(key=lambda x: (-x[0], x[1].id))
         return scored[0][1]
 
-    def select_profile(self, required_capabilities) -> "AgentProfile":
+    def select_profile(self, required_capabilities) -> "AgentProfile | None":
         """从必需能力选一个匹配 Worker。
 
-        与 find_best_worker 区别：找不到时返回 default coder profile 而非 None，
-        让 Scheduler 路径始终能拿到一个执行器（避免无声空指针）。
+        This compatibility alias is deliberately fail-closed.  A missing
+        capability must be handled by DynamicTeamManager or a replan; it must
+        never become an implicit high-privilege DefaultCoder assignment.
         """
         caps = set(required_capabilities or [])
         best = self.find_best_worker(caps)
         if best is not None:
             return best
-        # 兜底：返回 default coder profile
-        from app.multiagent.executor import _fallback_coder_profile
-        return _fallback_coder_profile()
+        return None
 
     def score_worker(
         self,

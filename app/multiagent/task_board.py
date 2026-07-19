@@ -11,6 +11,7 @@ Phase D：所有 Agent 通过原子认领抢占任务。
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from enum import Enum
 from typing import Any
@@ -135,6 +136,58 @@ class TaskBoard:
             task = self.get(task_id, run_id=run_id)
             if task is None:
                 return ClaimResult(success=False, reason="task_not_found")
+            if self._persist_enabled:
+                # BEGIN IMMEDIATE serializes claimers across threads and
+                # processes.  The database row, not a stale in-memory copy,
+                # decides the winner.
+                from app.multiagent.store import _get_conn
+                conn = _get_conn()
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    row = conn.execute(
+                        "SELECT payload FROM task_board_tasks WHERE run_id=? AND task_id=?",
+                        (task.run_id, task_id),
+                    ).fetchone()
+                    if row is None:
+                        conn.rollback()
+                        return ClaimResult(success=False, reason="task_not_found")
+                    task = BoardTask.model_validate(json.loads(row["payload"]))
+                    if task.status != BoardTaskStatus.PENDING:
+                        conn.rollback()
+                        return ClaimResult(
+                            success=False, task=task,
+                            reason=f"task_not_pending({task.status.value})",
+                        )
+                    for dep_id in task.dependencies:
+                        dep_row = conn.execute(
+                            "SELECT payload FROM task_board_tasks WHERE run_id=? AND task_id=?",
+                            (task.run_id, dep_id),
+                        ).fetchone()
+                        dep = (BoardTask.model_validate(json.loads(dep_row["payload"]))
+                               if dep_row else None)
+                        if dep is None or dep.status != BoardTaskStatus.SUCCEEDED:
+                            conn.rollback()
+                            return ClaimResult(
+                                success=False, task=task,
+                                reason=f"dependency_{dep_id}_not_succeeded",
+                            )
+                    task.status = BoardTaskStatus.CLAIMED
+                    task.claimed_by = agent_id
+                    task.claimed_at = datetime.utcnow()
+                    task.updated_at = datetime.utcnow()
+                    conn.execute(
+                        "UPDATE task_board_tasks SET payload=?, updated_at=? "
+                        "WHERE run_id=? AND task_id=?",
+                        (json.dumps(task.model_dump(mode="json")),
+                         task.updated_at.isoformat(), task.run_id, task.task_id),
+                    )
+                    conn.commit()
+                    self._tasks[(task.run_id, task.task_id)] = task
+                    logger.info("[TaskBoard] claimed task=%s agent=%s", task_id, agent_id)
+                    return ClaimResult(success=True, task=task)
+                except Exception:
+                    conn.rollback()
+                    raise
             if task.status != BoardTaskStatus.PENDING:
                 return ClaimResult(
                     success=False,
@@ -414,13 +467,6 @@ class TaskBoard:
                 and bool(t.metadata.get("superseded_by_repair"))
             )
             for t in tasks
-        )
-
-    def all_produced(self, run_id: str) -> bool:
-        tasks = self.list_by_run(run_id)
-        return bool(tasks) and all(
-            task.status in (BoardTaskStatus.PRODUCED, BoardTaskStatus.SUCCEEDED)
-            for task in tasks
         )
 
     def summary(self, run_id: str) -> dict[str, int]:

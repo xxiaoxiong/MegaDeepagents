@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import tempfile
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -68,6 +69,7 @@ class Artifact:
     size_bytes: int
     version: int                     # 版本号，从 1 开始；fix 后产生新 version
     produced_by: str                # Agent 名
+    commit_sha: str | None = None
     status: ArtifactStatus = ArtifactStatus.DRAFT
     created_at: datetime = field(default_factory=datetime.utcnow)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -85,6 +87,7 @@ class Artifact:
             "size_bytes": self.size_bytes,
             "version": self.version,
             "produced_by": self.produced_by,
+            "commit_sha": self.commit_sha,
             "status": self.status.value,
             "created_at": self.created_at.isoformat(),
             "metadata": dict(self.metadata),
@@ -104,6 +107,7 @@ class Artifact:
             size_bytes=int(d["size_bytes"]),
             version=int(d.get("version", 1)),
             produced_by=d["produced_by"],
+            commit_sha=d.get("commit_sha") or (d.get("metadata") or {}).get("commit_sha"),
             status=ArtifactStatus(d.get("status", "draft")),
             created_at=datetime.fromisoformat(d["created_at"]) if d.get("created_at") else datetime.utcnow(),
             metadata=dict(d.get("metadata", {})),
@@ -303,6 +307,7 @@ class ArtifactStore:
                     size_bytes=int(r.get("size_bytes", 0)),
                     version=int(r.get("version", 1)),
                     produced_by=r.get("produced_by", ""),
+                    commit_sha=(r.get("metadata") or {}).get("commit_sha") if isinstance(r.get("metadata"), dict) else None,
                     status=ArtifactStatus(r.get("status", "published")),
                     created_at=datetime.fromisoformat(r["created_at"]) if isinstance(r.get("created_at"), str) else datetime.utcnow(),
                     metadata=dict(r.get("metadata", {}) if isinstance(r.get("metadata"), dict) else {}),
@@ -326,12 +331,19 @@ class ArtifactStore:
             return
         abs_path = self._safe_path(artifact.path)
         abs_path.parent.mkdir(parents=True, exist_ok=True)
-        if isinstance(content, str):
-            with abs_path.open("w", encoding="utf-8") as f:
-                f.write(content)
-        else:
-            with abs_path.open("wb") as f:
-                f.write(content)
+        fd, temp_name = tempfile.mkstemp(prefix=f".{abs_path.name}.", suffix=".tmp",
+                                         dir=abs_path.parent)
+        try:
+            mode = "w" if isinstance(content, str) else "wb"
+            kwargs = {"encoding": "utf-8"} if isinstance(content, str) else {}
+            with os.fdopen(fd, mode, **kwargs) as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, abs_path)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
 
     def _safe_path(self, relative_path: str) -> Path:
         """Resolve an artifact path under the run root, rejecting escapes."""
@@ -406,6 +418,7 @@ class ArtifactStore:
         if a is None:
             return False
         a.status = ArtifactStatus.VERIFIED
+        self._persist_status(a)
         return True
 
     def mark_rejected(self, artifact_id: str) -> bool:
@@ -413,6 +426,7 @@ class ArtifactStore:
         if a is None:
             return False
         a.status = ArtifactStatus.REJECTED
+        self._persist_status(a)
         return True
 
     def supersede(self, artifact_id: str) -> bool:
@@ -420,12 +434,60 @@ class ArtifactStore:
         if a is None:
             return False
         a.status = ArtifactStatus.SUPERSEDED
+        self._persist_status(a)
         return True
+
+    def bind_commit(self, artifact_ids: list[str], commit_sha: str) -> int:
+        """Bind produced evidence to the immutable coding commit."""
+        changed = 0
+        for artifact_id in artifact_ids:
+            artifact = self._registry.get(artifact_id)
+            if artifact is None:
+                continue
+            artifact.commit_sha = commit_sha
+            artifact.metadata["commit_sha"] = commit_sha
+            self._persist_status(artifact)
+            changed += 1
+        return changed
+
+    @staticmethod
+    def _persist_status(artifact: Artifact) -> None:
+        try:
+            from app.multiagent.store import _get_conn
+            import json
+            _get_conn().execute(
+                "UPDATE artifacts SET status=?, metadata=? WHERE artifact_id=?",
+                (artifact.status.value, json.dumps(artifact.metadata), artifact.id),
+            )
+            _get_conn().commit()
+        except Exception as exc:
+            logger.warning("[ArtifactStore] persist status failed artifact=%s: %s", artifact.id, exc)
 
     # ---- 跨 Run 隔离 ----
     def is_in_run(self, artifact_id: str, run_id: str) -> bool:
         a = self._registry.get(artifact_id)
         return a is not None and a.run_id == run_id
+
+    def lineage(self, artifact_id: str) -> list[Artifact]:
+        """Return oldest-to-newest predecessor/repair lineage."""
+        current = self._registry.get(artifact_id)
+        if current is None:
+            return []
+        chain: list[Artifact] = []
+        seen: set[str] = set()
+        while current and current.id not in seen:
+            seen.add(current.id)
+            chain.append(current)
+            previous_id = current.predecessor_id or current.parent_artifact_id
+            current = self._registry.get(previous_id) if previous_id else None
+        chain.reverse()
+        descendants = sorted(
+            (item for item in self._registry.values()
+             if item.predecessor_id == artifact_id or item.parent_artifact_id == artifact_id),
+            key=lambda item: (item.version, item.created_at),
+        )
+        chain.extend(item for item in descendants if item.id not in seen)
+        return chain
 
     @property
     def root_path(self) -> str | None:

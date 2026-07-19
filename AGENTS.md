@@ -2,14 +2,23 @@
 
 本文档面向 AI 编程助手，用于持续维护本项目。覆盖项目定位、目录结构、运行方式、数据流、维护陷阱和标准修复流程。
 
+> **TASK_TEAM v2 权威说明**：多 Agent 生产路径是
+> `TeamRuntimeFacade → SimpleOrchestrator → TransactionalTaskService → ParallelTeamScheduler → TeammateSession → DeepAgentExecutor → Verifier/GitIntegrationManager`。
+> `DISCUSSION/TeamRunner/runtime_adapter/Action JSON` 是 Legacy 兼容路径。下文仍有旧模块维护资料，
+> 不能把它理解为默认架构；新权限、工具、Artifact、worktree、恢复和动态团队功能只能加入
+> TASK_TEAM。完整事实边界见 `docs/Agent_Team_Parity_Audit.md`。
+
 ## 1. 项目定位
 
 本项目是 **DeepAgents + LangGraph** 风格的自主任务型智能体底座，包含**两条 Agent 执行路径**：
 
 - **单 Agent 路径**：`CLI / API → TaskService → TaskRunner → DeepAgents create_deep_agent`
   - 状态：`TaskAgentState(DeepAgentState)` + SqliteSaver 检查点 + HITL 审批
-- **多 Agent 路径**：`CLI team / API /team-tasks → TeamRunner → MessageBus + SpeakerSelector + ActionGuard + ReviewRepairLoop + ConflictResolver`
-  - 状态：`SharedTeamState`（10 种 phase），7 张 SQLite 表全量持久化
+- **多 Agent 生产路径**：`CLI/API → TeamRuntimeFacade(TASK_TEAM) → ParallelTeamScheduler → stable TeammateSession → DeepAgentExecutor`
+  - 计划：版本化 `TaskGraph`；运行权威：SQLite `TaskBoard`
+  - Worker 只能 produced，Verifier 决定 succeeded；编码 Agent 使用独立 Git worktree
+- **多 Agent Legacy 路径**：显式 `DISCUSSION → TeamRunner → MessageBus/SpeakerSelector/ActionGuard`
+  - 状态：`SharedTeamState`；只保留兼容和历史测试，不再扩展
 
 **已实现**：SQLite 持久化、SSE 事件流（团队）、HITL 审批、MCP 工具集成（无配置未启用）、Harness Profiles、沙箱隔离、结构化输出、LangSmith 全链路 trace 埋点（T1–T8 已落地）。
 

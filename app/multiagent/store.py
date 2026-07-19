@@ -334,7 +334,11 @@ def _ensure_schema_version(conn) -> None:
     cur = conn.execute("SELECT MAX(version) FROM schema_version")
     row = cur.fetchone()
     current_version = row[0] if row and row[0] else 0
-    target_version = 3  # v3: 增加 mailbox_messages 表
+    # v4 introduces the TASK_TEAM v2 durable runtime.  Feature modules create
+    # their additive tables lazily (sessions/queues, graph mutations/outbox,
+    # permissions/plans, worktree leases/merge queue and tool journals), so
+    # existing databases need no destructive rewrite.
+    target_version = 4
     if current_version < target_version:
         conn.execute(
             "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)",

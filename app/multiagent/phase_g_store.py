@@ -334,20 +334,39 @@ class AgentRunHistory:
         timestamp: datetime | None = None,
         payload: dict[str, Any] | None = None,
     ) -> None:
-        self.conn.execute(
-            """
-            INSERT INTO team_events (
-                event_id, run_id, event_type, agent_id, task_id, task_run_id,
-                timestamp, trace_id, payload
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                event_id, run_id, event_type, agent_id, task_id, task_run_id,
-                (timestamp or datetime.utcnow()).isoformat(),
-                trace_id, json.dumps(payload or {}),
-            ),
+        occurred_at = (timestamp or datetime.utcnow()).isoformat()
+        conn = self.conn
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS event_envelopes (
+                event_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, agent_id TEXT,
+                task_id TEXT, event_type TEXT NOT NULL, sequence INTEGER NOT NULL,
+                timestamp TEXT NOT NULL, payload TEXT NOT NULL, trace_id TEXT,
+                UNIQUE(run_id, sequence)
+            )"""
         )
-        self.conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                """INSERT INTO team_events (
+                    event_id, run_id, event_type, agent_id, task_id, task_run_id,
+                    timestamp, trace_id, payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (event_id, run_id, event_type, agent_id, task_id, task_run_id,
+                 occurred_at, trace_id, json.dumps(payload or {})),
+            )
+            sequence = int(conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM event_envelopes WHERE run_id=?",
+                (run_id,),
+            ).fetchone()["seq"])
+            conn.execute(
+                "INSERT INTO event_envelopes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (event_id, run_id, agent_id, task_id, event_type, sequence,
+                 occurred_at, json.dumps(payload or {}), trace_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     def list_events(self, run_id: str, event_type: str | None = None) -> list[dict[str, Any]]:
         sql = "SELECT * FROM team_events WHERE run_id = ?"
@@ -358,6 +377,30 @@ class AgentRunHistory:
         sql += " ORDER BY timestamp ASC"
         rows = self.conn.execute(sql, params).fetchall()
         return [_row_to_dict(r) for r in rows]
+
+    def list_event_envelopes(self, run_id: str, after_sequence: int = 0,
+                             limit: int = 500) -> list[dict[str, Any]]:
+        self.conn.execute(
+            """CREATE TABLE IF NOT EXISTS event_envelopes (
+                event_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, agent_id TEXT,
+                task_id TEXT, event_type TEXT NOT NULL, sequence INTEGER NOT NULL,
+                timestamp TEXT NOT NULL, payload TEXT NOT NULL, trace_id TEXT,
+                UNIQUE(run_id, sequence)
+            )"""
+        )
+        rows = self.conn.execute(
+            "SELECT * FROM event_envelopes WHERE run_id=? AND sequence>? "
+            "ORDER BY sequence LIMIT ?", (run_id, after_sequence, min(limit, 2000)),
+        ).fetchall()
+        result = [_row_to_dict(row) for row in rows]
+        for item in result:
+            if isinstance(item.get("payload"), dict):
+                continue
+            try:
+                item["payload"] = json.loads(item.get("payload") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                item["payload"] = {"corrupt_payload": True}
+        return result
 
     # ===== Permission Requests =====
 

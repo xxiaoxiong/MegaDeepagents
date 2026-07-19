@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sys
 
 import pytest
 
@@ -13,6 +14,7 @@ from app.multiagent.verifier import (
     ValidationResult,
     CriterionFailure,
     EvidenceRef,
+    VerificationCommand,
 )
 
 
@@ -104,15 +106,14 @@ def test_llm_rubric_fallback_no_artifacts():
 
 
 def test_llm_rubric_fallback_with_artifacts():
-    """LLM 不可用 + 有产物 → REPAIR/PASS（带规则评分）。"""
+    """LLM 不可用时，非空产物也不能冒充语义验收通过。"""
     v = LLMRubricVerifier(model_available=False)
     artifacts = {
         "/tmp/a.py": {"content": "print(1)"},
         "/tmp/b.py": {"content": "x = 2"},
     }
     result = v.verify("build code", artifacts)
-    # 全部产物非空 → PASS（fallback 规则）
-    assert result.verdict == Verdict.PASS
+    assert result.verdict == Verdict.REPAIR
     assert result.scores["completeness"] == 1.0
 
 
@@ -124,23 +125,32 @@ def test_llm_rubric_fallback_empty_artifact():
     }
     result = v.verify("build code", artifacts)
     assert result.verdict == Verdict.REPAIR
-    assert len(result.failed_criteria) == 1
+    assert len(result.failed_criteria) >= 2
 
 
 # ===== Verifier 顶层 =====
 
 
 def test_verifier_pass_when_all_clean(tmp_path):
-    """文件存在 + LLM rubric 通过 → PASS。"""
+    """文件存在 + 真实命令证据通过 → PASS。"""
     f1 = tmp_path / "x.py"
     f1.write_text("print(1)")
     verifier = Verifier(
-        llm_rubric=LLMRubricVerifier(model_available=False),  # 用 fallback
+        llm_rubric=LLMRubricVerifier(model_available=False),
     )
     result = verifier.validate(
         goal="做 X",
         artifacts={str(f1): {"content": "print(1)"}},
-        checks={"files": [str(f1)]},
+        checks={
+            "files": [str(f1)],
+            "commands": [
+                VerificationCommand(
+                    kind="test",
+                    argv=[sys.executable, "-c", "print('verified')"],
+                    cwd=str(tmp_path),
+                )
+            ],
+        },
     )
     assert result.verdict == Verdict.PASS
 
