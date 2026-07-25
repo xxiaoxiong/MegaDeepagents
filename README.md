@@ -1,10 +1,15 @@
 # MegaDeepagents V3
 
+[Project website](https://megadeepagents.vercel.app) ·
+[Architecture](docs/architecture.md) ·
+[API](docs/api.md) ·
+[Deployment](docs/deployment.md)
+
 MegaDeepagents 是一个单机优先、可恢复、可观测、受治理的多智能体任务运行平台。浏览器、
 API 与 CLI 的新请求进入同一套 LangGraph Root Graph；DeepAgents 只负责 Worker
 Agent Loop，任务的最终成功由控制面和 Verifier 判定。
 
-![MegaDeepagents runtime](frontend/public/megadeepagents-og.png)
+![MegaDeepagents — One runtime. Accountable agent teams.](website/public/og.png)
 
 ## V3 主链
 
@@ -103,9 +108,9 @@ npm --prefix frontend run build
 
 ## 部署边界
 
-Vercel 配置仅发布 Vue 静态控制台。Python Worker、长时 LangGraph、SQLite 和本地
-worktree 需要持久容器或虚拟机，不能安全运行在 Vercel 无状态函数中。先用 Docker
-部署后端，再把其 HTTPS 地址配置为 Vercel 的 `VITE_API_BASE_URL`。
+Vercel 只发布 `website/` 中的中英文项目介绍站，不承载运行控制台、Python Worker、
+LangGraph、SQLite 或本地 worktree。自托管 Docker 镜像同时提供持久后端与
+`frontend/` 运行控制台；两者属于不同部署面。
 
 详见：
 
