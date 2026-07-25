@@ -30,7 +30,7 @@ def test_cancelling_an_active_task_never_verifies_it_as_succeeded():
             assert task_input["cancel_event"].wait(timeout=2)
             # A late worker response is intentionally successful; the runtime
             # must still preserve cancellation rather than accepting it.
-            from app.multiagent.scheduler import TaskResult
+            from app.domain.tasks.models import TaskExecutionResult as TaskResult
             return TaskResult(task_id=task_id, success=True)
 
     scheduler = ParallelTeamScheduler("run_cancel_active", task_graph=graph, max_rounds=3, cancel_event=cancelled)
@@ -97,7 +97,7 @@ def test_facade_controls_the_same_teammate_lifecycle_as_scheduler_registry(tmp_p
 
 def test_cold_cancel_cancels_persisted_board_before_a_future_resume(tmp_path):
     """A non-resident API runtime cannot leave pending durable work alive."""
-    from app.multiagent.phase_g_store import get_agent_run_history
+    from app.infrastructure.database.run_store import get_agent_run_history
     from app.multiagent.task_board import get_task_board, reset_task_board, BoardTaskStatus
     from app.multiagent.team_runtime import TeamRuntimeFacade
 
@@ -149,7 +149,7 @@ def test_stopping_one_active_agent_releases_work_for_another_teammate():
             if task_input["agent_id"] == first.agent_id:
                 first_started.set()
                 assert task_input["cancel_event"].wait(timeout=2)
-            from app.multiagent.scheduler import TaskResult
+            from app.domain.tasks.models import TaskExecutionResult as TaskResult
             return TaskResult(task_id=task_id, success=True)
 
     scheduler = ParallelTeamScheduler("run_stop_agent", task_graph=graph, max_rounds=4)

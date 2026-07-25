@@ -2,30 +2,27 @@
 
 import hashlib
 import json
-import sqlite3
-import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from app.core.config import settings
 from app.core.logging import logger
+from app.infrastructure.database.connection import get_connection as get_database_connection
 
 
-_local = threading.local()
+_initialized_connection_ids: set[int] = set()
 
 
-def get_connection() -> sqlite3.Connection:
-    if not hasattr(_local, "conn") or _local.conn is None:
-        db_path = Path(settings.sqlite_path)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        _local.conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        _local.conn.row_factory = sqlite3.Row
-        _init_db(_local.conn)
-    return _local.conn
+def get_connection():
+    connection = get_database_connection()
+    connection_id = id(connection)
+    if connection_id not in _initialized_connection_ids:
+        _init_db(connection)
+        _initialized_connection_ids.add(connection_id)
+    return connection
 
 
-def _init_db(conn: sqlite3.Connection) -> None:
+def _init_db(conn) -> None:
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS skills (
             id TEXT PRIMARY KEY,

@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 from pydantic import BaseModel, Field
 
-from app.multiagent.phase_g_store import get_agent_run_history, make_run_event_id
+from app.infrastructure.database.run_store import get_agent_run_history, make_run_event_id
 
 
 class LifecycleEvent(str, Enum):

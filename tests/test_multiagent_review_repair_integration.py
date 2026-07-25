@@ -52,7 +52,7 @@ class _ScriptedAdapter(AgentRuntimeAdapter):
 def test_review_repair_full_cycle(tmp_path):
     """ReviewRepair 完整闭环：Coder→Reviewer(拒)→Critique→Coder(修)→Reviewer(通)→收尾。
 
-    这是 upgradePhaseOne.md Test req 4 要求的确定性 Fake Model 测试。
+    这是 review/repair 门禁要求的确定性测试模型。
     """
     store = _make_store(tmp_path)
     team_spec = SOFTWARE_DEV_TEAM

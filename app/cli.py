@@ -39,12 +39,10 @@ def run_team(
     max_rounds: int = Option(10, "--max-rounds", "-m", help="最大轮次"),
     review_required: bool = Option(True, "--review/--no-review", help="是否需要评审"),
     workspace: str = Option("", "--workspace", "-w", help="产出文件目录（默认 runtime/workspaces/）"),
-    legacy: bool = Option(False, "--legacy", help="使用旧 TeamRunner DISCUSSION 模式（不走 TASK_TEAM 主链）"),
 ):
     """运行多 Agent 团队任务。
 
-    默认走统一 TeamRuntimeFacade（TASK_TEAM：TaskGraph + DeepAgentExecutor + 真实验证）。
-    加 --legacy 回退 DISCUSSION 模式（旧 TeamRunner 轮替发言）。
+    所有新运行走统一 V3 Root Graph 与受治理的 DeepAgents Worker。
     """
     import asyncio
     import uuid
@@ -56,7 +54,7 @@ def run_team(
     from app.multiagent.team_run_context import TeamRunMode
 
     init_observability(component="cli")
-    mode = TeamRunMode.DISCUSSION if legacy else TeamRunMode.TASK_TEAM
+    mode = TeamRunMode.TASK_TEAM
 
     runtime = get_team_runtime()
     base = workspace or os.path.join(os.getcwd(), "runtime", "workspaces")
@@ -74,7 +72,7 @@ def run_team(
         )
         return ctx, result
 
-    with console.status(f"[bold green]{'Legacy' if legacy else 'TASK_TEAM'} run starting..."):
+    with console.status("[bold green]V3 run starting..."):
         ctx, result = asyncio.run(_go())
 
     console.print(f"[bold]Run ID:[/bold] {ctx.run_id}")

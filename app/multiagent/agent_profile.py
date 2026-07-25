@@ -1,6 +1,6 @@
 """AgentProfile + CapabilityRegistry：Worker 能力隔离与动态团队选择。
 
-requirements（docs/upgradePhaseTwo.md 四、七）：
+V3 capability requirements：
 
 AgentProfile:
 - 独立模型：worker 身份、能力集、各项 policy

@@ -2,7 +2,7 @@
 
 设计原则：
 - 真正的模型定义分布在 messages.py / state.py / agent_spec.py 中，按职责分文件
-- 这里仅作为聚合导出，对应 updatePlan.md 中 models.py 的要求
+- 这里仅作为 Legacy 兼容聚合导出；V3 新契约位于 app/domain
 """
 
 from app.multiagent.messages import (

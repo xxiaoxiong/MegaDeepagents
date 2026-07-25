@@ -1,4 +1,4 @@
-"""ComplexityRouter 单元测试（docs/upgradePhaseTwo.md §十三）。"""
+"""ComplexityRouter 单元测试。"""
 from __future__ import annotations
 
 import pytest

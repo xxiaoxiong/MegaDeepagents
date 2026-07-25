@@ -38,7 +38,7 @@ def test_mailbox_message_is_injected_into_the_target_workers_assignment():
 
         def execute_task(self, _dag, _task_id, task_input):
             self.messages = task_input.get("mailbox_messages", [])
-            from app.multiagent.scheduler import TaskResult
+            from app.domain.tasks.models import TaskExecutionResult as TaskResult
             return TaskResult(task_id="write", success=True)
 
     scheduler = ParallelTeamScheduler("run_message", task_graph=graph, max_rounds=2)
@@ -47,51 +47,6 @@ def test_mailbox_message_is_injected_into_the_target_workers_assignment():
     executor = AssignmentRecordingExecutor()
     assert asyncio.run(scheduler.run(executor)).status == "completed"
     assert [message["content"] for message in executor.messages] == ["Use Python 3.12 typing."]
-
-
-def test_task_team_verifier_repair_creates_and_executes_repair_task(tmp_path):
-    """A verifier repair verdict must create work, not terminate as completed."""
-    from app.multiagent.orchestrator import SimpleOrchestrator
-    from app.multiagent.scheduler import TaskResult
-    from app.multiagent.task_graph import TaskGraph, TaskNode
-    from app.multiagent.team_run_context import TeamRunContext
-    from app.multiagent.task_board import get_task_board
-    from app.multiagent.verifier import ValidationResult, Verdict
-    from app.multiagent.artifact import ArtifactStore
-
-    store = ArtifactStore(root_path=str(tmp_path / "run"))
-
-    class RepairThenPassVerifier:
-        def __init__(self):
-            self.calls = 0
-            self.artifact_store = store
-
-        def validate(self, **_kwargs):
-            self.calls += 1
-            return ValidationResult(verdict=Verdict.REPAIR if self.calls == 1 else Verdict.PASS)
-
-    class SuccessfulWorker:
-        def execute_task(self, _dag, task_id, task_input):
-            artifact_ids = []
-            if "__repair_v" in task_id:
-                artifact = store.create(
-                    run_id=task_input["run_id"], task_id=task_id, type="patch",
-                    relative_path=f"tasks/{task_id}/repair.py", content="fixed = True\n",
-                    produced_by="Coder",
-                )
-                artifact_ids.append(artifact.id)
-            return TaskResult(task_id=task_id, success=True, artifact_ids=artifact_ids)
-
-    graph = TaskGraph(root_task_id="implement")
-    graph.add_node(TaskNode(id="implement", title="implement", objective="write feature", required_capabilities=["coding"]))
-    ctx = TeamRunContext.create("write feature", workspace_root=str(tmp_path / "run"))
-    result = SimpleOrchestrator(
-        executor=SuccessfulWorker(), verifier=RepairThenPassVerifier(), ctx=ctx, max_repair_rounds=2,
-    ).run("write feature", mode_override="full_multi", task_graph=graph)
-
-    assert result.status == "completed"
-    tasks = get_task_board().list_by_run(ctx.run_id)
-    assert any("__repair_v" in task.task_id and task.status.value == "succeeded" for task in tasks)
 
 
 def test_task_board_restores_and_requeues_interrupted_work_after_singleton_reset():
@@ -117,7 +72,7 @@ def test_task_board_restores_and_requeues_interrupted_work_after_singleton_reset
 
 
 def test_resume_restores_stable_agent_identity_and_rehydrates_task_board():
-    from app.multiagent.phase_g_store import get_agent_run_history
+    from app.infrastructure.database.run_store import get_agent_run_history
     from app.multiagent.resume_coordinator import ResumeCoordinator
     from app.multiagent.agent_registry import get_agent_registry, reset_agent_registry
     from app.multiagent.task_board import get_task_board, reset_task_board, BoardTaskStatus
@@ -147,7 +102,7 @@ def test_resume_restores_stable_agent_identity_and_rehydrates_task_board():
 
 def test_facade_cold_resume_reconstructs_context_and_continues_execution(monkeypatch, tmp_path):
     """Resume is not successful until it schedules the persisted run again."""
-    from app.multiagent.phase_g_store import get_agent_run_history
+    from app.infrastructure.database.run_store import get_agent_run_history
     from app.multiagent.team_runtime import TeamRuntimeFacade
     from app.multiagent.team_run_context import TeamRunMode
 
@@ -174,7 +129,7 @@ def test_facade_cold_resume_reconstructs_context_and_continues_execution(monkeyp
 
 def test_resume_restores_full_task_graph_not_only_board_projection(tmp_path):
     """A restart must retain contracts and graph version needed by verification."""
-    from app.multiagent.phase_g_store import get_agent_run_history
+    from app.infrastructure.database.run_store import get_agent_run_history
     from app.multiagent.team_runtime import TeamRuntimeFacade
     from app.multiagent.task_graph import OutputContract, TaskGraph, TaskNode
 
@@ -205,7 +160,7 @@ def test_resume_rehydrates_unconsumed_mailbox_messages_after_process_restart():
     """A wake-up message sent before a restart must reach the restored teammate."""
     from app.multiagent.agent_registry import reset_agent_registry
     from app.multiagent.mailbox import MailboxMessage, get_mailbox, reset_mailbox
-    from app.multiagent.phase_g_store import get_agent_run_history
+    from app.infrastructure.database.run_store import get_agent_run_history
     from app.multiagent.resume_coordinator import ResumeCoordinator
     from app.multiagent.task_board import reset_task_board
 
@@ -234,7 +189,7 @@ def test_resume_rehydrates_unconsumed_mailbox_messages_after_process_restart():
 def test_agent_registry_persists_each_lease_transition_without_team_builder():
     """A claim is durable even when it was made by the scheduler, not TeamBuilder."""
     from app.multiagent.agent_registry import AgentRegistry
-    from app.multiagent.phase_g_store import get_agent_run_history
+    from app.infrastructure.database.run_store import get_agent_run_history
 
     registry = AgentRegistry()
     agent = registry.create_agent(

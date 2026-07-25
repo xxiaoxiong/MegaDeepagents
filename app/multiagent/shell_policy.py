@@ -74,9 +74,13 @@ class ShellPolicyEngine:
         if not argv:
             return CommandCategory.UNKNOWN
         executable = Path(argv[0]).name.lower()
-        if executable in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
+        # Windows resolves Python and other build tools through ``*.exe``.
+        # Classify the basename consistently whether callers pass ``python``
+        # or an absolute interpreter path such as ``C:\...\python.exe``.
+        executable = executable.removesuffix(".exe")
+        if executable in {"powershell", "pwsh"}:
             return self._classify_powershell(argv)
-        if executable in {"cmd", "cmd.exe"}:
+        if executable == "cmd":
             return self._classify_cmd(argv)
         if executable in self.PRIVILEGE:
             return CommandCategory.PRIVILEGE_ESCALATION
@@ -193,6 +197,16 @@ class ShellCommandRunner:
                                cancellation_phase="cancelled_before_tool")
 
         start = time.monotonic()
+        if os.name == "nt" and Path(argv[0]).name.lower() == "echo":
+            # ``echo`` is a cmd.exe built-in on Windows.  Handling it here
+            # preserves argv semantics without introducing a shell parser.
+            return ShellResult(
+                argv=argv,
+                returncode=0,
+                stdout=" ".join(argv[1:]) + "\n",
+                duration_seconds=time.monotonic() - start,
+                environment={"platform": os.name, "cwd": str(root)},
+            )
         creationflags = 0
         popen_kwargs: dict[str, Any] = {}
         if os.name == "nt":
@@ -235,7 +249,10 @@ class ShellCommandRunner:
     def _terminate_tree(process: subprocess.Popen[Any]) -> None:
         try:
             if os.name == "nt":
-                process.send_signal(getattr(signal, "CTRL_BREAK_EVENT", signal.SIGTERM))
+                # CTRL_BREAK_EVENT is delivered to the whole console group and
+                # can interrupt the host test/API process.  Terminate the child
+                # directly, then escalate to kill below if it does not exit.
+                process.terminate()
             else:
                 os.killpg(process.pid, signal.SIGTERM)
             process.wait(timeout=1.5)

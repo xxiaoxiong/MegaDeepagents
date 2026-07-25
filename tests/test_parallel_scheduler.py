@@ -1,6 +1,6 @@
 """并行调度器测试 + 端到端并行验证。
 
-验证点（docs/MegaDeepagents_Agent_Teams_改造任务书.md §25.2）：
+验证点：
 - 20 个协程同时认领同一个 Task 时只能一个成功
 - 两个独立 Task 各休眠 2 秒，总耗时接近 2 秒而非 4 秒
 - 同一 Profile max_concurrency=1 时两个任务不得同时执行

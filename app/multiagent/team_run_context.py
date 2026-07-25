@@ -1,6 +1,6 @@
 """TeamRunContext — 全链路统一 Run 上下文。
 
-docs/MegaDeepagents_Agent_Teams_改造任务书.md §7：
+V3 durable Run context：
 - 从 CLI/API 入口创建一次。
 - 全链路显式传递。
 - 禁止中间组件使用 `cli_run`、`default_run` 等固定生产回退值。

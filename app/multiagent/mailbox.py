@@ -1,8 +1,8 @@
 """Mailbox — Agent 间可信消息邮箱。
 
-Phase F（docs/MegaDeepagents_Agent_Teams_改造任务书.md §14）：
+Mailbox 提供：
 - 每个 AgentInstance 拥有独立 Inbox
-- 跨 Agent 消息落表（持久化层在 Phase G SQLite）
+- 跨 Agent 消息落入统一 SQLite
 - 治理钩子：审计 / 黑白名单 / REQUEST 出站需要 contract method 签名
 - 支持 broadcast / send / broadcast_to_role
 
@@ -83,17 +83,17 @@ PolicyHook = Callable[[MailboxMessage], None]
 class Mailbox:
     """每个 Agent 的独立 inbox + 跨 Agent 治理。
 
-    Phase E（in-memory）：
+    进程内能力：
     - send(message) → 投递到目标 Agent inbox
     - broadcast_run(message) → 投递到 run 内所有 Agent
     - broadcast_role(message) → 投递到 run 内某 role 的所有 Agent
 
-    治理（Phase F 第 5 步）：
+    治理：
     - allow_send policy：可注册 send 前钩子（拒绝、加签等）
     - 黑名单（from_agent_id 维度）：block / unblock
     - 反压：inbox 容量上限（per_agent_max_size）+ discard_oldest 策略
 
-    持久化（Phase G）：
+    持久化：
     - SqliteSaver 模式时落表 mailbox_messages，restart 时 inbox 自动恢复
     """
 
@@ -300,10 +300,10 @@ class Mailbox:
     def get_message(self, message_id: str) -> MailboxMessage | None:
         return self._all_messages.get(message_id)
 
-    # ===== 持久化桥（Phase G）=====
+    # ===== 持久化桥 =====
 
     def snapshot(self) -> dict[str, Any]:
-        """序列化用于检查点存储（Phase G）。"""
+        """序列化用于检查点存储。"""
         with self._lock:
             data = {
                 "inboxes": {aid: [m.model_dump() for m in dq] for aid, dq in self._inboxes.items()},
@@ -313,7 +313,7 @@ class Mailbox:
         return data
 
     def restore(self, snapshot: dict[str, Any]) -> None:
-        """从快照恢复（Phase G）。"""
+        """从快照恢复。"""
         with self._lock:
             self._inboxes.clear()
             for aid, qsnap in (snapshot.get("inboxes") or {}).items():
@@ -327,12 +327,12 @@ class Mailbox:
                 for mid, msnap in (snapshot.get("all") or {}).items()
             }
 
-    # ===== SQLite 落库（Phase G 第 2 步）=====
+    # ===== SQLite 落库 =====
 
     def _persist_message(self, msg: MailboxMessage) -> None:
         """Persist on delivery/consumption; flush_to_db remains a recovery aid."""
         try:
-            from app.multiagent.phase_g_store import get_agent_run_history
+            from app.infrastructure.database.run_store import get_agent_run_history
             get_agent_run_history().insert_mailbox_message(
                 message_id=msg.message_id,
                 from_agent_id=msg.from_agent_id,
@@ -360,7 +360,7 @@ class Mailbox:
 
         返回落库条数。幂等：每条按 message_id upsert。
         """
-        from app.multiagent.phase_g_store import get_agent_run_history
+        from app.infrastructure.database.run_store import get_agent_run_history
         h = history or get_agent_run_history()
         count = 0
         with self._lock:
@@ -398,7 +398,7 @@ class Mailbox:
 
         返回恢复条数。已 consumed 的不再塞回 inbox（避免重复消费）。
         """
-        from app.multiagent.phase_g_store import get_agent_run_history
+        from app.infrastructure.database.run_store import get_agent_run_history
         h = history or get_agent_run_history()
         rows = h.list_mailbox_messages(run_id=run_id)
         count = 0

@@ -1,6 +1,6 @@
 """Complexity Router：根据任务特征选择 single-agent 或 multi-agent 模式。
 
-requirements（docs/upgradePhaseTwo.md §十三）：
+V3 routing requirements：
 
 支持模式：
 1. **SINGLE**: 简单任务，单 Agent 串行完成

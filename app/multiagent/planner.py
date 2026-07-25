@@ -1,6 +1,6 @@
 """Structured Planner — 将用户目标分解为 TaskGraph。
 
-docs/upgradePhaseTwo.md §六：
+V3 planner contract：
 Planner 输出不能再只是自然语言 plan。
 必须返回符合 Schema 的任务图建议，包括：Task ID / 目标 / 依赖 / 所需能力 / 输入 /
 输出契约 / 验收条件 / 预算建议 / 是否允许并行。

@@ -1,6 +1,6 @@
 """ResumeCoordinator — 基于 checkpoint 的运行恢复协调器。
 
-Phase G 第 1 步：恢复（docs/MegaDeepagents_Agent_Teams_改造任务书.md §16）：
+运行时恢复：
 - 跨进程重启后，从 SqliteSaver checkpoint 恢复各 Agent 状态
 - 已完成 Task 不重新执行（通过 task_runs.resumed_checkpoints 跳过）
 - 持续 Teammate 不重新执行 → 直接进入主链调度下一个 ready task
@@ -23,7 +23,7 @@ from typing import Any
 from app.core.logging import logger
 from app.multiagent.agent_instance import AgentInstance, AgentStatus
 from app.multiagent.agent_registry import get_agent_registry
-from app.multiagent.phase_g_store import AgentRunHistory, get_agent_run_history
+from app.infrastructure.database.run_store import AgentRunHistory, get_agent_run_history
 from app.multiagent.task_board import (
     BoardTask,
     BoardTaskStatus,
@@ -101,7 +101,7 @@ class ResumeCoordinator:
                         f"[Resume] loaded checkpoint for agent={agent_id} "
                         f"session_id={stored.get('session_id')}"
                     )
-                # 注意：AgentInstance Registry 是 in-memory。Phase G 的恢复机制把它
+                # AgentInstance Registry 是 in-memory；恢复机制把它
                 # 重新加入 registry 时，可能与其他已注册 Agent 冲突。我们只重建
                 # 仍存活的（status not stopped/failed）的 Agent。
                 if stored.get("status") in ("stopped", "failed"):

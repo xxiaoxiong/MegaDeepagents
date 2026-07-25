@@ -1,8 +1,7 @@
 """AgentRegistry — 运行时 Agent 注册表。
 
 存储所有 AgentInstance 并支持查询、心跳、租约清理。
-Phase C 第一步：纯内存实现 + 能力/状态查询。
-Phase C 第二步：持久化（Plan-G 第 7 节）。
+提供能力/状态查询与持久化租约。
 """
 from __future__ import annotations
 
@@ -248,7 +247,7 @@ class AgentRegistry:
         the same agent lease that the scheduler just made.
         """
         try:
-            from app.multiagent.phase_g_store import get_agent_run_history
+            from app.infrastructure.database.run_store import get_agent_run_history
             get_agent_run_history().upsert_agent_instance(
                 agent_id=agent.agent_id, team_id=agent.team_id, run_id=agent.run_id,
                 profile_id=agent.profile_id, name=agent.name, role=agent.role,

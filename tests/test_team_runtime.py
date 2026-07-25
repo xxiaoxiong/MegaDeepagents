@@ -1,4 +1,4 @@
-"""Phase A/B/C/D 新增模块测试：TeamRunContext / TeamRuntimeFacade /
+"""TeamRunContext / TeamRuntimeFacade /
 AgentRegistry / TaskBoard / AgentInstance 状态机。"""
 from __future__ import annotations
 
@@ -272,7 +272,18 @@ class TestTeamRuntimeFacade:
             ctx = asyncio.run(runtime.create_run(
                 goal="test", workspace_root=os.path.join(tmp, "r1"),
             ))
-            assert ctx.run_id.startswith("run_")
+        assert ctx.run_id.startswith("run_")
+
+    def test_new_discussion_runs_are_frozen(self):
+        import asyncio
+        from app.multiagent.team_runtime import TeamRuntimeFacade
+
+        runtime = TeamRuntimeFacade()
+        with pytest.raises(ValueError, match="DISCUSSION runtime is frozen"):
+            asyncio.run(runtime.create_run(
+                goal="legacy chat",
+                mode=TeamRunMode.DISCUSSION,
+            ))
             assert os.path.isdir(ctx.workspace_root)
             run_info = asyncio.run(runtime.get_run(ctx.run_id))
             assert run_info is not None
