@@ -56,8 +56,10 @@ connection. It is intentionally separate to protect saver transactions.
 - Never expose API keys or absolute host filesystem paths.
 - Artifact reads must resolve inside the Run workspace and reject path escape.
 - New real-time UI state must be persisted before it is streamed.
-- Vue code lives in `frontend/` and consumes real `/api/v1` data.
-- Keep Vercel frontend-only. The durable backend runs in the Docker image.
+- Runtime console code lives in `frontend/` and consumes real `/api/v1` data.
+- The public bilingual project website lives in `website/`.
+- Vercel publishes only `website/`; the durable backend and runtime console run
+  together in the Docker image.
 
 ## Verification
 
@@ -68,6 +70,7 @@ python -m compileall -q app
 pytest -m "not live_model and not real_langsmith"
 npm --prefix frontend test
 npm --prefix frontend run build
+npm --prefix website run build
 ```
 
 Never delete a valid test, weaken an assertion, treat missing model output as

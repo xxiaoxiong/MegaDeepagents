@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#080b10" />
+    <meta
+      name="description"
+      content="MegaDeepagents is an open-source, durable and governed runtime for single-agent and multi-agent work."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://megadeepagents.vercel.app/" />
+    <meta property="og:title" content="MegaDeepagents — One runtime. Accountable agent teams." />
+    <meta
+      property="og:description"
+      content="An open-source agent runtime with one LangGraph control plane, durable execution, verification and human approval."
+    />
+    <meta property="og:image" content="https://megadeepagents.vercel.app/og.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="MegaDeepagents — One runtime. Accountable agent teams." />
+    <meta
+      name="twitter:description"
+      content="Open-source orchestration for reliable single-agent and multi-agent work."
+    />
+    <meta name="twitter:image" content="https://megadeepagents.vercel.app/og.png" />
+    <title>MegaDeepagents — Open-source agent runtime</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <header class="site-header">
+      <div class="container nav-wrap">
+        <a class="brand" href="#top" aria-label="MegaDeepagents home">
+          <span class="brand-mark" aria-hidden="true">M<span>//</span></span>
+          <span>MegaDeepagents</span>
+        </a>
+
+        <nav class="nav-links" aria-label="Primary navigation">
+          <a href="#why" data-i18n="nav.why">Why</a>
+          <a href="#capabilities" data-i18n="nav.capabilities">Capabilities</a>
+          <a href="#architecture" data-i18n="nav.architecture">Architecture</a>
+          <a href="#quickstart" data-i18n="nav.quickstart">Quickstart</a>
+        </nav>
+
+        <div class="nav-actions">
+          <button class="language-toggle" type="button" aria-label="Switch language">
+            <span class="language-active">EN</span>
+            <span aria-hidden="true">/</span>
+            <span>中文</span>
+          </button>
+          <a
+            class="button button-quiet nav-github"
+            href="https://github.com/xxiaoxiong/MegaDeepagents"
+            target="_blank"
+            rel="noreferrer"
+          >
+            <span data-i18n="nav.github">GitHub</span>
+            <span aria-hidden="true">↗</span>
+          </a>
+        </div>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="hero" id="top">
+        <div class="hero-grid" aria-hidden="true"></div>
+        <div class="container hero-layout">
+          <div class="hero-copy">
+            <div class="eyebrow">
+              <span class="signal-dot"></span>
+              <span data-i18n="hero.eyebrow">OPEN-SOURCE AGENT RUNTIME / V3</span>
+            </div>
+            <h1 data-i18n="hero.title">One runtime.<br />Accountable agent teams.</h1>
+            <p class="hero-lede" data-i18n="hero.lede">
+              MegaDeepagents turns a goal into governed, recoverable work—from one agent to a
+              coordinated team—through a single LangGraph control plane.
+            </p>
+            <div class="hero-actions">
+              <a
+                class="button button-primary"
+                href="https://github.com/xxiaoxiong/MegaDeepagents"
+                target="_blank"
+                rel="noreferrer"
+              >
+                <span data-i18n="hero.cta">Explore on GitHub</span>
+                <span aria-hidden="true">↗</span>
+              </a>
+              <a class="button button-secondary" href="#architecture">
+                <span data-i18n="hero.secondary">See how it works</span>
+                <span aria-hidden="true">↓</span>
+              </a>
+            </div>
+            <div class="hero-notes">
+              <span><i></i><b data-i18n="hero.note1">MIT licensed</b></span>
+              <span><i></i><b data-i18n="hero.note2">Model agnostic</b></span>
+              <span><i></i><b data-i18n="hero.note3">Self-hosted</b></span>
+            </div>
+          </div>
+
+          <div class="runtime-card" aria-label="MegaDeepagents runtime flow">
+            <div class="runtime-topbar">
+              <span>runtime.map</span>
+              <span class="runtime-ready"><i></i> V3 / READY</span>
+            </div>
+            <div class="runtime-body">
+              <div class="runtime-input">
+                <span class="runtime-index">00</span>
+                <span data-i18n="runtime.goal">GOAL</span>
+                <strong data-i18n="runtime.goalValue">Ship a verified change</strong>
+              </div>
+
+              <div class="runtime-route">
+                <div class="route-node route-supervisor">
+                  <span>01</span>
+                  <strong>SUPERVISOR</strong>
+                  <small data-i18n="runtime.route">route + govern</small>
+                </div>
+                <div class="route-fork">
+                  <div class="route-node">
+                    <span>02A</span>
+                    <strong>SINGLE</strong>
+                    <small data-i18n="runtime.focused">focused path</small>
+                  </div>
+                  <div class="route-node route-active">
+                    <span>02B</span>
+                    <strong>TEAM</strong>
+                    <small data-i18n="runtime.parallel">parallel tasks</small>
+                  </div>
+                </div>
+                <div class="route-node route-verify">
+                  <span>03</span>
+                  <strong>VERIFY</strong>
+                  <small data-i18n="runtime.evidence">evidence gate</small>
+                </div>
+              </div>
+
+              <div class="event-stream">
+                <div>
+                  <span>14:08:31</span>
+                  <b data-i18n="runtime.event1">plan.created</b>
+                  <em>6 tasks</em>
+                </div>
+                <div>
+                  <span>14:08:34</span>
+                  <b data-i18n="runtime.event2">agents.dispatched</b>
+                  <em>3 workers</em>
+                </div>
+                <div>
+                  <span>14:09:02</span>
+                  <b data-i18n="runtime.event3">artifact.verified</b>
+                  <em class="event-pass">PASS</em>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="container proof-strip" aria-label="Project facts">
+          <div><strong>01</strong><span data-i18n="proof.graph">production Root Graph</span></div>
+          <div><strong>35</strong><span data-i18n="proof.api">typed API paths</span></div>
+          <div><strong>446</strong><span data-i18n="proof.tests">passing backend tests</span></div>
+          <div><strong>100%</strong><span data-i18n="proof.open">open source</span></div>
+        </div>
+      </section>
+
+      <section class="section section-statement" id="why">
+        <div class="container statement-layout reveal">
+          <div>
+            <span class="section-number">01 / WHY</span>
+            <h2 data-i18n="why.title">Agents should not mark their own homework.</h2>
+          </div>
+          <div class="statement-copy">
+            <p data-i18n="why.body">
+              Demos stop when the model returns text. Production work begins there. MegaDeepagents
+              separates planning, execution and verification so every successful run has durable
+              state, evidence and a recoverable path.
+            </p>
+            <div class="principle-list">
+              <div>
+                <span>01</span>
+                <p data-i18n="why.point1">Workers produce artifacts. Verifiers decide success.</p>
+              </div>
+              <div>
+                <span>02</span>
+                <p data-i18n="why.point2">Single and team runs share one execution model.</p>
+              </div>
+              <div>
+                <span>03</span>
+                <p data-i18n="why.point3">Every decision can be replayed, inspected and resumed.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="capabilities">
+        <div class="container">
+          <div class="section-heading reveal">
+            <span class="section-number">02 / CAPABILITIES</span>
+            <h2 data-i18n="cap.title">A control plane for work that has to finish.</h2>
+            <p data-i18n="cap.lede">
+              The runtime coordinates autonomy without giving up control, evidence or recovery.
+            </p>
+          </div>
+
+          <div class="capability-grid">
+            <article class="capability-card capability-wide reveal">
+              <span class="card-index">01</span>
+              <div class="mini-graph" aria-hidden="true">
+                <span>Goal</span><i>→</i><span>Route</span><i>→</i><span>Execute</span><i>→</i
+                ><span>Verify</span>
+              </div>
+              <h3 data-i18n="cap.unified.title">One graph, every run</h3>
+              <p data-i18n="cap.unified.body">
+                Complexity changes the route—not the runtime. Focused tasks and parallel teams use
+                the same state, checkpoints and completion rules.
+              </p>
+            </article>
+
+            <article class="capability-card reveal">
+              <span class="card-index">02</span>
+              <div class="card-symbol">↻</div>
+              <h3 data-i18n="cap.durable.title">Durable by default</h3>
+              <p data-i18n="cap.durable.body">
+                SQLite WAL, event envelopes and LangGraph checkpoints make pause, resume and
+                process recovery first-class behavior.
+              </p>
+            </article>
+
+            <article class="capability-card reveal">
+              <span class="card-index">03</span>
+              <div class="card-symbol">✓</div>
+              <h3 data-i18n="cap.verify.title">Evidence before success</h3>
+              <p data-i18n="cap.verify.body">
+                Artifacts, tests and output contracts pass through a fail-closed verification gate
+                before a task can complete.
+              </p>
+            </article>
+
+            <article class="capability-card reveal">
+              <span class="card-index">04</span>
+              <div class="card-symbol">⌁</div>
+              <h3 data-i18n="cap.git.title">Isolated code work</h3>
+              <p data-i18n="cap.git.body">
+                Governed Git worktrees give each worker an isolated workspace before controlled
+                integration.
+              </p>
+            </article>
+
+            <article class="capability-card reveal">
+              <span class="card-index">05</span>
+              <div class="card-symbol">◆</div>
+              <h3 data-i18n="cap.human.title">Human approval where it matters</h3>
+              <p data-i18n="cap.human.body">
+                Plans, permissions and risky operations can pause at explicit human-in-the-loop
+                checkpoints.
+              </p>
+            </article>
+
+            <article class="capability-card reveal">
+              <span class="card-index">06</span>
+              <div class="card-symbol">≋</div>
+              <h3 data-i18n="cap.observe.title">Observable from the source</h3>
+              <p data-i18n="cap.observe.body">
+                Typed events, SSE replay, task graphs, agent messages and artifact lineage expose
+                what happened and why.
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section architecture-section" id="architecture">
+        <div class="container architecture-layout">
+          <div class="architecture-copy reveal">
+            <span class="section-number">03 / ARCHITECTURE</span>
+            <h2 data-i18n="architecture.title">Simple boundaries. Serious execution.</h2>
+            <p data-i18n="architecture.body">
+              LangGraph owns orchestration. TaskGraph owns the plan. TaskBoard owns execution
+              state. Workers create evidence. Verifier alone owns success.
+            </p>
+            <a
+              class="text-link"
+              href="https://github.com/xxiaoxiong/MegaDeepagents/blob/main/docs/architecture.md"
+              target="_blank"
+              rel="noreferrer"
+            >
+              <span data-i18n="architecture.link">Read the architecture guide</span>
+              <span aria-hidden="true">↗</span>
+            </a>
+          </div>
+
+          <div class="architecture-stack reveal" aria-label="MegaDeepagents architecture layers">
+            <div class="stack-row stack-entry">
+              <span>ENTRY</span>
+              <strong>API V1 · CLI · Runtime Console</strong>
+            </div>
+            <div class="stack-arrow">↓</div>
+            <div class="stack-row stack-core">
+              <span>CONTROL</span>
+              <strong>LangGraph Root Graph</strong>
+              <small>Supervisor · HITL · Replan · Finalize</small>
+            </div>
+            <div class="stack-arrow">↓</div>
+            <div class="stack-split">
+              <div class="stack-row">
+                <span>PLAN</span>
+                <strong>TaskGraph</strong>
+                <small>dependencies + contracts</small>
+              </div>
+              <div class="stack-row">
+                <span>STATE</span>
+                <strong>TaskBoard</strong>
+                <small>claims + attempts + gates</small>
+              </div>
+            </div>
+            <div class="stack-arrow">↓</div>
+            <div class="stack-split">
+              <div class="stack-row">
+                <span>WORK</span>
+                <strong>DeepAgents</strong>
+                <small>tools + worktrees</small>
+              </div>
+              <div class="stack-row">
+                <span>PROOF</span>
+                <strong>Verifier</strong>
+                <small>artifacts + evidence</small>
+              </div>
+            </div>
+            <div class="stack-arrow">↓</div>
+            <div class="stack-row stack-store">
+              <span>DURABLE</span>
+              <strong>SQLite · Checkpoints · Event Replay</strong>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section flow-section">
+        <div class="container">
+          <div class="section-heading reveal">
+            <span class="section-number">04 / EXECUTION FLOW</span>
+            <h2 data-i18n="flow.title">From intent to verified outcome.</h2>
+          </div>
+
+          <ol class="flow-list">
+            <li class="reveal">
+              <span>01</span>
+              <div>
+                <h3 data-i18n="flow.intake.title">Understand</h3>
+                <p data-i18n="flow.intake.body">
+                  Normalize the goal, constraints, repository and completion contract.
+                </p>
+              </div>
+            </li>
+            <li class="reveal">
+              <span>02</span>
+              <div>
+                <h3 data-i18n="flow.route.title">Route</h3>
+                <p data-i18n="flow.route.body">
+                  Choose a focused agent or construct a role-aware team.
+                </p>
+              </div>
+            </li>
+            <li class="reveal">
+              <span>03</span>
+              <div>
+                <h3 data-i18n="flow.execute.title">Execute</h3>
+                <p data-i18n="flow.execute.body">
+                  Claim dependency-ready tasks and work in isolated environments.
+                </p>
+              </div>
+            </li>
+            <li class="reveal">
+              <span>04</span>
+              <div>
+                <h3 data-i18n="flow.verify.title">Verify</h3>
+                <p data-i18n="flow.verify.body">
+                  Test outputs, inspect evidence and create real repair work when needed.
+                </p>
+              </div>
+            </li>
+            <li class="reveal">
+              <span>05</span>
+              <div>
+                <h3 data-i18n="flow.recover.title">Recover</h3>
+                <p data-i18n="flow.recover.body">
+                  Pause, approve, resume or replay without losing the run.
+                </p>
+              </div>
+            </li>
+          </ol>
+        </div>
+      </section>
+
+      <section class="section quickstart-section" id="quickstart">
+        <div class="container quickstart-layout">
+          <div class="quickstart-copy reveal">
+            <span class="section-number">05 / QUICKSTART</span>
+            <h2 data-i18n="quickstart.title">Run it where your work lives.</h2>
+            <p data-i18n="quickstart.body">
+              MegaDeepagents is self-hosted by design. Start locally, bring your own model, and
+              keep repositories and runtime state under your control.
+            </p>
+            <div class="requirement-row">
+              <span>Python 3.11+</span>
+              <span>Node.js 20+</span>
+              <span>Git</span>
+            </div>
+          </div>
+
+          <div class="terminal reveal">
+            <div class="terminal-bar">
+              <span>quickstart.sh</span>
+              <button class="copy-button" type="button" data-i18n="quickstart.copy">Copy</button>
+            </div>
+            <pre><code><span class="code-comment"># clone & configure</span>
+git clone https://github.com/xxiaoxiong/MegaDeepagents.git
+cd MegaDeepagents
+cp .env.example .env
+
+<span class="code-comment"># launch the durable runtime</span>
+docker compose up --build</code></pre>
+            <div class="terminal-status">
+              <i></i>
+              <span data-i18n="quickstart.ready">API, runtime console and durable state—ready.</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="final-cta">
+        <div class="container final-cta-inner reveal">
+          <div>
+            <span class="section-number">OPEN SOURCE / MIT</span>
+            <h2 data-i18n="cta.title">Build agents you can trust to finish.</h2>
+          </div>
+          <div class="final-cta-actions">
+            <a
+              class="button button-primary"
+              href="https://github.com/xxiaoxiong/MegaDeepagents"
+              target="_blank"
+              rel="noreferrer"
+            >
+              <span data-i18n="cta.github">View the repository</span>
+              <span aria-hidden="true">↗</span>
+            </a>
+            <a
+              class="button button-secondary"
+              href="https://github.com/xxiaoxiong/MegaDeepagents/blob/main/README.md"
+              target="_blank"
+              rel="noreferrer"
+            >
+              <span data-i18n="cta.docs">Read the docs</span>
+            </a>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="container footer-inner">
+        <a class="brand" href="#top">
+          <span class="brand-mark" aria-hidden="true">M<span>//</span></span>
+          <span>MegaDeepagents</span>
+        </a>
+        <p data-i18n="footer.line">An open runtime for accountable agent work.</p>
+        <div>
+          <a href="https://github.com/xxiaoxiong/MegaDeepagents" target="_blank" rel="noreferrer"
+            >GitHub</a
+          >
+          <a
+            href="https://github.com/xxiaoxiong/MegaDeepagents/issues"
+            target="_blank"
+            rel="noreferrer"
+            >Issues</a
+          >
+          <a
+            href="https://github.com/xxiaoxiong/MegaDeepagents/blob/main/LICENSE"
+            target="_blank"
+            rel="noreferrer"
+            >MIT</a
+          >
+        </div>
+      </div>
+    </footer>
+
+    <script type="module" src="/main.js"></script>
+  </body>
+</html>

@@ -3,16 +3,17 @@
 ## 推荐拓扑
 
 ```text
-Vercel (Vue 静态控制台)
-            ↓ HTTPS / SSE
-持久 Docker 主机 (FastAPI + LangGraph + DeepAgents)
-            ↓
-SQLite volume + workspaces + Git repositories
+GitHub 访客 ──→ Vercel 项目介绍站 (website/)
+
+项目操作者 ──→ 持久 Docker 主机
+                 ├── FastAPI + LangGraph + DeepAgents
+                 ├── Vue 运行控制台 (frontend/)
+                 └── SQLite volume + workspaces + Git repositories
 ```
 
 Vercel 的函数实例是无状态、短生命周期的。把 SQLite、长时间 Agent Loop 或 Git
-worktree 放进 Vercel 会导致运行丢失、文件不可见和超时，因此仓库中的 `vercel.json`
-只构建 `frontend/`。
+worktree 放进 Vercel 会导致运行丢失、文件不可见和超时。仓库中的 `vercel.json`
+因此只构建纯静态 `website/`；它是项目介绍页，不连接生产 Runtime API。
 
 ## 后端 Docker
 
@@ -31,31 +32,25 @@ docker compose up -d --build
 - 备份 `/data/app.sqlite3` 和 `/data/workspaces`。
 - 单机只启动一个负责同一 SQLite 文件的应用实例。
 
-## Vercel 前端
+## Vercel 项目官网
 
-当前正式控制台：<https://megadeepagents.vercel.app>
+当前正式官网：<https://megadeepagents.vercel.app>
 
 项目根目录执行：
 
 ```bash
-npm --prefix frontend ci
-npm --prefix frontend run build
+npm --prefix website ci
+npm --prefix website run build
 npx vercel --prod
 ```
 
-在 Vercel 项目设置中添加：
+官网默认英文，通过页面右上角切换中文；语言偏好只保存在浏览器 localStorage。站点不需要
+API 地址、模型密钥或运行时环境变量。
 
-```text
-VITE_API_BASE_URL=https://your-runtime.example.com
-```
-
-修改构建期环境变量后必须重新部署。也可以在控制台“系统设置”中临时保存 API 地址；
-它只保存在当前浏览器 localStorage。
-
-## 一体化部署
+## 自托管运行时
 
 `Dockerfile` 会先构建 Vue，再把 `frontend/dist` 复制到 Python 镜像。访问后端根路径即可
-打开控制台，API 同源时无需 `VITE_API_BASE_URL`。
+打开运行控制台，API 使用同源地址。公共官网和运行控制台刻意分离。
 
 ## 健康检查
 
