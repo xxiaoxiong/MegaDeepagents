@@ -83,6 +83,7 @@ Keep these files aligned with implementation:
 
 - `README.md`
 - `docs/architecture.md`
+- `docs/codebase-map.md`
 - `docs/api.md`
 - `docs/database.md`
 - `docs/development.md`
@@ -90,4 +91,5 @@ Keep these files aligned with implementation:
 - `docs/frontend.md`
 - `docs/testing.md`
 - `docs/migration-v3.md`
+- `docs/observability.md`
 - `docs/refactor-v3/*`

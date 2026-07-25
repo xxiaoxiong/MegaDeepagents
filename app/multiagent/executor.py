@@ -201,12 +201,6 @@ def _tool_hook(event: str, *, run_id: str, agent_id: str, task_id: str,
     """Run lifecycle hooks at the same governed boundary as every local tool."""
     if not run_id:
         return
-    from app.infrastructure.database.run_store import get_agent_run_history, make_run_event_id
-    get_agent_run_history().record_event(
-        event_id=make_run_event_id(), run_id=run_id, event_type=event,
-        agent_id=agent_id, task_id=task_id,
-        payload={"tool": tool_name, "arguments": arguments, "result": result or {}},
-    )
     from app.multiagent.lifecycle_hooks import LifecycleEvent, get_lifecycle_hook_engine
     hook_result = get_lifecycle_hook_engine().emit(
         LifecycleEvent(event),

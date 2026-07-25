@@ -1,4 +1,4 @@
-import { onBeforeUnmount, ref, watch, type Ref } from "vue";
+import { computed, onBeforeUnmount, ref, watch, type Ref } from "vue";
 import { api } from "@/lib/api";
 import type { EventEnvelope } from "@/types";
 
@@ -9,10 +9,14 @@ export function useRunStream(
 ) {
   const connected = ref(false);
   const reconnecting = ref(false);
+  const reconnectAttempt = ref(0);
+  const lastMessageAt = ref<string | null>(null);
+  const lastError = ref("");
   let source: EventSource | null = null;
   let retryTimer: number | null = null;
+  let stopped = false;
 
-  const close = () => {
+  const disconnect = () => {
     source?.close();
     source = null;
     connected.value = false;
@@ -20,43 +24,89 @@ export function useRunStream(
     retryTimer = null;
   };
 
+  const scheduleReconnect = () => {
+    if (stopped || retryTimer !== null) return;
+    reconnecting.value = true;
+    reconnectAttempt.value += 1;
+    const delay = Math.min(
+      30_000,
+      1_000 * 2 ** Math.min(reconnectAttempt.value - 1, 5),
+    );
+    retryTimer = window.setTimeout(() => {
+      retryTimer = null;
+      connect();
+    }, delay);
+  };
+
+  const handleMessage = (message: MessageEvent) => {
+    try {
+      const event = JSON.parse(message.data) as EventEnvelope;
+      lastMessageAt.value = new Date().toISOString();
+      lastError.value = "";
+      onEvent(event);
+    } catch (reason) {
+      lastError.value =
+        reason instanceof Error ? reason.message : "无法解析实时事件";
+    }
+  };
+
   const connect = () => {
-    close();
+    disconnect();
     if (!runId.value) return;
+    stopped = false;
     const base = api.baseUrl();
     const url = `${base}/api/v1/runs/${runId.value}/stream?after_sequence=${afterSequence.value}`;
     source = new EventSource(url);
     source.onopen = () => {
       connected.value = true;
       reconnecting.value = false;
+      reconnectAttempt.value = 0;
+      lastError.value = "";
     };
-    source.onmessage = (message) => {
-      onEvent(JSON.parse(message.data) as EventEnvelope);
-    };
-    source.addEventListener("error", () => {
+    source.onmessage = handleMessage;
+    source.onerror = () => {
       connected.value = false;
-      reconnecting.value = true;
+      lastError.value = navigator.onLine
+        ? "实时连接中断，正在自动恢复"
+        : "网络已离线，恢复后将自动补齐事件";
       source?.close();
-      retryTimer = window.setTimeout(connect, 2_000);
-    });
-    const knownEvents = [
-      "run_started",
-      "run_completed",
-      "run_failed",
-      "task_started",
-      "task_completed",
-      "task_failed",
-      "artifact_created",
-      "verification_completed",
-    ];
-    for (const eventName of knownEvents) {
-      source.addEventListener(eventName, (message) => {
-        onEvent(JSON.parse((message as MessageEvent).data) as EventEnvelope);
-      });
-    }
+      source = null;
+      scheduleReconnect();
+    };
   };
 
-  watch(runId, connect, { immediate: true });
-  onBeforeUnmount(close);
-  return { connected, reconnecting, reconnect: connect, close };
+  const reconnect = () => {
+    reconnectAttempt.value = 0;
+    connect();
+  };
+  const close = () => {
+    stopped = true;
+    reconnecting.value = false;
+    disconnect();
+  };
+  const online = () => reconnect();
+  window.addEventListener("online", online);
+
+  watch(runId, reconnect, { immediate: true });
+  onBeforeUnmount(() => {
+    close();
+    window.removeEventListener("online", online);
+  });
+  const state = computed(() =>
+    connected.value
+      ? "live"
+      : reconnecting.value
+        ? "reconnecting"
+        : "offline",
+  );
+  return {
+    connected,
+    reconnecting,
+    reconnectAttempt,
+    lastMessageAt,
+    lastError,
+    state,
+    reconnect,
+    close,
+  };
 }

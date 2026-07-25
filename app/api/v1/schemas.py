@@ -62,6 +62,12 @@ class RunMessageBody(AgentMessageBody):
     """A user message broadcast to every active teammate in a run."""
 
 
+class RetryRunBody(BaseModel):
+    task_id: str | None = None
+    reason: str = Field(default="manual_retry", max_length=2_000)
+    reset_attempts: bool = False
+
+
 class RunResponse(ApiModel):
     run_id: str
     goal: str = ""
@@ -78,6 +84,11 @@ class RunResponse(ApiModel):
 class ControlResponse(ApiModel):
     run_id: str
     status: str
+
+
+class RetryResponse(ControlResponse):
+    retried_task_ids: list[str] = Field(default_factory=list)
+    recovery_generation: int = 0
 
 
 class DeliveryResponse(ApiModel):
@@ -110,6 +121,7 @@ class TaskResponse(ApiModel):
     attempts: int = 0
     max_attempts: int = 0
     last_error: str | None = None
+    next_attempt_at: datetime | str | None = None
     produced_artifact_ids: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -169,5 +181,9 @@ class SettingsResponse(ApiModel):
     langsmith_project: str
     max_concurrency: int
     max_team_size: int
+    task_execution_timeout_seconds: float
+    retry_base_delay_seconds: float
+    retry_max_delay_seconds: float
+    stalled_run_threshold_seconds: int
     default_auto_approve_low_risk: bool
     legacy_api_enabled: bool

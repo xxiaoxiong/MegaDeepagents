@@ -19,12 +19,14 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
+from app.core.config import settings
 from app.core.logging import logger
 from app.multiagent.agent_registry import AgentRegistry, get_agent_registry
 from app.multiagent.task_board import (
@@ -34,6 +36,7 @@ from app.multiagent.task_board import (
     TaskBoard,
     get_task_board,
 )
+from app.runtime.reliability import RetryDecision, RetryPolicy
 
 
 class ScheduleStatus(str, Enum):
@@ -96,12 +99,29 @@ class ParallelTeamScheduler:
         integration_manager: Any | None = None,
         control_plane: Any | None = None,
         permission_broker: Any | None = None,
+        task_execution_timeout_seconds: float | None = None,
+        retry_policy: RetryPolicy | None = None,
+        audit_heartbeat_interval_seconds: float | None = None,
     ) -> None:
         self.run_id = run_id
         self.max_rounds = max_rounds
         self.max_concurrency = max_concurrency
         self.heartbeat_interval = heartbeat_interval_seconds
         self.lease_timeout = lease_timeout_seconds
+        self.task_execution_timeout = (
+            settings.task_execution_timeout_seconds
+            if task_execution_timeout_seconds is None
+            else max(0.0, float(task_execution_timeout_seconds))
+        )
+        self.retry_policy = retry_policy or RetryPolicy(
+            base_delay_seconds=settings.retry_base_delay_seconds,
+            max_delay_seconds=settings.retry_max_delay_seconds,
+        )
+        self.audit_heartbeat_interval = (
+            settings.audit_heartbeat_interval_seconds
+            if audit_heartbeat_interval_seconds is None
+            else max(1.0, float(audit_heartbeat_interval_seconds))
+        )
         self.task_graph = task_graph
         self.cancel_event = cancel_event or asyncio.Event()
         self.verifier = verifier
@@ -126,12 +146,14 @@ class ParallelTeamScheduler:
     async def run(self, executor: Any) -> ParallelRunResult:
         """执行并行调度。executor 必须实现 execute_task(dag, task_id, task_input)。"""
         round_n = 0
-        last_error: str | None = None
+        self._event("SchedulerStarted", payload={
+            "max_rounds": self.max_rounds,
+            "max_concurrency": self.max_concurrency,
+            "task_execution_timeout_seconds": self.task_execution_timeout,
+        })
 
         # 申明所有 team 任务的来源（TaskGraph 转化为 BoardTask 由 caller 完成）
         while round_n < self.max_rounds:
-            round_n += 1
-
             from app.infrastructure.database.run_store import get_agent_run_history
             run_record = get_agent_run_history().get_team_run(self.run_id)
             if run_record and run_record.get("status") == "paused":
@@ -158,6 +180,24 @@ class ParallelTeamScheduler:
                     logger.info(f"[ParallelSched] run={self.run_id}: 仍有 RUNNING 等待")
                     await asyncio.sleep(0.5)
                     continue
+                deferred = [
+                    task for task in running
+                    if task.status == BoardTaskStatus.PENDING
+                    and task.next_attempt_at is not None
+                    and task.next_attempt_at > datetime.utcnow()
+                ]
+                if deferred:
+                    due_at = min(task.next_attempt_at for task in deferred)
+                    wait_seconds = max(
+                        0.05, (due_at - datetime.utcnow()).total_seconds()
+                    )
+                    self._event("RetryBackoffWaiting", payload={
+                        "task_ids": [task.task_id for task in deferred],
+                        "next_attempt_at": due_at.isoformat(),
+                        "wait_seconds": round(wait_seconds, 3),
+                    })
+                    await asyncio.sleep(min(wait_seconds, 1.0))
+                    continue
                 if any(s in (BoardTaskStatus.BLOCKED, BoardTaskStatus.REPAIR_REQUIRED,
                              BoardTaskStatus.REPLAN_REQUIRED) for s in running_states):
                     return self._finalize(
@@ -171,6 +211,58 @@ class ParallelTeamScheduler:
                     round_n, status="failed", error="scheduler_deadlock",
                 )
 
+            # Do not burn the complete round budget in a tight loop when a
+            # dynamically-created task requests a capability that no live
+            # teammate can provide.  This is an actionable control-plane
+            # condition, not an executor failure.
+            live_agents = [
+                agent
+                for agent in self.registry.list_by_run(self.run_id)
+                if getattr(agent.status, "value", agent.status)
+                not in {"stopped", "failed"}
+            ]
+            serviceable: list[BoardTask] = []
+            unserviceable: list[BoardTask] = []
+            for task in pending:
+                required = set(task.required_capabilities)
+                if any(
+                    not required or required.issubset(set(agent.capabilities))
+                    for agent in live_agents
+                ):
+                    serviceable.append(task)
+                else:
+                    unserviceable.append(task)
+            if unserviceable:
+                self._event("TasksWaitingForCapability", payload={
+                    "tasks": [
+                        {
+                            "task_id": task.task_id,
+                            "required_capabilities": task.required_capabilities,
+                        }
+                        for task in unserviceable
+                    ],
+                    "available_agents": [
+                        {
+                            "agent_id": agent.agent_id,
+                            "capabilities": agent.capabilities,
+                        }
+                        for agent in live_agents
+                    ],
+                })
+            if not serviceable:
+                return self._finalize(
+                    round_n,
+                    status=ScheduleStatus.WAITING_HUMAN.value,
+                    error="no_eligible_worker",
+                )
+            pending = serviceable
+
+            round_n += 1
+            self._event("SchedulerRoundStarted", payload={
+                "round": round_n,
+                "pending_task_ids": [task.task_id for task in pending],
+                "task_count": len(pending),
+            })
             # 用信号量限制并发
             semaphore = asyncio.Semaphore(self.max_concurrency)
             coros = [
@@ -341,11 +433,32 @@ class ParallelTeamScheduler:
                 run_id=self.run_id, attempt=task.attempts + 1, status="running",
                 metadata={"session_id": agent.session_id, "thread_id": agent.thread_id},
             )
+            assignment_started = time.monotonic()
 
             async def _heartbeat_loop():
+                last_audit = -self.audit_heartbeat_interval
                 while not beat_stop.is_set():
                     self.registry.heartbeat(agent.agent_id)
-                    await asyncio.sleep(self.heartbeat_interval)
+                    elapsed = time.monotonic() - assignment_started
+                    if elapsed - last_audit >= self.audit_heartbeat_interval:
+                        self._event(
+                            "TaskHeartbeat",
+                            agent_id=agent.agent_id,
+                            task_id=task.task_id,
+                            payload={
+                                "task_run_id": task_run_id,
+                                "attempt": task.attempts + 1,
+                                "elapsed_seconds": round(elapsed, 1),
+                                "message": "Agent is still working",
+                            },
+                        )
+                        last_audit = elapsed
+                    try:
+                        await asyncio.wait_for(
+                            beat_stop.wait(), timeout=self.heartbeat_interval
+                        )
+                    except TimeoutError:
+                        pass
 
             beat_task = asyncio.create_task(_heartbeat_loop())
 
@@ -403,11 +516,43 @@ class ParallelTeamScheduler:
                     for message in get_mailbox().receive(agent.agent_id, max_count=20)
                 ]
                 dag = self.task_graph or self._task_graph_from_board()
-                result = await self.runtime_manager.execute_assignment(
-                    executor=executor, task_graph=dag, task_id=task.task_id,
-                    task_input=task_input, cancel_event=self.cancel_event,
-                    agent_registry=self.registry,
+                assignment_future = asyncio.create_task(
+                    self.runtime_manager.execute_assignment(
+                        executor=executor,
+                        task_graph=dag,
+                        task_id=task.task_id,
+                        task_input=task_input,
+                        cancel_event=self.cancel_event,
+                        agent_registry=self.registry,
+                    )
                 )
+                if self.task_execution_timeout > 0:
+                    done, _ = await asyncio.wait(
+                        {assignment_future},
+                        timeout=self.task_execution_timeout,
+                    )
+                    if not done:
+                        self.runtime_manager.cancel_agent(
+                            self.run_id, agent.agent_id
+                        )
+                        self._event(
+                            "TaskTimedOut",
+                            agent_id=agent.agent_id,
+                            task_id=task.task_id,
+                            payload={
+                                "task_run_id": task_run_id,
+                                "timeout_seconds": self.task_execution_timeout,
+                                "attempt": task.attempts + 1,
+                            },
+                        )
+                        assignment_future.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await assignment_future
+                        raise TimeoutError(
+                            "task execution timed out after "
+                            f"{self.task_execution_timeout:g}s"
+                        )
+                result = await assignment_future
 
                 if task_input["cancel_event"].is_set():
                     if self.cancel_event.is_set():
@@ -532,12 +677,19 @@ class ParallelTeamScheduler:
                         f"[ParallelSched] task={task.task_id} agent={agent.agent_id} succeeded"
                     )
                 else:
-                    self.board.fail(task.task_id, agent.agent_id, result.error or "unknown", run_id=self.run_id)
-                    history.update_task_run_status(task_run_id, "failed", error=result.error or "unknown")
+                    error = result.error or "unknown"
+                    decision = self._record_task_failure(
+                        task=task,
+                        agent_id=agent.agent_id,
+                        error=error,
+                        task_run_id=task_run_id,
+                        history=history,
+                    )
                     await get_lifecycle_hook_engine().emit_async(
                         LifecycleEvent.TASK_FAILED,
                         {"run_id": self.run_id, "agent_id": agent.agent_id,
-                         "task_id": task.task_id, "error": result.error or "unknown"},
+                         "task_id": task.task_id, "error": error,
+                         "retry": decision.to_dict()},
                     )
                     # 实时更新 CapabilityRegistry 指标。
                     try:
@@ -555,20 +707,28 @@ class ParallelTeamScheduler:
                     f"[ParallelSched] task={task.task_id} agent={agent.agent_id} "
                     f"raised: {exc}"
                 )
-                self.board.fail(task.task_id, agent.agent_id, str(exc), run_id=self.run_id)
-                history.update_task_run_status(task_run_id, "failed", error=str(exc))
+                decision = self._record_task_failure(
+                    task=task,
+                    agent_id=agent.agent_id,
+                    error=str(exc),
+                    task_run_id=task_run_id,
+                    history=history,
+                )
                 try:
                     from app.multiagent.lifecycle_hooks import LifecycleEvent, get_lifecycle_hook_engine
                     await get_lifecycle_hook_engine().emit_async(
                         LifecycleEvent.TASK_FAILED,
                         {"run_id": self.run_id, "agent_id": agent.agent_id,
-                         "task_id": task.task_id, "error": str(exc)},
+                         "task_id": task.task_id, "error": str(exc),
+                         "retry": decision.to_dict()},
                     )
                 except Exception:
                     pass
             finally:
                 beat_stop.set()
-                await asyncio.sleep(0)
+                beat_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await beat_task
                 # 状态恢复
                 self.registry.release_reservation(agent.agent_id, task.task_id)
                 session.current_task_id = None
@@ -598,6 +758,51 @@ class ParallelTeamScheduler:
             # a cancellation or unexpected error happens in-between.
             self.registry.release_reservation(agent.agent_id, task.task_id)
             raise
+
+    def _record_task_failure(
+        self,
+        *,
+        task: BoardTask,
+        agent_id: str,
+        error: str,
+        task_run_id: str,
+        history: Any,
+    ) -> RetryDecision:
+        """Persist one classified failure and its next recovery action."""
+        decision = self.retry_policy.decide(
+            error,
+            attempt=task.attempts + 1,
+            max_attempts=task.max_attempts,
+        )
+        self.board.fail(
+            task.task_id,
+            agent_id,
+            error,
+            run_id=self.run_id,
+            retryable=decision.retryable,
+            retry_delay_seconds=decision.delay_seconds,
+            failure_category=decision.category.value,
+        )
+        current = self.board.get(task.task_id, run_id=self.run_id)
+        history.update_task_run_status(task_run_id, "failed", error=error)
+        self._event(
+            "TaskRetryScheduled" if decision.retryable else "TaskFailedPermanently",
+            agent_id=agent_id,
+            task_id=task.task_id,
+            payload={
+                "task_run_id": task_run_id,
+                "attempt": current.attempts if current else task.attempts + 1,
+                "max_attempts": current.max_attempts if current else task.max_attempts,
+                "next_attempt_at": (
+                    current.next_attempt_at.isoformat()
+                    if current and current.next_attempt_at
+                    else None
+                ),
+                "error": error,
+                **decision.to_dict(),
+            },
+        )
+        return decision
 
     def _task_graph_from_board(self) -> Any:
         """Compatibility bridge for legacy callers while never passing None."""
@@ -702,11 +907,34 @@ class ParallelTeamScheduler:
 
     # ===== 工具 =====
 
+    def _event(
+        self,
+        event_type: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        agent_id: str | None = None,
+        task_id: str | None = None,
+    ) -> None:
+        from app.infrastructure.database.run_store import (
+            get_agent_run_history,
+            make_run_event_id,
+        )
+
+        get_agent_run_history().record_event(
+            event_id=make_run_event_id(),
+            run_id=self.run_id,
+            event_type=event_type,
+            agent_id=agent_id,
+            task_id=task_id,
+            timestamp=datetime.now(UTC),
+            payload=payload or {},
+        )
+
     def _finalize(
         self, rounds: int, status: str, error: str | None = None,
     ) -> ParallelRunResult:
         summarize = self.board.summary(self.run_id)
-        return ParallelRunResult(
+        result = ParallelRunResult(
             status=status,
             rounds=rounds,
             total_tasks=summarize.get("total", 0),
@@ -717,6 +945,8 @@ class ParallelTeamScheduler:
             error=error,
             summary=summarize,
         )
+        self._event("SchedulerStopped", payload=result.to_dict())
+        return result
 
     def _finalize_verified_run(self, rounds: int) -> ParallelRunResult:
         """Apply run-level gates after every task is verifier-owned SUCCEEDED."""
@@ -762,6 +992,7 @@ class ParallelTeamScheduler:
                 dependencies=list(node.dependencies),
                 required_capabilities=list(node.required_capabilities),
                 priority=getattr(node, "priority", 0),
+                max_attempts=getattr(node, "max_attempts", 3),
             )
 
     @staticmethod

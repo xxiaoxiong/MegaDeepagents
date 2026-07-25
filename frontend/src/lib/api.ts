@@ -6,6 +6,7 @@ import type {
   EventEnvelope,
   PermissionRequest,
   PlanRequest,
+  RunDiagnostics,
   Task,
   TaskGraph,
 } from "@/types";
@@ -93,10 +94,26 @@ export const api = {
     request<{ content: string; truncated: boolean; path: string }>(
       `/api/v1/runs/${runId}/artifacts/${artifactId}/content`,
     ),
-  listEvents: (runId: string, after = 0) =>
+  listEvents: (runId: string, after = 0, limit = 2_000) =>
     request<EventEnvelope[]>(
-      `/api/v1/runs/${runId}/events?after_sequence=${after}`,
+      `/api/v1/runs/${runId}/events?after_sequence=${after}&limit=${limit}`,
     ),
+  async listAllEvents(runId: string, cap = 20_000) {
+    const events: EventEnvelope[] = [];
+    let cursor = 0;
+    while (events.length < cap) {
+      const page = await api.listEvents(
+        runId,
+        cursor,
+        Math.min(2_000, cap - events.length),
+      );
+      if (!page.length) break;
+      events.push(...page);
+      cursor = page.at(-1)?.sequence ?? cursor;
+      if (page.length < 2_000) break;
+    }
+    return events;
+  },
   listPermissions: (runId: string) =>
     request<PermissionRequest[]>(`/api/v1/runs/${runId}/permissions`),
   decidePermission: (
@@ -135,6 +152,21 @@ export const api = {
     request(`/api/v1/runs/${runId}/agents/${agentId}/stop`, { method: "POST" }),
   errors: (runId: string) =>
     request<Record<string, unknown>>(`/api/v1/runs/${runId}/errors`),
+  diagnostics: (runId: string) =>
+    request<RunDiagnostics>(`/api/v1/runs/${runId}/diagnostics`),
+  retryRun: (
+    runId: string,
+    options: { task_id?: string; reason?: string; reset_attempts?: boolean } = {},
+  ) =>
+    request<{
+      run_id: string;
+      status: string;
+      retried_task_ids: string[];
+      recovery_generation: number;
+    }>(`/api/v1/runs/${runId}/retry`, {
+      method: "POST",
+      body: JSON.stringify(options),
+    }),
   git: (runId: string) =>
     request<Record<string, unknown>>(`/api/v1/runs/${runId}/git`),
   settings: () => request<Record<string, unknown>>("/api/v1/settings"),

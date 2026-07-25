@@ -22,6 +22,8 @@ from app.api.v1.schemas import (
     FlexibleResponse,
     PermissionDecisionBody,
     PlanDecisionBody,
+    RetryResponse,
+    RetryRunBody,
     RunMessageBody,
     RunResponse,
     SettingsResponse,
@@ -118,6 +120,23 @@ async def cancel_run(run_id: str):
     return {"run_id": run_id, "status": "cancelled"}
 
 
+@router.post("/runs/{run_id}/retry", status_code=202, response_model=RetryResponse)
+async def retry_run(run_id: str, body: RetryRunBody):
+    _require_run(run_id)
+    result = await get_run_service().retry(
+        run_id,
+        task_id=body.task_id,
+        reason=body.reason,
+        reset_attempts=body.reset_attempts,
+    )
+    if result is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Run has no retryable task or cannot be retried",
+        )
+    return result
+
+
 @router.get(
     "/runs/{run_id}/events", response_model=list[EventEnvelopeResponse]
 )
@@ -182,6 +201,17 @@ def stream_events(run_id: str, after_sequence: int = Query(0, ge=0)):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@router.get("/runs/{run_id}/diagnostics", response_model=FlexibleResponse)
+def get_run_diagnostics(run_id: str):
+    _require_run(run_id)
+    from app.application.runs.diagnostics import RunDiagnosticsService
+
+    result = RunDiagnosticsService().inspect(run_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return _public_operational_record(result)
 
 
 @router.get("/runs/{run_id}/task-graph", response_model=TaskGraphResponse)
@@ -609,6 +639,10 @@ def get_settings():
         "langsmith_project": settings.langsmith_project,
         "max_concurrency": settings.max_concurrency,
         "max_team_size": settings.max_team_size,
+        "task_execution_timeout_seconds": settings.task_execution_timeout_seconds,
+        "retry_base_delay_seconds": settings.retry_base_delay_seconds,
+        "retry_max_delay_seconds": settings.retry_max_delay_seconds,
+        "stalled_run_threshold_seconds": settings.stalled_run_threshold_seconds,
         "default_auto_approve_low_risk": settings.default_auto_approve_low_risk,
         "legacy_api_enabled": settings.enable_legacy_api,
     }

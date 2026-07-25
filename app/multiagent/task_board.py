@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any
 
@@ -51,6 +51,7 @@ class BoardTask(BaseModel):
     attempts: int = 0
     max_attempts: int = 3
     last_error: str | None = None
+    next_attempt_at: datetime | None = None
 
     produced_artifact_ids: list[str] = Field(default_factory=list)
     priority: int = 0
@@ -324,7 +325,17 @@ class TaskBoard:
             self._persist(task)
             return True
 
-    def fail(self, task_id: str, agent_id: str, error: str, run_id: str | None = None) -> bool:
+    def fail(
+        self,
+        task_id: str,
+        agent_id: str,
+        error: str,
+        run_id: str | None = None,
+        *,
+        retryable: bool = True,
+        retry_delay_seconds: float = 0.0,
+        failure_category: str = "unknown",
+    ) -> bool:
         """标记 failed（或重置为 PENDING 如果还有重试次数）。"""
         with self._lock:
             task = self.get(task_id, run_id=run_id)
@@ -333,21 +344,72 @@ class TaskBoard:
             task.attempts += 1
             task.last_error = error
             task.updated_at = datetime.utcnow()
-            if task.attempts < task.max_attempts:
+            history = task.metadata.setdefault("error_history", [])
+            history.append({
+                "attempt": task.attempts,
+                "category": failure_category,
+                "message": error,
+                "timestamp": task.updated_at.isoformat(),
+            })
+            if len(history) > 20:
+                del history[:-20]
+            if retryable and task.attempts < task.max_attempts:
                 # 重置为 pending
                 task.status = BoardTaskStatus.PENDING
                 task.claimed_by = None
                 task.claimed_at = None
+                task.next_attempt_at = (
+                    task.updated_at + timedelta(seconds=max(0.0, retry_delay_seconds))
+                )
                 logger.warning(
                     f"[TaskBoard] task={task_id} failed (attempt {task.attempts}/{task.max_attempts}), "
-                    f"reset to pending"
+                    f"retry after {max(0.0, retry_delay_seconds):.1f}s"
                 )
             else:
                 task.status = BoardTaskStatus.FAILED
                 task.completed_at = datetime.utcnow()
+                task.next_attempt_at = None
                 logger.warning(
                     f"[TaskBoard] task={task_id} failed permanently: {error}"
                 )
+            self._persist(task)
+            return True
+
+    def retry(
+        self,
+        task_id: str,
+        *,
+        run_id: str,
+        reason: str = "manual_retry",
+        reset_attempts: bool = False,
+    ) -> bool:
+        """Requeue a terminal task through an explicit, audited operator action."""
+        with self._lock:
+            task = self.get(task_id, run_id=run_id)
+            if task is None or task.status not in {
+                BoardTaskStatus.FAILED,
+                BoardTaskStatus.REPAIR_REQUIRED,
+                BoardTaskStatus.REPLAN_REQUIRED,
+                BoardTaskStatus.BLOCKED,
+            }:
+                return False
+            task.metadata.setdefault("manual_retries", []).append({
+                "reason": reason,
+                "previous_status": task.status.value,
+                "previous_attempts": task.attempts,
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+            if reset_attempts:
+                task.attempts = 0
+            elif task.attempts >= task.max_attempts:
+                task.max_attempts = task.attempts + 1
+            task.status = BoardTaskStatus.PENDING
+            task.claimed_by = None
+            task.claimed_at = None
+            task.completed_at = None
+            task.next_attempt_at = None
+            task.last_error = reason
+            task.updated_at = datetime.utcnow()
             self._persist(task)
             return True
 
@@ -430,9 +492,11 @@ class TaskBoard:
         return [self._tasks[key] for key in keys if key in self._tasks]
 
     def list_pending(self, run_id: str) -> list[BoardTask]:
+        now = datetime.utcnow()
         return [
             t for t in self.list_by_run(run_id)
             if t.status == BoardTaskStatus.PENDING
+            and (t.next_attempt_at is None or t.next_attempt_at <= now)
         ]
 
     def list_claimable(

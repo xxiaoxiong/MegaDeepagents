@@ -76,6 +76,10 @@ class LifecycleHookEngine:
     async def emit_async(
         self, event: LifecycleEvent, context: dict[str, Any],
     ) -> HookResult:
+        # Lifecycle events are part of the durable audit contract, even when
+        # no optional hook is registered.  Previously most Task/Run events
+        # disappeared from the UI in the common "zero hooks" configuration.
+        self._record_lifecycle(event, context)
         combined = HookResult()
         order = {"system": 0, "user": 1, "project": 2}
         hooks = sorted((h for h in self._hooks if h.event == event),
@@ -121,6 +125,27 @@ class LifecycleHookEngine:
                               feedback=result.stderr or result.stdout)
         return self.register(event, run_command, scope=scope,
                              timeout_seconds=timeout_seconds + 1)
+
+    @staticmethod
+    def _record_lifecycle(
+        event: LifecycleEvent, context: dict[str, Any],
+    ) -> None:
+        run_id = context.get("run_id")
+        if not run_id:
+            return
+        payload = {
+            key: value
+            for key, value in context.items()
+            if key not in {"run_id", "agent_id", "task_id"}
+        }
+        get_agent_run_history().record_event(
+            event_id=make_run_event_id(),
+            run_id=run_id,
+            event_type=event.value,
+            agent_id=context.get("agent_id"),
+            task_id=context.get("task_id"),
+            payload=payload,
+        )
 
     @staticmethod
     def _audit(event: LifecycleEvent, hook: _Hook, context: dict[str, Any], result: HookResult) -> None:
