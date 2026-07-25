@@ -19,13 +19,14 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import threading
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
-from app.core.config import settings
 from app.core.logging import logger
+from app.infrastructure.database.connection import (
+    close_connection as close_database_connection,
+    get_connection,
+)
 from app.multiagent.agent_spec import (
     AgentSpec,
     TeamRunConfig,
@@ -44,21 +45,19 @@ from app.multiagent.state import (
 )
 
 
-_local = threading.local()
+_initialized_connection_ids: set[int] = set()
 
 
-def _get_conn() -> sqlite3.Connection:
-    if not hasattr(_local, "conn") or _local.conn is None:
-        db_path = Path(settings.sqlite_path)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        _init_multiagent_db(conn)
-        _local.conn = conn
-    return _local.conn
+def _get_conn():
+    connection = get_connection()
+    connection_id = id(connection)
+    if connection_id not in _initialized_connection_ids:
+        _init_multiagent_db(connection)
+        _initialized_connection_ids.add(connection_id)
+    return connection
 
 
-def _init_multiagent_db(conn: sqlite3.Connection) -> None:
+def _init_multiagent_db(conn) -> None:
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS team_rooms (
@@ -181,7 +180,7 @@ def _init_multiagent_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory_entries(agent_scope);
         CREATE INDEX IF NOT EXISTS idx_memory_task ON memory_entries(task_id);
 
-        -- Phase G: AgentInstance 持久化
+        -- AgentInstance persistence
         CREATE TABLE IF NOT EXISTS agent_instances (
             agent_id TEXT PRIMARY KEY,
             team_id TEXT NOT NULL,
@@ -205,7 +204,7 @@ def _init_multiagent_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_agent_inst_run ON agent_instances(run_id);
         CREATE INDEX IF NOT EXISTS idx_agent_inst_status ON agent_instances(status);
 
-        -- Phase G: TaskRun 记录
+        -- TaskRun records
         CREATE TABLE IF NOT EXISTS task_runs (
             task_run_id TEXT PRIMARY KEY,
             task_id TEXT NOT NULL,
@@ -224,7 +223,7 @@ def _init_multiagent_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_task_runs_task ON task_runs(task_id);
         CREATE INDEX IF NOT EXISTS idx_task_runs_run ON task_runs(run_id);
 
-        -- Phase G: Artifact 持久化（替代内存注册表）
+        -- Artifact persistence
         CREATE TABLE IF NOT EXISTS artifacts (
             artifact_id TEXT PRIMARY KEY,
             run_id TEXT NOT NULL,
@@ -244,7 +243,7 @@ def _init_multiagent_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id);
         CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts(run_id);
 
-        -- Phase G: Permission Requests
+        -- Permission requests
         CREATE TABLE IF NOT EXISTS permission_requests (
             request_id TEXT PRIMARY KEY,
             run_id TEXT NOT NULL,
@@ -260,7 +259,7 @@ def _init_multiagent_db(conn: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_perm_req_run ON permission_requests(run_id);
 
-        -- Phase G: Team Events 审计日志
+        -- Team event audit log
         CREATE TABLE IF NOT EXISTS team_events (
             event_id TEXT PRIMARY KEY,
             run_id TEXT NOT NULL,
@@ -275,7 +274,7 @@ def _init_multiagent_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_team_events_run ON team_events(run_id);
         CREATE INDEX IF NOT EXISTS idx_team_events_type ON team_events(event_type);
 
-        -- Phase G: Mailbox 消息持久化
+        -- Mailbox persistence
         CREATE TABLE IF NOT EXISTS mailbox_messages (
             message_id TEXT PRIMARY KEY,
             from_agent_id TEXT NOT NULL,
@@ -300,7 +299,7 @@ def _init_multiagent_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_mailbox_thread ON mailbox_messages(thread_id);
         CREATE INDEX IF NOT EXISTS idx_mailbox_blocklist ON mailbox_messages(run_id, from_agent_id);
 
-        -- Phase G: Schema Version
+        -- Schema version
         CREATE TABLE IF NOT EXISTS schema_version (
             version INTEGER PRIMARY KEY,
             applied_at TEXT NOT NULL
@@ -348,9 +347,8 @@ def _ensure_schema_version(conn) -> None:
 
 
 def close_connection() -> None:
-    if hasattr(_local, "conn") and _local.conn is not None:
-        _local.conn.close()
-        _local.conn = None
+    _initialized_connection_ids.clear()
+    close_database_connection()
 
 
 # ========== 消息转 Pydantic ==========

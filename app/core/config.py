@@ -15,8 +15,10 @@ class Settings(BaseSettings):
     )
 
     # 应用配置
-    app_name: str = "general-agent-framework"
+    app_name: str = "MegaDeepagents"
     app_env: str = "dev"
+    app_host: str = "127.0.0.1"
+    app_port: int = 8081
 
     # 模型配置
     llm_provider: str = "deepseek"
@@ -32,11 +34,15 @@ class Settings(BaseSettings):
     skills_dir: str = "./runtime/skills"
     log_dir: str = "./runtime/logs"
     sqlite_path: str = "./runtime/db/app.sqlite3"
+    database_url: str = ""
+    workspace_root: str = "./runtime/workspaces"
+    sqlite_busy_timeout_ms: int = 5000
 
     # 功能开关
     enable_web_tools: bool = False
     enable_safe_shell: bool = False
     enable_mcp_tools: bool = False
+    enable_legacy_api: bool = False
 
     # 审批配置
     hitl_required_for_write: bool = True
@@ -83,6 +89,12 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = 100
     max_message_length: int = 50000
     pending_runner_ttl_minutes: int = 30
+    max_concurrency: int = 4
+    max_team_size: int = 5
+    max_spawn_depth: int = 2
+    max_repair_rounds: int = 3
+    default_auto_approve_low_risk: bool = False
+    frontend_origin: str = "http://127.0.0.1:5173"
 
     # ========== LangSmith 可观测性（可选；未配置时本地可跑） ==========
     langsmith_enabled: bool = False  # 总开关，默认 False 满足"未配置本地可跑"约束
@@ -112,6 +124,10 @@ class Settings(BaseSettings):
             Path(d).mkdir(parents=True, exist_ok=True)
 
     def model_post_init(self, context) -> None:
+        if self.database_url.startswith("sqlite:///"):
+            self.sqlite_path = self.database_url.removeprefix("sqlite:///")
+        elif not self.database_url:
+            self.database_url = f"sqlite:///{self.sqlite_path}"
         self._ensure_dirs()
 
     @property

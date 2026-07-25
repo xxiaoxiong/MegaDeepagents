@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from app.multiagent.agent_profile import AgentProfile, get_capability_registry
 from app.multiagent.agent_registry import AgentRegistry, get_agent_registry
 from app.multiagent.lifecycle_hooks import LifecycleEvent, get_lifecycle_hook_engine
-from app.multiagent.phase_g_store import get_agent_run_history, make_run_event_id
+from app.infrastructure.database.run_store import get_agent_run_history, make_run_event_id
 from app.multiagent.store import _get_conn
 from app.multiagent.teammate_session import get_teammate_supervisor
 

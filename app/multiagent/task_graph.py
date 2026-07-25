@@ -1,6 +1,6 @@
 """结构化 TaskGraph：替代 `state.plan: str` 的伪任务模型。
 
-P2-1（Orchestrator–Worker 升级）核心数据模型。要求（`docs/upgradePhaseTwo.md` 五）：
+V3 编排与 Worker 之间的核心计划数据模型：
 
 - TaskNode / TaskGraph 严格 Pydantic 数据模型
 - DAG 环检测 / dependency 校验
@@ -9,7 +9,7 @@ P2-1（Orchestrator–Worker 升级）核心数据模型。要求（`docs/upgrad
 - TaskGraph 版本化（每次突变 +1）
 - 动态新增 Repair / 补充调研 / 验证 Task（局部 Replan，不重建整图）
 
-本模块只提供 **数据与图算法**；调度 / 并行由 `scheduler.py` 负责，
+本模块只提供 **数据与图算法**；调度 / 并行由 `parallel_scheduler.py` 负责，
 执行由 `executor.py` 负责，校验由 `verifier.py` 负责。
 """
 from __future__ import annotations
@@ -382,10 +382,12 @@ class TaskGraph(BaseModel):
                     repair_id if d == target_node_id else d
                     for d in n.dependencies
                 ]
-        # 原 target 进入 SKIPPED：repair 已顶替它，原 FAILED 节点不再阻塞
+        # 原 target 进入 SKIPPED：repair 已顶替它，原节点不再阻塞
         # all_succeeded()，也不会被 ready_tasks() 调度（terminal）。FAILED → SKIPPED
         # 必须是合法转换，否则只记 WARNING，调度行为仍能正确（all_succeeded 仅看
         # 是否全 SUCCEEDED，FAILED 节点天然使 all_succeeded=False；本步是 best-effort）。
+        if target.status == TaskNodeStatus.SUCCEEDED:
+            self.update_status(target_node_id, TaskNodeStatus.FAILED)
         self.update_status(target_node_id, TaskNodeStatus.SKIPPED)
         return node
 

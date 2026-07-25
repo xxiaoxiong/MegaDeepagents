@@ -1,4 +1,4 @@
-"""AgentProfile + CapabilityRegistry 单元测试（docs/upgradePhaseTwo.md 测试要求 5-8）。
+"""AgentProfile + CapabilityRegistry 单元测试。
 
 覆盖：
 1. AgentProfile 构造与能力询问

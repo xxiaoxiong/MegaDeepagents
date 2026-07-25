@@ -10,7 +10,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from app.multiagent.lifecycle_hooks import LifecycleEvent, get_lifecycle_hook_engine
-from app.multiagent.phase_g_store import get_agent_run_history
+from app.infrastructure.database.run_store import get_agent_run_history
 from app.multiagent.store import _get_conn
 from app.multiagent.task_board import BoardTask, get_task_board
 from app.multiagent.task_graph import TaskGraph, TaskNode
@@ -42,7 +42,7 @@ class TaskGraphVersion(BaseModel):
 
 def _ensure_schema() -> None:
     conn = _get_conn()
-    from app.multiagent.phase_g_store import (
+    from app.infrastructure.database.run_store import (
         _ensure_task_board_tasks, _ensure_task_graph_snapshots,
     )
     _ensure_task_board_tasks(conn)

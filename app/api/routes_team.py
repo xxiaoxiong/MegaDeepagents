@@ -142,7 +142,7 @@ def _task_team_agents(run_id: str) -> list[dict[str, Any]]:
     agents = get_agent_registry().list_by_run(run_id)
     if agents:
         return [agent.model_dump(mode="json") for agent in agents]
-    from app.multiagent.phase_g_store import get_agent_run_history
+    from app.infrastructure.database.run_store import get_agent_run_history
     return get_agent_run_history().list_by_run(run_id)
 
 
@@ -221,7 +221,7 @@ def get_team_run_agents(run_id: str):
     from app.multiagent.agent_registry import get_agent_registry
     agents = get_agent_registry().list_by_run(run_id)
     if not agents:
-        from app.multiagent.phase_g_store import get_agent_run_history
+        from app.infrastructure.database.run_store import get_agent_run_history
         return get_agent_run_history().list_by_run(run_id)
     return [agent.model_dump(mode="json") for agent in agents]
 
@@ -234,13 +234,13 @@ def get_team_run_tasks(run_id: str):
 
 @router.get("/team-runs/{run_id}/artifacts")
 def get_team_run_artifacts(run_id: str):
-    from app.multiagent.phase_g_store import get_agent_run_history
+    from app.infrastructure.database.run_store import get_agent_run_history
     return get_agent_run_history().list_artifacts_by_run(run_id)
 
 
 @router.get("/team-runs/{run_id}/events")
 def get_team_run_events(run_id: str, after_sequence: int = 0, limit: int = 500):
-    from app.multiagent.phase_g_store import get_agent_run_history
+    from app.infrastructure.database.run_store import get_agent_run_history
     return get_agent_run_history().list_event_envelopes(run_id, after_sequence, limit)
 
 
@@ -251,7 +251,7 @@ def stream_team_run_events(run_id: str, after_sequence: int = 0):
         cursor = after_sequence
         idle = 0
         while idle < 300:
-            from app.multiagent.phase_g_store import get_agent_run_history
+            from app.infrastructure.database.run_store import get_agent_run_history
             events = get_agent_run_history().list_event_envelopes(run_id, cursor, 200)
             if events:
                 idle = 0
@@ -274,7 +274,7 @@ def get_team_run_messages(run_id: str):
 
 @router.get("/team-runs/{run_id}/task-graph")
 def get_team_run_graph(run_id: str):
-    from app.multiagent.phase_g_store import get_agent_run_history
+    from app.infrastructure.database.run_store import get_agent_run_history
     graph = get_agent_run_history().load_task_graph(run_id)
     if graph is None:
         raise HTTPException(status_code=404, detail="TaskGraph not found")
@@ -294,7 +294,7 @@ def peek_team_run_agent(run_id: str, agent_id: str):
 
 @router.get("/team-runs/{run_id}/agents/{agent_id}/transcript")
 def get_team_run_agent_transcript(run_id: str, agent_id: str):
-    from app.multiagent.phase_g_store import get_agent_run_history
+    from app.infrastructure.database.run_store import get_agent_run_history
     messages = [row for row in get_agent_run_history().list_mailbox_messages(run_id=run_id)
                 if row.get("to_agent_id") == agent_id or row.get("from_agent_id") == agent_id]
     events = [row for row in get_agent_run_history().list_event_envelopes(run_id, 0, 2000)
@@ -368,7 +368,7 @@ def list_team_run_worktrees(run_id: str):
 def get_team_run_git_state(run_id: str):
     """Expose governed worktree branches, commits, integration and PR metadata."""
     from app.multiagent.git_workspace import _ensure_schema
-    from app.multiagent.phase_g_store import get_agent_run_history
+    from app.infrastructure.database.run_store import get_agent_run_history
     from app.multiagent.store import _get_conn
     _ensure_schema()
     leases = _get_conn().execute(
@@ -391,7 +391,7 @@ def get_team_run_git_state(run_id: str):
 
 @router.get("/team-runs/{run_id}/verification")
 def get_team_run_verification(run_id: str):
-    from app.multiagent.phase_g_store import get_agent_run_history
+    from app.infrastructure.database.run_store import get_agent_run_history
     events = get_agent_run_history().list_event_envelopes(run_id, 0, 5000)
     return [event for event in events
             if "Verification" in event.get("event_type", "")
@@ -400,7 +400,7 @@ def get_team_run_verification(run_id: str):
 
 @router.get("/team-runs/{run_id}/errors")
 def get_team_run_errors(run_id: str):
-    from app.multiagent.phase_g_store import get_agent_run_history
+    from app.infrastructure.database.run_store import get_agent_run_history
     from app.multiagent.task_board import get_task_board
     tasks = [task.model_dump(mode="json") for task in get_task_board().list_by_run(run_id)
              if task.last_error or task.status.value in {"failed", "repair_required", "blocked"}]
@@ -413,7 +413,7 @@ def get_team_run_errors(run_id: str):
 
 @router.get("/team-runs/{run_id}/artifacts/{artifact_id}/lineage")
 def get_team_run_artifact_lineage(run_id: str, artifact_id: str):
-    from app.multiagent.phase_g_store import get_agent_run_history
+    from app.infrastructure.database.run_store import get_agent_run_history
     artifacts = get_agent_run_history().list_artifacts_by_run(run_id)
     by_id = {item["artifact_id"]: item for item in artifacts}
     current = by_id.get(artifact_id)

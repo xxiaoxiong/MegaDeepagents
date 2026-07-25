@@ -1,0 +1,170 @@
+"""Use-case layer for the unified run API."""
+
+from __future__ import annotations
+
+import asyncio
+from typing import Any, Coroutine
+
+from app.core.logging import logger
+from app.domain.runs.models import RunMode
+from app.infrastructure.database.run_store import (
+    get_agent_run_history,
+    make_run_event_id,
+)
+from app.multiagent.team_run_context import TeamRunMode
+from app.multiagent.team_runtime import get_team_runtime
+
+
+class RunApplicationService:
+    def __init__(self) -> None:
+        self._background: set[asyncio.Task[Any]] = set()
+
+    async def create(
+        self,
+        *,
+        goal: str,
+        mode: RunMode,
+        team_template: str,
+        repository_path: str | None,
+        base_branch: str | None,
+        review_required: bool,
+        auto_approve_low_risk: bool,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        runtime = get_team_runtime()
+        ctx = await runtime.create_run(
+            goal=goal,
+            team_name=team_template,
+            mode=TeamRunMode.TASK_TEAM,
+            max_rounds=30,
+            review_required=review_required,
+            source_repository_path=repository_path,
+            base_branch=base_branch,
+            requested_mode=mode.value,
+            metadata={
+                **metadata,
+                "api_version": "v1",
+                "auto_approve_low_risk": auto_approve_low_risk,
+            },
+        )
+        self._spawn(
+            runtime.start_run(ctx, goal, team_template, 30, review_required),
+            run_id=ctx.run_id,
+        )
+        return self.get(ctx.run_id) or {"run_id": ctx.run_id, "status": "running"}
+
+    def get(self, run_id: str) -> dict[str, Any] | None:
+        record = get_agent_run_history().get_team_run(run_id)
+        return self._normalize(record) if record else None
+
+    def list(self, limit: int = 50) -> list[dict[str, Any]]:
+        return [
+            self._normalize(record)
+            for record in get_agent_run_history().list_team_runs(limit)
+        ]
+
+    async def pause(self, run_id: str) -> bool:
+        return await get_team_runtime().pause_run(run_id)
+
+    async def cancel(self, run_id: str) -> bool:
+        return await get_team_runtime().cancel_run(run_id)
+
+    async def resume(self, run_id: str) -> bool:
+        if self.get(run_id) is None:
+            return False
+        self._spawn(get_team_runtime().resume_run(run_id), run_id=run_id)
+        return True
+
+    async def broadcast_message(self, run_id: str, content: str) -> int:
+        """Deliver a user message through the same durable mailbox as agents."""
+        if self.get(run_id) is None:
+            return 0
+        history = get_agent_run_history()
+        agent_ids = [
+            item["agent_id"] for item in history.list_by_run(run_id)
+            if item.get("status") not in {"stopped", "failed"}
+        ]
+        delivered = 0
+        runtime = get_team_runtime()
+        for agent_id in agent_ids:
+            if await runtime.send_message(run_id, agent_id, content):
+                delivered += 1
+        return delivered
+
+    async def stop_agent(self, run_id: str, agent_id: str) -> bool:
+        return await get_team_runtime().stop_agent(run_id, agent_id)
+
+    def recover_incomplete(self) -> int:
+        recoverable = {
+            "created", "running", "waiting_human",
+        }
+        count = 0
+        for record in get_agent_run_history().list_team_runs(500):
+            if record.get("status") in recoverable:
+                self._spawn(
+                    get_team_runtime().resume_run(record["run_id"]),
+                    run_id=record["run_id"],
+                )
+                count += 1
+        return count
+
+    def _spawn(
+        self, coroutine: Coroutine[Any, Any, Any], *, run_id: str
+    ) -> None:
+        async def guarded() -> Any:
+            try:
+                return await coroutine
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                history = get_agent_run_history()
+                history.update_team_run_status(run_id, "failed")
+                history.record_event(
+                    event_id=make_run_event_id(),
+                    run_id=run_id,
+                    event_type="RunFailed",
+                    payload={
+                        "error_type": type(exc).__name__,
+                        "message": str(exc),
+                        "source": "background_task",
+                    },
+                )
+                logger.exception("Background run failed run=%s", run_id)
+                return None
+
+        task = asyncio.create_task(guarded())
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    @staticmethod
+    def _normalize(record: dict[str, Any]) -> dict[str, Any]:
+        status = record.get("status", "created")
+        status = {
+            "completed": "succeeded",
+            "interrupted": "waiting_human",
+            "incomplete": "failed",
+        }.get(status, status)
+        metadata = record.get("metadata") or {}
+        return {
+            "run_id": record["run_id"],
+            "goal": record.get("goal", ""),
+            "mode": metadata.get("requested_mode", "team"),
+            "resolved_mode": metadata.get("resolved_mode"),
+            "team_template": record.get("team_id", ""),
+            "status": status,
+            "workspace_root": record.get("workspace_root", ""),
+            "review_required": bool(record.get("review_required", True)),
+            "metadata": metadata,
+            "created_at": record.get("created_at"),
+            "updated_at": record.get("updated_at"),
+        }
+
+
+_service: RunApplicationService | None = None
+
+
+def get_run_service() -> RunApplicationService:
+    global _service
+    if _service is None:
+        _service = RunApplicationService()
+    return _service

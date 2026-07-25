@@ -9,7 +9,7 @@ from app.multiagent.agent_profile import get_capability_registry
 from app.multiagent.agent_registry import AgentRegistry, get_agent_registry
 from app.multiagent.default_teams import get_team
 from app.multiagent.mailbox import get_mailbox
-from app.multiagent.phase_g_store import get_agent_run_history, make_run_event_id
+from app.infrastructure.database.run_store import get_agent_run_history, make_run_event_id
 from app.multiagent.team_run_context import TeamRunContext
 
 

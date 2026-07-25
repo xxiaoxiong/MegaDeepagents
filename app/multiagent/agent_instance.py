@@ -3,7 +3,7 @@
 AgentProfile 是静态能力模板，AgentInstance 是运行中的 Agent 实体。
 每个 AgentInstance 拥有独立 Session、Thread、Inbox 和生命周期。
 
-要求（docs/MegaDeepagents_Agent_Teams_改造任务书.md §8）：
+V3 Agent identity requirements：
 - agent_id / team_id / run_id
 - session_id / thread_id / checkpoint_namespace
 - 独立状态机

@@ -10,7 +10,7 @@ from app.multiagent.dynamic_team import DynamicTeamManager
 from app.multiagent.lifecycle_hooks import LifecycleEvent, get_lifecycle_hook_engine
 from app.multiagent.mailbox import MailboxMessage, get_mailbox, make_message_id
 from app.multiagent.permission import PermissionKind, get_permission_broker
-from app.multiagent.phase_g_store import get_agent_run_history, make_run_event_id
+from app.infrastructure.database.run_store import get_agent_run_history, make_run_event_id
 from app.multiagent.plan_approval import PlanApprovalService, TeammatePlan
 from app.multiagent.task_board import BoardTaskStatus, get_task_board
 from app.multiagent.task_graph import TaskNode

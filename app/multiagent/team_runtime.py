@@ -1,7 +1,7 @@
 """TeamRuntimeFacade — 统一团队运行时入口。
 
-docs/MegaDeepagents_Agent_Teams_改造任务书.md §7.2：
-CLI、API、Web 只能调用该 Facade，不得直接实例化旧 TeamRunner 或 SimpleOrchestrator。
+V3 facade compatibility boundary：
+Legacy API、CLI 和恢复代码通过该 Facade；V3 使用 application service。
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ class TeamRuntimeFacade:
     """统一团队运行时门面。
 
     所有团队任务入口（CLI、API、Web）必须通过此门面。
-    内部根据 mode 自动路由到 TASK_TEAM 或 DISCUSSION 运行时。
+    新运行只接受 TASK_TEAM。DISCUSSION 仅用于恢复和取消历史记录。
     """
 
     def __init__(self) -> None:
@@ -42,8 +42,14 @@ class TeamRuntimeFacade:
         base_branch: str | None = None,
         base_commit_sha: str | None = None,
         environment_file_allowlist: list[str] | None = None,
+        requested_mode: str = "team",
+        metadata: dict[str, Any] | None = None,
     ) -> TeamRunContext:
         """创建一次新的团队运行，返回上下文。"""
+        if mode != TeamRunMode.TASK_TEAM:
+            raise ValueError(
+                "DISCUSSION runtime is frozen; create runs through /api/v1/runs"
+            )
         ctx = TeamRunContext.create(
             goal=goal,
             team_name=team_name,
@@ -55,6 +61,8 @@ class TeamRuntimeFacade:
             f"[TeamRuntime] run created: id={ctx.run_id} team={team_name} "
             f"mode={mode.value} workspace={ctx.workspace_root}"
         )
+        ctx.metadata.update(metadata or {})
+        ctx.metadata["requested_mode"] = requested_mode
         if source_repository_path:
             from app.multiagent.git_workspace import RepositoryWorkspaceManager
             repository = RepositoryWorkspaceManager(
@@ -82,7 +90,7 @@ class TeamRuntimeFacade:
             "cancel_event": threading.Event(),
             "created_at": datetime.utcnow(),
         }
-        from app.multiagent.phase_g_store import get_agent_run_history
+        from app.infrastructure.database.run_store import get_agent_run_history
         get_agent_run_history().save_team_run(
             run_id=ctx.run_id, goal=goal, team_id=team_name, mode=mode.value,
             workspace_root=ctx.workspace_root, status="created", max_rounds=max_rounds,
@@ -113,7 +121,7 @@ class TeamRuntimeFacade:
         if ctx.run_id not in self._active_runs:
             self._activate_restored_run(ctx, goal, team_name, max_rounds, review_required)
         self._active_runs[ctx.run_id]["status"] = "running"
-        from app.multiagent.phase_g_store import get_agent_run_history
+        from app.infrastructure.database.run_store import get_agent_run_history
         get_agent_run_history().update_team_run_status(ctx.run_id, "running")
         from app.multiagent.lifecycle_hooks import LifecycleEvent, get_lifecycle_hook_engine
         hook = await get_lifecycle_hook_engine().emit_async(
@@ -149,11 +157,11 @@ class TeamRuntimeFacade:
         *,
         resume: bool = False,
     ) -> TeamRunResult:
-        """TASK_TEAM 模式：使用 Phase Two 基于 TaskGraph 的编排器。"""
+        """Execute through the unified V3 LangGraph root graph."""
         from app.multiagent.executor import DeepAgentExecutor
         from app.multiagent.verifier import Verifier, LLMRubricVerifier
         from app.multiagent.planner import plan_with_llm
-        from app.multiagent.orchestrator import run_orchestrated
+        from app.runtime.root_graph.graph import run_governed
         from app.multiagent.artifact import ArtifactStore
         from app.multiagent.lifecycle_hooks import LifecycleEvent, get_lifecycle_hook_engine
 
@@ -175,23 +183,26 @@ class TeamRuntimeFacade:
 
         # 串联运行
         resume_graph = self._task_graph_from_persisted_board(ctx.run_id) if resume else None
-        # run_orchestrated contains synchronous planning/executor adapters.
-        # Offloading keeps the API event loop responsive for message/cancel.
+        # The unified LangGraph root graph is the production orchestration
+        # kernel for both single and team execution modes.
         result = await asyncio.to_thread(
-            run_orchestrated,
+            run_governed,
             goal=goal,
-            mode_override="full_multi",
+            requested_mode=str(ctx.metadata.get("requested_mode", "team")),
             planner=lambda g, c: plan_with_llm(g, context=c),
             executor=executor,
             verifier=verifier,
             ctx=ctx,
             cancel_event=self._active_runs[ctx.run_id]["cancel_event"],
             task_graph=resume_graph,
+            resume=resume,
+            max_rounds=max_rounds,
         )
 
         # 映射结果
         status_map = {
             "completed": "completed",
+            "succeeded": "completed",
             "failed": "failed",
             "interrupted": (
                 "paused" if result.error == "paused"
@@ -201,7 +212,7 @@ class TeamRuntimeFacade:
             "incomplete": "failed",
         }
         self._active_runs[ctx.run_id]["status"] = status_map.get(result.status, "failed")
-        from app.multiagent.phase_g_store import get_agent_run_history
+        from app.infrastructure.database.run_store import get_agent_run_history
         get_agent_run_history().update_team_run_status(ctx.run_id, self._active_runs[ctx.run_id]["status"])
         final_status = self._active_runs[ctx.run_id]["status"]
         final_event = (LifecycleEvent.RUN_COMPLETED if final_status == "completed"
@@ -230,7 +241,7 @@ class TeamRuntimeFacade:
         """
         from app.multiagent.task_board import get_task_board, BoardTaskStatus
         from app.multiagent.task_graph import TaskGraph, TaskNode, TaskNodeStatus
-        from app.multiagent.phase_g_store import get_agent_run_history
+        from app.infrastructure.database.run_store import get_agent_run_history
 
         board = get_task_board()
         board.restore_run(run_id)
@@ -294,7 +305,7 @@ class TeamRuntimeFacade:
     async def cancel_run(self, run_id: str) -> bool:
         run = self._active_runs.get(run_id)
         if not run:
-            from app.multiagent.phase_g_store import get_agent_run_history
+            from app.infrastructure.database.run_store import get_agent_run_history
             history = get_agent_run_history()
             if not history.get_team_run(run_id):
                 return False
@@ -313,7 +324,7 @@ class TeamRuntimeFacade:
         from app.multiagent.task_board import get_task_board
         get_task_board().cancel_run(run_id)
         run["status"] = "cancelled"
-        from app.multiagent.phase_g_store import get_agent_run_history
+        from app.infrastructure.database.run_store import get_agent_run_history
         get_agent_run_history().update_team_run_status(run_id, "cancelled")
         return True
 
@@ -328,7 +339,7 @@ class TeamRuntimeFacade:
             get_agent_runtime_manager().pause_agent(run_id, agent.agent_id)
         if run_id in self._active_runs:
             self._active_runs[run_id]["status"] = "paused"
-        from app.multiagent.phase_g_store import get_agent_run_history
+        from app.infrastructure.database.run_store import get_agent_run_history
         return get_agent_run_history().update_team_run_status(run_id, "paused")
 
     async def pause_agent(self, run_id: str, agent_id: str) -> bool:
@@ -356,7 +367,7 @@ class TeamRuntimeFacade:
         run = self._active_runs.get(run_id)
         if run is not None:
             return run
-        from app.multiagent.phase_g_store import get_agent_run_history
+        from app.infrastructure.database.run_store import get_agent_run_history
         return get_agent_run_history().get_team_run(run_id)
 
     async def send_message(self, run_id: str, agent_id: str, message: str) -> bool:
@@ -371,7 +382,7 @@ class TeamRuntimeFacade:
         if target is None or target.run_id != run_id:
             # Cold runs may not yet be rehydrated; durable identity is still
             # authoritative for message routing.
-            from app.multiagent.phase_g_store import get_agent_run_history
+            from app.infrastructure.database.run_store import get_agent_run_history
             stored = get_agent_run_history().get_agent_instance(agent_id)
             if not stored or stored.get("run_id") != run_id:
                 return False
@@ -408,7 +419,7 @@ class TeamRuntimeFacade:
     async def resume_run(self, run_id: str) -> bool:
         """Restore durable state and continue the same TASK_TEAM execution."""
         from app.multiagent.resume_coordinator import get_resume_coordinator
-        from app.multiagent.phase_g_store import get_agent_run_history
+        from app.infrastructure.database.run_store import get_agent_run_history
 
         run = self._active_runs.get(run_id)
         if not run:
@@ -485,7 +496,7 @@ class TeamRuntimeFacade:
 
     def list_run_records(self, limit: int = 50) -> list[dict[str, Any]]:
         """Return active and cold-restart TASK_TEAM runs without a second store."""
-        from app.multiagent.phase_g_store import get_agent_run_history
+        from app.infrastructure.database.run_store import get_agent_run_history
         records = {record["run_id"]: record for record in get_agent_run_history().list_team_runs(limit)}
         for run_id, active in self._active_runs.items():
             records[run_id] = {

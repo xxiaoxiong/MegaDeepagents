@@ -1,4 +1,4 @@
-"""TaskGraph 单元测试（docs/upgradePhaseTwo.md 测试要求 1-4）。
+"""TaskGraph 单元测试。
 
 覆盖：
 1. Planner 生成合法 DAG（add_node + validate）

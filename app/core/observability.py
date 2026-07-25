@@ -11,7 +11,7 @@
 7. 持久化：TeamRunner 通过 get_current_run_url() 拿到 run URL 落库到 team_rounds
 
 不让 LangSmith 强依赖外网 / 不破坏现有 API / 不影响未配置时的本地体验，
-这是 docs/updatePlan.md 与 docs/reviewUpdate.md 的硬性约束。
+V3 可观测性约束见 docs/architecture.md 与 docs/testing.md。
 """
 
 from __future__ import annotations

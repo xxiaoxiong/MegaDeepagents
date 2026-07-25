@@ -2,30 +2,30 @@
 
 import json
 import sqlite3
-import threading
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
-from app.core.config import settings
 from app.core.logging import logger
+from app.infrastructure.database.connection import (
+    close_connection as close_database_connection,
+    get_connection as get_database_connection,
+)
 from app.task.models import ArtifactInfo, Task, TaskEvent, TaskMessage, TaskStatus
 
 
-_local = threading.local()
+_initialized_connection_ids: set[int] = set()
 
 
-def get_connection() -> sqlite3.Connection:
-    if not hasattr(_local, "conn") or _local.conn is None:
-        db_path = Path(settings.sqlite_path)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        _local.conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        _local.conn.row_factory = sqlite3.Row
-        _init_db(_local.conn)
-    return _local.conn
+def get_connection():
+    connection = get_database_connection()
+    connection_id = id(connection)
+    if connection_id not in _initialized_connection_ids:
+        _init_db(connection)
+        _initialized_connection_ids.add(connection_id)
+    return connection
 
 
-def _init_db(conn: sqlite3.Connection) -> None:
+def _init_db(conn) -> None:
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS tasks (
             task_id TEXT PRIMARY KEY,
@@ -55,7 +55,7 @@ def _init_db(conn: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS artifacts (
+        CREATE TABLE IF NOT EXISTS task_artifacts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             task_id TEXT NOT NULL,
             path TEXT NOT NULL,
@@ -94,7 +94,7 @@ def _init_db(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_task_events_task_id ON task_events(task_id);
         CREATE INDEX IF NOT EXISTS idx_task_messages_task_id ON task_messages(task_id);
-        CREATE INDEX IF NOT EXISTS idx_artifacts_task_id ON artifacts(task_id);
+        CREATE INDEX IF NOT EXISTS idx_task_artifacts_task_id ON task_artifacts(task_id);
         CREATE INDEX IF NOT EXISTS idx_skills_name ON skills(name);
         CREATE INDEX IF NOT EXISTS idx_skill_usage_skill_id ON skill_usage_events(skill_id);
         CREATE INDEX IF NOT EXISTS idx_skill_usage_task_id ON skill_usage_events(task_id);
@@ -103,9 +103,8 @@ def _init_db(conn: sqlite3.Connection) -> None:
 
 
 def close_connection() -> None:
-    if hasattr(_local, "conn") and _local.conn is not None:
-        _local.conn.close()
-        _local.conn = None
+    _initialized_connection_ids.clear()
+    close_database_connection()
 
 
 class TaskStore:
@@ -207,7 +206,7 @@ class TaskStore:
 
     def add_artifact(self, task_id: str, artifact: ArtifactInfo) -> None:
         self.conn.execute(
-            "INSERT INTO artifacts (task_id, path, name, size_bytes, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO task_artifacts (task_id, path, name, size_bytes, created_at) VALUES (?, ?, ?, ?, ?)",
             (
                 task_id,
                 artifact.path,
@@ -241,7 +240,7 @@ class TaskStore:
 
     def get_artifacts(self, task_id: str) -> list[ArtifactInfo]:
         cur = self.conn.execute(
-            "SELECT path, name, size_bytes FROM artifacts WHERE task_id = ?",
+            "SELECT path, name, size_bytes FROM task_artifacts WHERE task_id = ?",
             (task_id,),
         )
         return [
@@ -259,7 +258,7 @@ class TaskStore:
             return False
         self.conn.execute("DELETE FROM task_messages WHERE task_id = ?", (task_id,))
         self.conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-        self.conn.execute("DELETE FROM artifacts WHERE task_id = ?", (task_id,))
+        self.conn.execute("DELETE FROM task_artifacts WHERE task_id = ?", (task_id,))
         self.conn.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
         self.conn.commit()
         return True

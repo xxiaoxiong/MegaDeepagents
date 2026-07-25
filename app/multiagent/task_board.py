@@ -1,9 +1,9 @@
 """TaskBoard — 共享子任务板。
 
-Phase D：所有 Agent 通过原子认领抢占任务。
-不依赖 TaskScheduler 的内部 [], 而用持久化认领状态。
+所有 Agent 通过原子认领抢占任务。
+不依赖调度器的进程内列表，而用持久化认领状态。
 
-认领契约（docs/MegaDeepagents_Agent_Teams_改造任务书.md §9）：
+原子认领契约：
 - claim(task_id, agent_id) → 成功 / 已被认领
 - release(task_id, agent_id) → 释放回 pending
 - complete(task_id, agent_id, artifacts) → 标记 succeeded
@@ -84,7 +84,7 @@ class TaskBoard:
         if not self._persist_enabled:
             return
         try:
-            from app.multiagent.phase_g_store import get_agent_run_history
+            from app.infrastructure.database.run_store import get_agent_run_history
             get_agent_run_history().upsert_task_board_task(task.model_dump(mode="json"))
         except Exception as exc:
             # A failed durable write makes recovery unsafe.  Surface it to the
@@ -379,7 +379,7 @@ class TaskBoard:
         if not self._persist_enabled:
             return 0
         try:
-            from app.multiagent.phase_g_store import get_agent_run_history
+            from app.infrastructure.database.run_store import get_agent_run_history
             payloads = get_agent_run_history().list_task_board_tasks(run_id)
         except Exception as exc:
             logger.error("[TaskBoard] restore failed run=%s: %s", run_id, exc)

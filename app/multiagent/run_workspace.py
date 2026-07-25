@@ -1,4 +1,4 @@
-"""Run-level workspace isolation（docs/upgradePhaseTwo.md §九）。
+"""V3 Run-level workspace isolation.
 
 设计：
 - 每个 Run 拥有独立 workspace 根目录

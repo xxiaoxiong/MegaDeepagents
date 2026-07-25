@@ -1,6 +1,6 @@
 """AgentExecutor — 统一 Worker 执行接口。
 
-docs/upgradePhaseTwo.md §三：
+V3 Worker harness contract：
 - `DeepAgentExecutor` — 用于 Coder、Tester、Researcher 等真实 Worker。调用真实 Deep Agent
   并传递 profile 中受限的工具集。
 - `ModelDecisionExecutor` — 用于 Planner、Router、轻量 Evaluator 等仅需结构化决策节点。
@@ -136,7 +136,7 @@ class ModelDecisionExecutor:
 
         start = time.time()
         try:
-            # Phase Two #17: model_policy 影响模型选择
+            # model_policy 影响模型选择。
             from app.llm_factory import build_model_for_policy
             llm = build_model_for_policy(getattr(profile, "model_policy", None))
             try:
@@ -201,7 +201,7 @@ def _tool_hook(event: str, *, run_id: str, agent_id: str, task_id: str,
     """Run lifecycle hooks at the same governed boundary as every local tool."""
     if not run_id:
         return
-    from app.multiagent.phase_g_store import get_agent_run_history, make_run_event_id
+    from app.infrastructure.database.run_store import get_agent_run_history, make_run_event_id
     get_agent_run_history().record_event(
         event_id=make_run_event_id(), run_id=run_id, event_type=event,
         agent_id=agent_id, task_id=task_id,
@@ -383,7 +383,7 @@ def _make_execute_tool(
     def execute(argv: list[str]) -> str:
         """以结构化 argv 执行命令；不会经过 shell 字符串解析。"""
         from app.multiagent.shell_policy import ShellCommandRunner
-        from app.multiagent.phase_g_store import get_agent_run_history, make_run_event_id
+        from app.infrastructure.database.run_store import get_agent_run_history, make_run_event_id
         from app.multiagent.tool_runtime import ToolInvocation, ToolInvocationStatus, ToolSideEffectJournal
         _tool_boundary(cancel_event, safety_point)
         _tool_hook("BeforeToolUse", run_id=run_id, agent_id=agent_id,
@@ -502,7 +502,7 @@ class DeepAgentExecutor:
                 execute_task 调用方必须通过 task_input 传入。
         """
         self.workspace_root = workspace_root
-        # ArtifactStore 注入（Phase A 修复断链）
+        # ArtifactStore 由运行时显式注入。
         self._artifact_store: Any | None = None
         # 测试 hook：设置后 execute 跳过真实 agent 创建
         self._mock_response: AgentExecutionResult | None = None
@@ -530,7 +530,7 @@ class DeepAgentExecutor:
         task_id: str,
         task_input: dict[str, Any],
     ) -> "TaskResult":
-        """对接 TaskScheduler 的 WorkerExecutor 协议。
+        """对接受治理调度器的 Worker 执行协议。
 
         适配逻辑：
         1. 从 task_dag 取 TaskNode
@@ -543,11 +543,11 @@ class DeepAgentExecutor:
             - workspace_root: str   覆盖 self.workspace_root
             - input_artifact_ids: list[str]
         """
-        from app.multiagent.scheduler import TaskResult
+        from app.domain.tasks.models import TaskExecutionResult
 
         node = task_dag.nodes.get(task_id)
         if node is None:
-            return TaskResult(
+            return TaskExecutionResult(
                 task_id=task_id,
                 success=False, error=f"task {task_id} not in dag",
                 artifact_ids=[],
@@ -568,7 +568,7 @@ class DeepAgentExecutor:
         if profile is None:
             profile = registry.find_best_worker(set(node.required_capabilities))
         if profile is None or not set(node.required_capabilities).issubset(profile.capabilities):
-            return TaskResult(
+            return TaskExecutionResult(
                 task_id=task_id, success=False, artifact_ids=[],
                 error="no_matching_worker",
             )
@@ -606,7 +606,7 @@ class DeepAgentExecutor:
         result = self.execute(assignment, profile, context)
 
         # 把 produced_artifact_ids 装回 TaskNode 用作下游 input
-        return TaskResult(
+        return TaskExecutionResult(
             task_id=task_id,
             success=result.success,
             artifact_ids=list(result.produced_artifact_ids or []),
@@ -655,7 +655,7 @@ class DeepAgentExecutor:
         start = time.time()
 
         try:
-            # Phase Two #17: 让 profile.model_policy 真正影响模型选择
+            # profile.model_policy 参与模型选择。
             from app.llm_factory import build_model_for_policy
             model = build_model_for_policy(getattr(profile, "model_policy", None))
             # DeepAgent execution remains available when the optional

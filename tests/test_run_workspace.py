@@ -130,7 +130,12 @@ def test_is_within_run_rejects_symlink_escape(tmp_path):
     ws = RunWorkspace(run_id="r_link", base_root=str(tmp_path))
     outside = tmp_path / "outside"
     outside.mkdir()
-    os.symlink(outside, os.path.join(ws.tasks_dir, "escaped"))
+    try:
+        os.symlink(outside, os.path.join(ws.tasks_dir, "escaped"))
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink privilege is unavailable")
+        raise
     assert not is_within_run(os.path.join(ws.tasks_dir, "escaped", "owned.py"), ws)
 
 

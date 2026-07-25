@@ -29,7 +29,7 @@ from app.multiagent.permission import (
 from app.multiagent.lifecycle_hooks import (
     HookResult, LifecycleEvent, get_lifecycle_hook_engine,
 )
-from app.multiagent.phase_g_store import get_agent_run_history, make_run_event_id
+from app.infrastructure.database.run_store import get_agent_run_history, make_run_event_id
 from app.multiagent.plan_approval import PlanApprovalService, PlanStatus, TeammatePlan
 from app.multiagent.shell_policy import (
     CommandCategory,

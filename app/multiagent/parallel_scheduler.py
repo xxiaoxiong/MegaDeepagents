@@ -1,6 +1,6 @@
 """ParallelTeamScheduler — 基于 asyncio + TaskBoard + AgentRegistry 的真实并行调度。
 
-Phase E（docs/MegaDeepagents_Agent_Teams_改造任务书.md §10）：
+生产并行调度语义：
 - 不再用顺序 for 循环遍历 ready_tasks；改用 asyncio 协程池并行执行
 - TaskBoard 提供原子认领，多 Agent 可同时抢任务
 - AgentRegistry 提供 Agent 生命周期 + 心跳，调度器从空闲池子里挑 worker
@@ -10,7 +10,7 @@ Phase E（docs/MegaDeepagents_Agent_Teams_改造任务书.md §10）：
 设计原则：
 - 与现有 _run_sync_fallback 并存：
   - TASK_TEAM 默认走 ParallelTeamScheduler（async）
-  - 旧的 Sync scheduler 保留作为已知回退
+  - 不包含旁路同步调度器
 - 优先保证 LLM 工具场景的吞吐：无相互依赖的 task 并行执行
 - 单 task 失败不阻塞其他 task
 - 调度器和 AgentRegistry 通过心跳互锁：超时的 Agent 被回收，其任务由 timeout
@@ -132,7 +132,7 @@ class ParallelTeamScheduler:
         while round_n < self.max_rounds:
             round_n += 1
 
-            from app.multiagent.phase_g_store import get_agent_run_history
+            from app.infrastructure.database.run_store import get_agent_run_history
             run_record = get_agent_run_history().get_team_run(self.run_id)
             if run_record and run_record.get("status") == "paused":
                 return self._finalize(round_n, status=ScheduleStatus.PAUSED.value,
@@ -333,7 +333,7 @@ class ParallelTeamScheduler:
 
             # 心跳任务（执行长时间时记录进度）
             beat_stop = asyncio.Event()
-            from app.multiagent.phase_g_store import get_agent_run_history, make_task_run_id
+            from app.infrastructure.database.run_store import get_agent_run_history, make_task_run_id
             history = get_agent_run_history()
             task_run_id = make_task_run_id()
             history.insert_task_run(
@@ -522,7 +522,7 @@ class ParallelTeamScheduler:
                             {"run_id": self.run_id, "agent_id": agent.agent_id,
                              "task_id": task.task_id, "verdict": "repair"},
                         )
-                    # Phase Two #19: 实时更新 CapabilityRegistry 指标
+                    # 实时更新 CapabilityRegistry 指标。
                     try:
                         from app.multiagent.agent_profile import get_capability_registry
                         get_capability_registry().record_success(agent.profile_id)
@@ -539,7 +539,7 @@ class ParallelTeamScheduler:
                         {"run_id": self.run_id, "agent_id": agent.agent_id,
                          "task_id": task.task_id, "error": result.error or "unknown"},
                     )
-                    # Phase Two #19: 实时更新 CapabilityRegistry 指标
+                    # 实时更新 CapabilityRegistry 指标。
                     try:
                         from app.multiagent.agent_profile import get_capability_registry
                         get_capability_registry().record_failure(agent.profile_id)

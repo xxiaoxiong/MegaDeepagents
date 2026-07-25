@@ -1,4 +1,4 @@
-"""Artifact：真实产物模型（docs/upgradePhaseTwo.md §十）。
+"""Artifact：V3 真实产物模型。
 
 设计目标：
 1. Agent 之间不再通过超长消息传递代码和报告，而是通过 Artifact ID 引用
@@ -171,8 +171,8 @@ class ArtifactStore:
     4. 内容读取：read(artifact_id) → 文件内容
     5. 跨 Run 不可访问（root_path 由 run_id 隔离）
 
-    Phase G #14: create() 时同步写到 SQLite（phase_g_store.insert_artifact），
-    允许跨进程重启后通过 load_from_db(run_id) 重建内存注册表。
+    create() 同步写到 SQLite，允许跨进程重启后通过
+    load_from_db(run_id) 重建内存注册表。
     """
 
     def __init__(self, root_path: str | None = None) -> None:
@@ -201,7 +201,7 @@ class ArtifactStore:
         1. 计算 hash、size
         2. 写入磁盘（如启用 root_path）
         3. 注册到内存索引
-        4. 同步写入 SQLite（Phase G: persistence）
+        4. 同步写入 SQLite
         5. 标记为 PUBLISHED
         """
         artifact_type = type if isinstance(type, ArtifactType) else ArtifactType(type)
@@ -244,9 +244,9 @@ class ArtifactStore:
         self._by_task.setdefault(task_id, []).append(artifact.id)
         self._by_run.setdefault(run_id, []).append(artifact.id)
 
-        # Phase G: 同步写入 SQLite（跨进程恢复）
+        # 同步写入 SQLite，供跨进程恢复。
         try:
-            from app.multiagent.phase_g_store import get_agent_run_history
+            from app.infrastructure.database.run_store import get_agent_run_history
             from app.multiagent.store import _get_conn
             # 确保 sqlite 连接存在可写
             h = get_agent_run_history()
@@ -277,13 +277,13 @@ class ArtifactStore:
     # ---- 从 SQLite 恢复 ----
 
     def load_from_db(self, run_id: str) -> int:
-        """从 SQLite phase_g_store 重建本 run 的所有 Artifact 内存注册表。
+        """从 SQLite 重建本 run 的所有 Artifact 内存注册表。
 
         跨进程重启后调用，确保 resume 后可查询到之前的 Artifact 记录。
         返回恢复条数。幂等：已存在同 artifact_id 的内存条目跳过。
         """
         try:
-            from app.multiagent.phase_g_store import get_agent_run_history
+            from app.infrastructure.database.run_store import get_agent_run_history
             h = get_agent_run_history()
             rows = h.list_artifacts_by_run(run_id)
         except Exception as exc:

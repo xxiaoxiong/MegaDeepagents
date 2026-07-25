@@ -1,4 +1,4 @@
-"""Verifier 单元测试（docs/upgradePhaseTwo.md §十二）。"""
+"""Verifier 单元测试。"""
 from __future__ import annotations
 
 import os

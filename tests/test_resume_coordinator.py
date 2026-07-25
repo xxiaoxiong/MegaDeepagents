@@ -16,7 +16,7 @@ def _isolate(tmp_path):
     cfg.sqlite_path = str(tmp_path / "test_resume.sqlite3")
     from app.multiagent.agent_registry import reset_agent_registry
     from app.multiagent.task_board import reset_task_board
-    from app.multiagent.phase_g_store import reset_agent_run_history
+    from app.infrastructure.database.run_store import reset_agent_run_history
     reset_agent_registry()
     reset_task_board()
     reset_agent_run_history()
@@ -40,7 +40,7 @@ class TestResumeCoordinator:
     def test_resume_recovers_persisted_agent(self):
         """持久化有 Agent → 重建为 IDLE Agent。"""
         from app.multiagent.resume_coordinator import ResumeCoordinator
-        from app.multiagent.phase_g_store import get_agent_run_history
+        from app.infrastructure.database.run_store import get_agent_run_history
         from app.multiagent.agent_registry import get_agent_registry
 
         h = get_agent_run_history()
@@ -66,7 +66,7 @@ class TestResumeCoordinator:
     def test_resume_does_not_promote_unverified_history(self):
         """历史 task_run 不能绕过 Board/Verifier 直接晋升成功。"""
         from app.multiagent.resume_coordinator import ResumeCoordinator
-        from app.multiagent.phase_g_store import get_agent_run_history
+        from app.infrastructure.database.run_store import get_agent_run_history
         from app.multiagent.task_board import get_task_board, BoardTaskStatus
 
         board = get_task_board()
@@ -88,7 +88,7 @@ class TestResumeCoordinator:
     def test_resume_does_not_touch_failed_task(self):
         """Failure 状态的 task 不应被置为成功（应留给主链重试）。"""
         from app.multiagent.resume_coordinator import ResumeCoordinator
-        from app.multiagent.phase_g_store import get_agent_run_history
+        from app.infrastructure.database.run_store import get_agent_run_history
         from app.multiagent.task_board import get_task_board, BoardTaskStatus
 
         board = get_task_board()
@@ -115,7 +115,7 @@ class TestResumeCoordinator:
     def test_resume_skips_stopped_agent(self):
         """停止/失败的 Agent 不被重建。"""
         from app.multiagent.resume_coordinator import ResumeCoordinator
-        from app.multiagent.phase_g_store import get_agent_run_history
+        from app.infrastructure.database.run_store import get_agent_run_history
         from app.multiagent.agent_registry import get_agent_registry
 
         h = get_agent_run_history()

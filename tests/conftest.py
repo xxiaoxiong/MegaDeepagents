@@ -48,7 +48,7 @@ def _isolate_multiagent_store(tmp_path):
     from app.multiagent.agent_runtime_manager import reset_agent_runtime_manager
     from app.multiagent.task_board import reset_task_board
     from app.multiagent.mailbox import reset_mailbox
-    from app.multiagent.phase_g_store import reset_agent_run_history
+    from app.infrastructure.database.run_store import reset_agent_run_history
     from app.multiagent.teammate_session import reset_teammate_supervisor
     from app.multiagent.permission import reset_permission_broker
     from app.multiagent.lifecycle_hooks import reset_lifecycle_hook_engine

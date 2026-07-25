@@ -23,7 +23,7 @@ class DagRecordingExecutor:
         self.received_dag = None
 
     def execute_task(self, dag, task_id, task_input):
-        from app.multiagent.scheduler import TaskResult
+        from app.domain.tasks.models import TaskExecutionResult as TaskResult
 
         self.received_dag = dag
         assert dag is not None

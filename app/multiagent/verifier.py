@@ -1,4 +1,4 @@
-"""Verifier：统一验证引擎（docs/upgradePhaseTwo.md §十二）。
+"""Verifier：V3 统一验证引擎。
 
 设计分层：
 1. **程序化验证**（ProgrammaticVerifier）：文件存在、JSON Schema、测试命令、构建命令、Lint、输出格式
@@ -472,7 +472,7 @@ class Verifier:
         self.programmatic = programmatic or ProgrammaticVerifier()
         self.llm_rubric = llm_rubric or LLMRubricVerifier(model_available=True)
         self.human_approval = human_approval  # 预留：未来接入 HITL
-        # Phase Two #16: 接入 ArtifactStore，让 Verifier 能读到注册表里的真实
+        # 接入 ArtifactStore，让 Verifier 能读到注册表里的真实
         # artifact 元数据与文件内容（content_hash / size / produced_by / version）。
         self.artifact_store = artifact_store
 
@@ -550,7 +550,7 @@ class Verifier:
         Returns:
             最终验证结果（取各层最差 verdict）
         """
-        # Phase Two #16: 接入 ArtifactStore 读取真实文件 + 元数据
+        # 接入 ArtifactStore 读取真实文件和元数据。
         artifacts = self._enrich_with_artifact_store(artifacts)
         all_results: list[ValidationResult] = []
 
