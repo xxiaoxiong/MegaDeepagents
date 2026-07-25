@@ -244,10 +244,18 @@ class TeamControlPlaneService:
     def team_report_progress(self, run_id: str, agent_id: str, task_id: str,
                              progress: float, summary: str) -> bool:
         self._caller(run_id, agent_id)
-        if not 0 <= progress <= 1:
-            raise ValueError("progress must be between 0 and 1")
+        # LLM 偶尔会传入略超出区间的浮点（如 1.00001、1.5、100 等）；与其 fail-fast
+        # 让任务停止，不如 clamp 到 [0, 1]，工具返回 ok，agent 继续推进。
+        try:
+            p = float(progress)
+        except (TypeError, ValueError):
+            p = 0.0
+        if p < 0:
+            p = 0.0
+        elif p > 1:
+            p = 1.0
         self._audit("report_progress", run_id, agent_id,
-                    {"task_id": task_id, "progress": progress, "summary": summary})
+                    {"task_id": task_id, "progress": p, "summary": summary})
         return True
 
 

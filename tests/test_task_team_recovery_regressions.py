@@ -208,3 +208,21 @@ def test_agent_registry_persists_each_lease_transition_without_team_builder():
     stored = get_agent_run_history().get_agent_instance(agent.agent_id)
     assert stored["status"] == "idle"
     assert stored["current_task_id"] is None
+
+
+def test_reserve_idle_agent_falls_back_past_tool_caps():
+    """ reserve_idle_agent 在 task 附带工具能力时仍应匹配到主角色 Worker。 """
+    from app.multiagent.agent_registry import AgentRegistry
+    from app.infrastructure.database.run_store import get_agent_run_history
+
+    registry = AgentRegistry()
+    registry.create_agent(
+        profile_id="coder", name="Coder", role="coder", team_id="team",
+        run_id="run_tool_fallback", capabilities=["coding", "file_read"], workspace_root=".",
+    )
+    # 直接传含工具能力的集合 → 应成功匹配（主角色 coding 满足）
+    agent = registry.reserve_idle_agent("run_tool_fallback", {"coding", "file_write"}, "task_a")
+    assert agent is not None, "should fall back past tool-only mismatch for primary cap"
+    stored = get_agent_run_history().get_agent_instance(agent.agent_id)
+    assert stored["status"] == "claiming"
+    assert stored["current_task_id"] == "task_a"

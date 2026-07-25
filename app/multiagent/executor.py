@@ -656,8 +656,18 @@ class DeepAgentExecutor:
 
         try:
             # profile.model_policy 参与模型选择。
-            from app.llm_factory import build_model_for_policy
-            model = build_model_for_policy(getattr(profile, "model_policy", None))
+            # deepagents 0.6.8 的 create_deep_agent 内部走
+            # ``init_chat_model(model_spec, **apply_provider_profile(model_spec))``,
+            # 既不接受已实例化的 ChatOpenAI（init_chat_model 会拒绝，且
+            # apply_provider_profile 会调 ``spec.count(":")`` 抛 AttributeError），
+            # 也无法读我们 llm_factory 配的 streaming / request_timeout。
+            # 因此正路是：传字符串 model spec；用
+            # `_install_deepagents_openai_profile_override()` 在 llm_factory 里
+            # 把 openai provider profile 的 init_kwargs 设成 use_responses_api=False,
+            # request_timeout=600, max_retries=2, streaming=True。这样 init_chat_model
+            # 创建 ChatOpenAI 时会带上这些连接层参数，避免上游网关长 idle 断 socket。
+            from app.llm_factory import build_deepagents_model_spec
+            model = build_deepagents_model_spec(getattr(profile, "model_policy", None))
             # DeepAgent execution remains available when the optional
             # langgraph sqlite checkpointer extra is absent.  A failed import
             # must not prevent real tools/artifacts from running.
@@ -813,7 +823,10 @@ class DeepAgentExecutor:
 
         except Exception as exc:
             elapsed = time.time() - start
-            logger.error(f"[DeepAgentExecutor] task={assignment.task_id} failed: {exc}")
+            import traceback
+            logger.error(
+                f"[DeepAgentExecutor] task={assignment.task_id} failed: {exc}\n{traceback.format_exc()}"
+            )
             return AgentExecutionResult(
                 success=False,
                 error=str(exc),

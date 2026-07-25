@@ -77,6 +77,7 @@ async def create_run(request: CreateRunRequest):
         review_required=request.review_required,
         auto_approve_low_risk=request.auto_approve_low_risk,
         metadata=request.metadata,
+        max_rounds=request.max_rounds,
     )
     return _public_run(run)
 

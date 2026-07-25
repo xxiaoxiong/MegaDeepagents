@@ -168,6 +168,18 @@ def test_success_rate_affects_score():
     assert best.id == "reliable"
 
 
+def test_find_best_worker_returns_none_when_only_tool_caps_misaligned():
+    """A primary-cap-only worker must remain unselectable when task asks for
+    extra tool caps the worker doesn't declare — the contract callers rely
+    on to detect the need for the TeamBuilder/scheduler fallback."""
+    reg = CapabilityRegistry()
+    reg.register(_make_profile("planner", caps={"planning", "summarization"}))
+    # task 想要 planning + file_write；planner 没 file_write
+    assert reg.find_best_worker({"planning", "file_write"}) is None
+    # 主匹配应失败 → 调用方负责剥离 TOOL_CAPS 重试
+    assert reg.find_best_worker({"planning"}) is not None
+
+
 # ===== 4. 默认 Profiles 注册 =====
 
 

@@ -128,6 +128,24 @@ def test_llm_rubric_fallback_empty_artifact():
     assert len(result.failed_criteria) >= 2
 
 
+def test_llm_rubric_parse_json_handles_plain_codeblock_and_embedded():
+    """LLM 响应可以是纯 JSON、```json 代码块，或嵌在叙述文字中。"""
+    from app.multiagent.verifier import LLMRubricVerifier
+
+    plain = '{"scores": {"completeness": 0.8}, "verdict": "pass", "summary": "ok"}'
+    codeblock = "```json\n" + plain + "\n```"
+    embedded = "好的，我已经评估完毕，结果如下：\n" + plain + "\n以上是结论。"
+
+    for text in (plain, codeblock, embedded):
+        parsed = LLMRubricVerifier._parse_rubric_json(text)
+        assert parsed["verdict"] == "pass"
+        assert parsed["scores"]["completeness"] == 0.8
+
+    import pytest
+    with pytest.raises(TypeError):
+        LLMRubricVerifier._parse_rubric_json("not json at all")
+
+
 # ===== Verifier 顶层 =====
 
 

@@ -33,7 +33,7 @@ PLANNNER_SPEC = AgentSpec(
         MessageType.CRITIQUE,
         MessageType.REVIEW_RESULT,
     ],
-    allowed_tools=[],
+    allowed_tools=["create_file", "edit_file", "read_file", "list_dir"],
     subscription=AgentSubscription(
         message_types=[
             MessageType.USER_REQUEST,

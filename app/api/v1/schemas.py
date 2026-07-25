@@ -32,6 +32,7 @@ class CreateRunRequest(BaseModel):
     base_branch: str | None = None
     review_required: bool = True
     auto_approve_low_risk: bool = False
+    max_rounds: int = Field(default=80, ge=1, le=400)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("goal")

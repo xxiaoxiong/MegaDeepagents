@@ -37,9 +37,26 @@ class TeamBuilder:
         profiles = get_capability_registry()
         required_profile_ids: set[str] = set()
         for node in task_graph.nodes.values():
-            profile = profiles.find_best_worker(set(node.required_capabilities))
+            caps = set(node.required_capabilities)
+            profile = profiles.find_best_worker(caps)
             if profile is None:
-                # Do not disguise a missing worker as a privileged coder.
+                # Fallback: LLM 偶尔会在 task 的 required_capabilities 里附带
+                # 工具能力（file_read/file_write/shell_execute/web_research/
+                # mcp_access），而该主角色 Worker 并不声明这些工具，导致
+                # find_workers 取交集后无人可匹配。这里先尝试去掉所有工具
+                # 能力，只按主角色重新匹配，让任务仍可被调度而非整 run failed。
+                TOOL_CAPS = {
+                    "file_read", "file_write", "shell_execute",
+                    "web_research", "mcp_access", "default",
+                }
+                stripped = {c for c in caps if c not in TOOL_CAPS}
+                if stripped and stripped != caps:
+                    profile = profiles.find_best_worker(stripped)
+                    logger.warning(
+                        f"[TeamBuilder] task={node.id} 原始能力{caps}无匹配 Worker，"
+                        f"剥离工具能力后以{stripped}重新匹配到profile={profile.id if profile else None}"
+                    )
+            if profile is None:
                 raise RuntimeError(
                     f"no_matching_worker for task={node.id} capabilities={node.required_capabilities}"
                 )

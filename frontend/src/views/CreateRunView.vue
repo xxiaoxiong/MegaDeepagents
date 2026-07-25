@@ -144,7 +144,7 @@ async function submit() {
                 <input
                   v-model="form.repository_path"
                   type="text"
-                  placeholder="/workspace/my-project 或 D:\code\my-project"
+                  placeholder="/repositories/my-project （容器内路径，留空表示不绑定 Git 仓库）"
                 />
               </label>
               <label class="field">

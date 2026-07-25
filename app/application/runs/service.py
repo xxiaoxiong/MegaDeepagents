@@ -30,13 +30,14 @@ class RunApplicationService:
         review_required: bool,
         auto_approve_low_risk: bool,
         metadata: dict[str, Any],
+        max_rounds: int = 80,
     ) -> dict[str, Any]:
         runtime = get_team_runtime()
         ctx = await runtime.create_run(
             goal=goal,
             team_name=team_template,
             mode=TeamRunMode.TASK_TEAM,
-            max_rounds=30,
+            max_rounds=max_rounds,
             review_required=review_required,
             source_repository_path=repository_path,
             base_branch=base_branch,
@@ -48,7 +49,7 @@ class RunApplicationService:
             },
         )
         self._spawn(
-            runtime.start_run(ctx, goal, team_template, 30, review_required),
+            runtime.start_run(ctx, goal, team_template, max_rounds, review_required),
             run_id=ctx.run_id,
         )
         return self.get(ctx.run_id) or {"run_id": ctx.run_id, "status": "running"}

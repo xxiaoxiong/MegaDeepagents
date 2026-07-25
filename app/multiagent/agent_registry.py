@@ -140,19 +140,34 @@ class AgentRegistry:
         CLAIMING state is intentionally set while the same lock is held.
         """
         with self._lock:
-            for agent in self._agents.values():
-                if agent.run_id != run_id or agent.status != AgentStatus.IDLE:
-                    continue
-                if not required_capabilities.issubset(set(agent.capabilities)):
-                    continue
-                if agent.max_concurrency < 1:
-                    continue
-                if not agent.update_status(AgentStatus.CLAIMING):
-                    continue
-                agent.current_task_id = task_id
-                agent.heartbeat()
-                self._persist(agent)
-                return agent
+            # LLM 偶尔在 task.required_capabilities 里同时声明主角色能力
+            # （planning/coding/...）和工具能力（file_write/...)。Worker
+            # 注册时只声明主角色能力，导致 subset 永远不成立、调度卡死。
+            # 这里在主匹配失败后剥离工具能力再试一遍，与 TeamBuilder 的
+            # fallback 一致。
+            TOOL_CAPS = {
+                "file_read", "file_write", "shell_execute",
+                "web_research", "mcp_access", "default",
+            }
+            stripped = {c for c in required_capabilities if c not in TOOL_CAPS}
+            use_caps_list = [required_capabilities]
+            if stripped and stripped != required_capabilities:
+                use_caps_list.append(stripped)
+
+            for use_caps in use_caps_list:
+                for agent in self._agents.values():
+                    if agent.run_id != run_id or agent.status != AgentStatus.IDLE:
+                        continue
+                    if not use_caps.issubset(set(agent.capabilities)):
+                        continue
+                    if agent.max_concurrency < 1:
+                        continue
+                    if not agent.update_status(AgentStatus.CLAIMING):
+                        continue
+                    agent.current_task_id = task_id
+                    agent.heartbeat()
+                    self._persist(agent)
+                    return agent
         return None
 
     def release_reservation(self, agent_id: str, task_id: str | None = None) -> bool:

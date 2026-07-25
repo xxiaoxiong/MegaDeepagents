@@ -90,7 +90,9 @@ class PermissionPolicy(BaseModel):
     them.  Destructive/secret/privilege operations are denied by default.
     """
 
-    allowed: set[PermissionKind] = Field(default_factory=lambda: {PermissionKind.FILE_READ})
+    allowed: set[PermissionKind] = Field(default_factory=lambda: {
+        PermissionKind.FILE_READ, PermissionKind.FILE_WRITE,
+    })
     denied: set[PermissionKind] = Field(default_factory=lambda: {
         PermissionKind.SECRET, PermissionKind.DESTRUCTIVE,
     })

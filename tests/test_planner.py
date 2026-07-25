@@ -80,6 +80,34 @@ def test_parallel_tasks():
     assert "c" not in ready_ids
 
 
+def test_multiple_primary_capabilities_collapse_to_first(caplog):
+    """LLM 偶尔会把多个主角色能力合并到同一 task 上。
+
+    解析层会把多主角色裁剪为第一个，工具能力保留，避免 team_builder
+    因找不到同时具备多角色的 worker 而让整 run failed。
+    """
+    json_output = {
+        "tasks": [
+            {
+                "id": "T1",
+                "dependencies": [],
+                "required_capabilities": [
+                    "planning", "research", "summarization", "file_write",
+                ],
+            },
+        ]
+    }
+    graph = _llm_plan_to_taskgraph(json_output, goal="g")
+    node = graph.nodes["T1"]
+    caps = set(node.required_capabilities)
+    # 仅保留第一个主角色 + 工具能力
+    assert "planning" in caps
+    assert "research" not in caps
+    assert "summarization" not in caps
+    assert "file_write" in caps
+    assert any("多个主角色能力" in r.message for r in caplog.records)
+
+
 def test_duplicate_id_raises():
     json_output = {
         "tasks": [

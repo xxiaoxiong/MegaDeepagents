@@ -372,7 +372,7 @@ class LLMRubricVerifier:
             ])
             text = getattr(response, "content", str(response))
             import json
-            parsed = json.loads(text) if isinstance(text, str) else text
+            parsed = self._parse_rubric_json(text) if isinstance(text, str) else text
         except Exception as exc:
             logger.warning(f"[LLMRubricVerifier] LLM rubric 调用失败: {exc}")
             # 关键修复：传真实 (goal, artifacts) 而非 (prompt, {})
@@ -393,6 +393,48 @@ class LLMRubricVerifier:
             failed_criteria=failed,
             summary=parsed.get("summary", "LLM rubric 验证完成"),
         )
+
+    @staticmethod
+    def _parse_rubric_json(text: str) -> dict[str, Any]:
+        """多策略解析 rubric JSON。
+
+        兼容：
+        1. 标准 JSON（如响应中直接给出 ``{"scores": ...}``）；
+        2. Markdown 代码块包裹（如 `` ```json\\n{"scores": ...}\\n``` ``）；
+        3. 内嵌于中文说明文字中的 JSON（提取首个 ``{...}`` 块）。
+        """
+        import json
+        # 直接尝试
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        # 尝试剥离 markdown 代码块
+        strip_prefixes = ("```json", "```", "```JSON")
+        for prefix in strip_prefixes:
+            if text.startswith(prefix):
+                rest = text[len(prefix):]
+                # 找到闭合的 ```
+                end = rest.find("```")
+                if end != -1:
+                    candidate = rest[:end].strip()
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        pass
+                break
+        # 尝试提取首个 { ... } 块
+        start = text.find("{")
+        if start != -1:
+            end = text.rfind("}")
+            if end > start:
+                candidate = text[start:end + 1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    pass
+        # raise TypeError，让上层 catch 后走 _fallback_verify
+        raise TypeError(f"LLMRubricVerifier 无法解析 rubric JSON: {text[:300]}")
 
     def _build_rubric_prompt(
         self,

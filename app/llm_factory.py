@@ -6,7 +6,68 @@ from app.core.config import settings
 from app.core.logging import logger
 
 
+# deepagents 0.6.8 内置 "openai" provider profile 默认 init_kwargs={"use_responses_api": True},
+# 对很多第三方 OpenAI 兼容端点（如部分代理）会触发 Responses API 与 429/500；
+# 在这里把默认 profile 覆盖为 chat.completions 协议。
+def _install_deepagents_openai_profile_override() -> None:
+    try:
+        from deepagents import ProviderProfile, register_provider_profile
+        register_provider_profile(
+            "openai",
+            ProviderProfile(init_kwargs={"use_responses_api": False, "request_timeout": 600.0, "max_retries": 2, "streaming": True}),
+        )
+    except Exception as exc:
+        logger.debug(f"deepagents openai profile override skipped: {exc}")
+
+
+_install_deepagents_openai_profile_override()
+
+
+# deepagents 0.6.8 的 create_deep_agent 内部会调用
+# ``init_chat_model(model, **apply_provider_profile(model))``，而
+# ``apply_provider_profile`` 假设 model 是字符串 spec（调用 model.count(":")）。
+# 当我们把已实例化且配好 streaming=True / request_timeout=600 的 ChatOpenAI
+# 直接传给 create_deep_agent 时（为了避免内部走 init_chat_model 重建实例丢
+# 这些连接层参数），apply_provider_profile 会因 ``'ChatOpenAI' object has no
+# attribute 'count'`` 直接抛 AttributeError。这里在模块加载阶段一次 monkey-patch：
+# 当 spec 不是字符串时返回空 kwargs，让 init_chat_model 完全跳过 provider
+# profile 合并、直接复用我们传入的 model 实例。
+def _patch_apply_provider_profile_handles_model_instances() -> None:
+    try:
+        from deepagents.profiles import provider as _provider_mod
+    except Exception as exc:  # pragma: no cover - 仅在 deepagents 版本变时失配
+        logger.debug(f"deepagents apply_provider_profile patch skipped: {exc}")
+        return
+
+    wrapped = getattr(_provider_mod, "apply_provider_profile", None)
+    if wrapped is None or getattr(wrapped, "__mda_patched__", False):
+        return
+
+    def _safe(spec):
+        # 仅字符串 spec 才走原 provider profile 解析；其它形式（如已实例化
+        # 的 ChatOpenAI / ChatDeepSeek / ChatAnthropic 等 Runnable）跳过合并。
+        if isinstance(spec, str):
+            return wrapped(spec)
+        return {}
+
+    _safe.__mda_patched__ = True
+    _provider_mod.apply_provider_profile = _safe
+
+    # 同时替换 deepagents 顶层命名空间中的引用，确保 create_deep_agent
+    # 内 ``from deepagents import apply_provider_profile`` 路径也走 patched 版。
+    try:
+        import deepagents as _deepagents_top
+        if getattr(_deepagents_top, "apply_provider_profile", None) is wrapped:
+            _deepagents_top.apply_provider_profile = _safe
+    except Exception:
+        pass
+
+
+_patch_apply_provider_profile_handles_model_instances()
+
+
 def _build_deepseek(model: str, api_key: str):
+
     """延迟导入 ChatDeepSeek，避免在未安装 langchain_deepseek 时整个模块加载失败。
 
     DeepSeek API 与 OpenAI 协议兼容，缺包时自动 fallback 到 openai provider。
@@ -33,19 +94,42 @@ def _build_for_provider(provider: str, model: str, api_key: str, base_url: str):
         key = api_key or "sk-placeholder"
         return _build_deepseek(model, key)
     if base_url:
-        return init_chat_model(f"openai:{model}", api_key=api_key or "no-key", base_url=base_url)
-    return init_chat_model(f"{provider}:{model}")
+        return init_chat_model(
+            f"openai:{model}",
+            api_key=api_key or "no-key",
+            base_url=base_url,
+            request_timeout=600.0,
+            max_retries=2,
+            use_responses_api=False,
+            streaming=True,
+        )
+    return init_chat_model(
+        f"openai:{model}",
+        request_timeout=600.0,
+        max_retries=2,
+        use_responses_api=False,
+        streaming=True,
+    )
 
 
 def build_model():
     """主模型。"""
     s = settings
+    # streaming=True 让 ChatOpenAI 走 stream 模式逐 token 返回，
+    # 避免推理慢的 reasoning 模型在长 idle 时被上游网关断 socket。
+    common = {
+        "use_responses_api": False,
+        "request_timeout": 600.0,
+        "max_retries": 2,
+        "streaming": True,
+    }
     if s.llm_provider.lower() == "openai-compatible" and s.llm_base_url:
         logger.info(f"Using OpenAI-compatible model: {s.llm_model} at {s.llm_base_url}")
         return init_chat_model(
             f"openai:{s.llm_model}",
             api_key=s.llm_api_key or "no-key",
             base_url=s.llm_base_url,
+            **common,
         )
     if s.llm_provider.lower() == "deepseek" or s.llm_model.startswith("deepseek:"):
         api_key = s.llm_api_key
@@ -55,7 +139,7 @@ def build_model():
         logger.info(f"Using DeepSeek model: {s.llm_model}")
         return _build_deepseek(s.llm_model, api_key)
     logger.info(f"Using generic model: {s.resolved_model}")
-    return init_chat_model(s.resolved_model)
+    return init_chat_model(s.resolved_model, **common)
 
 
 def build_model_for_policy(model_policy) -> "Any":
@@ -117,3 +201,21 @@ def build_reflection_model():
         return build_aux_model()
     logger.info(f"Using reflection model: {s.reflection_llm_provider}/{s.reflection_llm_model}")
     return m
+
+
+def build_deepagents_model_spec(model_policy=None) -> str:
+    """为 deepagents 0.6.8 的 create_deep_agent 构建字符串 spec。
+
+    deepagents 0.6.8 在解析 model 时会再次调用
+    ``init_chat_model(model, **apply_provider_profile(model))``：当 model 是
+    字符串 spec 时正常工作，当 model 是已实例化的 ChatOpenAI 时会在
+    ``apply_provider_profile`` 中走 ``model.count(":")`` 报错。因此对 deepagents
+    始终传 spec 字符串，凭证通过 ``OPENAI_API_KEY`` / ``OPENAI_BASE_URL`` 环境
+    变量下发（见 ``app.core.config.Settings.model_post_init``）。
+    """
+    s = settings
+    if s.llm_provider.lower() == "openai-compatible" and s.llm_base_url:
+        return f"openai:{s.llm_model}"
+    if s.llm_provider.lower() in {"deepseek", "openai", "deepseek-chat", "openai-compatible"}:
+        return f"openai:{s.llm_model}"
+    return s.resolved_model

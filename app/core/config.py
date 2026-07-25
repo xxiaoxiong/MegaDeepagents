@@ -129,6 +129,13 @@ class Settings(BaseSettings):
         elif not self.database_url:
             self.database_url = f"sqlite:///{self.sqlite_path}"
         self._ensure_dirs()
+        # deepagents 0.6.8 内部走 `init_chat_model("openai:<model>")` 路径，
+        # 无法显式注入 api_key/base_url；这里把 OpenAI 兼容的凭证写到环境变量，
+        # 供 deepagents 与 langchain-openai 默认读取。
+        if self.llm_provider.lower() == "openai-compatible":
+            os.environ.setdefault("OPENAI_API_KEY", self.llm_api_key or "no-key")
+            if self.llm_base_url:
+                os.environ.setdefault("OPENAI_BASE_URL", self.llm_base_url)
 
     @property
     def resolved_model(self) -> str:

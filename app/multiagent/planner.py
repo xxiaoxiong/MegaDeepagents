@@ -87,6 +87,30 @@ def _llm_plan_to_taskgraph(json_output: dict | str, goal: str) -> TaskGraph:
         caps = t.get("required_capabilities", []) or ["default"]
         allow_parallel = t.get("allow_parallel", True)
 
+        # 保险：LLM 偶尔会把多个"主角色能力"（planning/research/coding/
+        # testing/reviewing/summarization）合并到同一 task，导致找不到
+        # 同时具备这些角色的 worker。这里只保留**第一个主角色**，再加
+        # 上其它"工具能力"（file_read/file_write/shell_execute/web_research/
+        # mcp_access），把任务规格收敛到 team 中真实可分配的形态。
+        PRIMARY_CAPS = {
+            "planning", "research", "coding", "testing",
+            "reviewing", "summarization",
+        }
+        TOOL_CAPS = {
+            "file_read", "file_write", "shell_execute",
+            "web_research", "mcp_access", "default",
+        }
+        primary_caps = [c for c in caps if c in PRIMARY_CAPS]
+        tool_caps = [c for c in caps if c in TOOL_CAPS]
+        if len(primary_caps) > 1:
+            keep_primary = primary_caps[0]
+            logger.warning(
+                f"[Planner] task {t.get('id')} 声明了多个主角色能力 {primary_caps}，"
+                f"裁剪为仅保留 {keep_primary!r}（工具能力 {tool_caps} 仍保留）。"
+                f"如需多角色，应拆分为多个 task 通过 dependencies 串联。"
+            )
+            caps = [keep_primary] + tool_caps
+
         node = TaskNode(
             id=t["id"],
             title=t.get("title", t["id"]),
@@ -187,7 +211,7 @@ def plan_with_llm(
         "- objective: 具体目标\n"
         "- description: 详细描述\n"
         "- dependencies: 前置依赖的 task id 列表\n"
-        "- required_capabilities: 所需能力列表，从以下选取："
+        "- required_capabilities: 所需能力列表，必须从以下选取："
         "planning/research/coding/testing/reviewing/summarization/"
         "file_read/file_write/shell_execute/web_research/mcp_access\n"
         "- output_artifact_type: 产出物类型（code/test/document/patch/report/config/any）\n"
@@ -201,7 +225,19 @@ def plan_with_llm(
         "3. 评审任务应依赖对应的实现任务\n"
         "4. test 任务应依赖 coding 任务\n"
         "5. 如果目标包含研究任务，research 应排在最前面\n"
-        "6. 输出必须仅包含 JSON"
+        "6. 输出必须仅包含 JSON\n"
+        "7. 每个 task 的 required_capabilities 必须只包含**唯一一个主角色能力**"
+        "（planning/research/coding/testing/reviewing/summarization 之一）；"
+        "不要把多个主角色能力合并到同一 task，需要多个角色时请拆分为多个 task，"
+        "通过 dependencies 串联。\n"
+        "8. file_read/file_write/shell_execute/web_research/mcp_access 是工具能力，"
+        "可以随主角色能力附带声明；常见的附着方式：\n"
+        "   - planning 任务: 仅 ['planning']\n"
+        "   - research 任务: ['research', 'web_research']\n"
+        "   - coding 任务: ['coding', 'file_read', 'file_write', 'shell_execute']\n"
+        "   - testing 任务: ['testing', 'file_read', 'shell_execute']\n"
+        "   - reviewing 任务: ['reviewing', 'file_read']\n"
+        "   - summarization 任务: ['summarization', 'file_read', 'file_write']"
     )
 
     prompt = f"## 用户目标\n{goal}\n\n## 额外上下文\n{context or '(无)'}"
