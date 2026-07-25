@@ -76,6 +76,76 @@ class RunApplicationService:
         self._spawn(get_team_runtime().resume_run(run_id), run_id=run_id)
         return True
 
+    async def retry(
+        self,
+        run_id: str,
+        *,
+        task_id: str | None = None,
+        reason: str = "manual_retry",
+        reset_attempts: bool = False,
+    ) -> dict[str, Any] | None:
+        """Requeue failed work and restart the same durable Run graph."""
+        run = self.get(run_id)
+        if run is None or run["status"] in {"succeeded", "cancelled"}:
+            return None
+        from app.multiagent.task_board import BoardTaskStatus, get_task_board
+
+        board = get_task_board()
+        board.restore_run(run_id)
+        if task_id:
+            candidates = [task_id]
+        else:
+            candidates = [
+                task.task_id
+                for task in board.list_by_run(run_id)
+                if task.status in {
+                    BoardTaskStatus.FAILED,
+                    BoardTaskStatus.REPAIR_REQUIRED,
+                    BoardTaskStatus.REPLAN_REQUIRED,
+                }
+            ]
+        retried = [
+            candidate
+            for candidate in candidates
+            if board.retry(
+                candidate,
+                run_id=run_id,
+                reason=reason,
+                reset_attempts=reset_attempts,
+            )
+        ]
+        if not retried:
+            return None
+        history = get_agent_run_history()
+        metadata = run.get("metadata") or {}
+        generation = int(metadata.get("recovery_generation", 0)) + 1
+        checkpoint_namespace = f"team:{run_id}:recovery:{generation}"
+        history.merge_team_run_metadata(run_id, {
+            "recovery_generation": generation,
+            "checkpoint_namespace": checkpoint_namespace,
+        })
+        history.update_team_run_status(run_id, "running")
+        history.record_event(
+            event_id=make_run_event_id(),
+            run_id=run_id,
+            event_type="ManualRetryRequested",
+            task_id=task_id,
+            payload={
+                "task_ids": retried,
+                "reason": reason,
+                "reset_attempts": reset_attempts,
+                "recovery_generation": generation,
+                "checkpoint_namespace": checkpoint_namespace,
+            },
+        )
+        self._spawn(get_team_runtime().retry_run(run_id), run_id=run_id)
+        return {
+            "run_id": run_id,
+            "status": "running",
+            "retried_task_ids": retried,
+            "recovery_generation": generation,
+        }
+
     async def broadcast_message(self, run_id: str, content: str) -> int:
         """Deliver a user message through the same durable mailbox as agents."""
         if self.get(run_id) is None:

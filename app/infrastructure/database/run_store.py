@@ -69,6 +69,22 @@ class AgentRunHistory:
         self.conn.commit()
         return cur.rowcount > 0
 
+    def merge_team_run_metadata(
+        self, run_id: str, updates: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Merge operational metadata without replacing the durable Run."""
+        record = self.get_team_run(run_id)
+        if record is None:
+            return None
+        metadata = dict(record.get("metadata") or {})
+        metadata.update(updates)
+        self.conn.execute(
+            "UPDATE team_runs SET metadata=?, updated_at=? WHERE run_id=?",
+            (json.dumps(metadata), datetime.utcnow().isoformat(), run_id),
+        )
+        self.conn.commit()
+        return metadata
+
     def list_team_runs(self, limit: int = 50) -> list[dict[str, Any]]:
         """List durable runs for one unified API control plane."""
         _ensure_team_runs(self.conn)
@@ -424,6 +440,40 @@ class AgentRunHistory:
             except (TypeError, json.JSONDecodeError):
                 item["payload"] = {"corrupt_payload": True}
         return result
+
+    def event_envelope_stats(self, run_id: str) -> dict[str, Any]:
+        """Return cheap liveness statistics without replaying the audit log."""
+        self.conn.execute(
+            """CREATE TABLE IF NOT EXISTS event_envelopes (
+                event_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, agent_id TEXT,
+                task_id TEXT, event_type TEXT NOT NULL, sequence INTEGER NOT NULL,
+                timestamp TEXT NOT NULL, payload TEXT NOT NULL, trace_id TEXT,
+                UNIQUE(run_id, sequence)
+            )"""
+        )
+        aggregate = self.conn.execute(
+            "SELECT COUNT(*) AS event_count, COALESCE(MAX(sequence), 0) AS last_sequence "
+            "FROM event_envelopes WHERE run_id=?",
+            (run_id,),
+        ).fetchone()
+        latest = self.conn.execute(
+            "SELECT * FROM event_envelopes WHERE run_id=? "
+            "ORDER BY sequence DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+        latest_payload = _row_to_dict(latest) if latest else None
+        if latest_payload:
+            try:
+                latest_payload["payload"] = json.loads(
+                    latest_payload.get("payload") or "{}"
+                )
+            except (TypeError, json.JSONDecodeError):
+                latest_payload["payload"] = {"corrupt_payload": True}
+        return {
+            "event_count": int(aggregate["event_count"]),
+            "last_sequence": int(aggregate["last_sequence"]),
+            "latest_event": latest_payload,
+        }
 
     # ===== Permission Requests =====
 

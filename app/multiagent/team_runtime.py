@@ -63,6 +63,7 @@ class TeamRuntimeFacade:
         )
         ctx.metadata.update(metadata or {})
         ctx.metadata["requested_mode"] = requested_mode
+        ctx.metadata["checkpoint_namespace"] = ctx.checkpoint_namespace
         if source_repository_path:
             from app.multiagent.git_workspace import RepositoryWorkspaceManager
             repository = RepositoryWorkspaceManager(
@@ -156,6 +157,7 @@ class TeamRuntimeFacade:
         review_required: bool,
         *,
         resume: bool = False,
+        restart: bool = False,
     ) -> TeamRunResult:
         """Execute through the unified V3 LangGraph root graph."""
         from app.multiagent.executor import DeepAgentExecutor
@@ -182,7 +184,11 @@ class TeamRuntimeFacade:
         )
 
         # 串联运行
-        resume_graph = self._task_graph_from_persisted_board(ctx.run_id) if resume else None
+        resume_graph = (
+            self._task_graph_from_persisted_board(ctx.run_id)
+            if resume or restart
+            else None
+        )
         # The unified LangGraph root graph is the production orchestration
         # kernel for both single and team execution modes.
         result = await asyncio.to_thread(
@@ -195,7 +201,7 @@ class TeamRuntimeFacade:
             ctx=ctx,
             cancel_event=self._active_runs[ctx.run_id]["cancel_event"],
             task_graph=resume_graph,
-            resume=resume,
+            resume=resume and not restart,
             max_rounds=max_rounds,
         )
 
@@ -416,7 +422,11 @@ class TeamRuntimeFacade:
             logger.error(f"[TeamRuntime] send_message failed: {exc}")
             return False
 
-    async def resume_run(self, run_id: str) -> bool:
+    async def retry_run(self, run_id: str) -> bool:
+        """Start a fresh checkpoint generation from the persisted TaskGraph."""
+        return await self.resume_run(run_id, restart=True)
+
+    async def resume_run(self, run_id: str, *, restart: bool = False) -> bool:
         """Restore durable state and continue the same TASK_TEAM execution."""
         from app.multiagent.resume_coordinator import get_resume_coordinator
         from app.infrastructure.database.run_store import get_agent_run_history
@@ -434,7 +444,9 @@ class TeamRuntimeFacade:
                     team_id=stored["team_id"],
                     mode=mode,
                     workspace_root=stored["workspace_root"],
-                    checkpoint_namespace=f"team:{run_id}",
+                    checkpoint_namespace=(stored.get("metadata") or {}).get(
+                        "checkpoint_namespace", f"team:{run_id}"
+                    ),
                     user_goal=stored.get("goal", ""),
                     metadata=stored.get("metadata") or {},
                 )
@@ -453,10 +465,22 @@ class TeamRuntimeFacade:
             get_agent_run_history().update_team_run_status(run_id, "running")
             logger.info(f"[TeamRuntime] resume_run result run={run_id}: {result.to_dict()}")
             ctx = run["ctx"]
+            if restart:
+                stored = get_agent_run_history().get_team_run(run_id) or {}
+                stored_metadata = stored.get("metadata") or {}
+                ctx = ctx.model_copy(deep=True)
+                ctx.metadata.update(stored_metadata)
+                ctx.checkpoint_namespace = stored_metadata.get(
+                    "checkpoint_namespace", ctx.checkpoint_namespace
+                )
+                run["ctx"] = ctx
             if ctx.mode == TeamRunMode.TASK_TEAM:
+                continuation = {"resume": not restart}
+                if restart:
+                    continuation["restart"] = True
                 task_result = await self._run_task_team(
                     ctx, run["goal"], run["team_name"], run["max_rounds"],
-                    run["review_required"], resume=True,
+                    run["review_required"], **continuation,
                 )
             else:
                 task_result = await self._run_discussion(

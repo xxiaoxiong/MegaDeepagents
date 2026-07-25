@@ -15,6 +15,9 @@ website/dist/
 dist/
 build/
 runtime/logs/*.log
+agent.log
+runtime/cache/*.db
+runtime/cache/*.db-*
 runtime/workspace/*
 runtime/workspaces/run_*/
 runtime/repositories/

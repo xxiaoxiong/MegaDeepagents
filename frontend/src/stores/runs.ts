@@ -14,6 +14,7 @@ const emptySnapshot = (): RunSnapshot => ({
   graph: null,
   errors: {},
   git: {},
+  diagnostics: null,
 });
 
 export const useRunsStore = defineStore("runs", () => {
@@ -53,17 +54,19 @@ export const useRunsStore = defineStore("runs", () => {
         graph,
         errors,
         git,
+        diagnostics,
       ] = await Promise.all([
         api.getRun(runId),
         api.listTasks(runId),
         api.listAgents(runId),
         api.listArtifacts(runId),
-        api.listEvents(runId),
+        api.listAllEvents(runId),
         api.listPermissions(runId),
         api.listPlans(runId),
         api.taskGraph(runId),
         api.errors(runId),
         api.git(runId),
+        api.diagnostics(runId),
       ]);
       Object.assign(current, {
         run,
@@ -76,6 +79,7 @@ export const useRunsStore = defineStore("runs", () => {
         graph,
         errors,
         git,
+        diagnostics,
       });
     } catch (reason) {
       error.value = reason instanceof Error ? reason.message : String(reason);
@@ -89,19 +93,42 @@ export const useRunsStore = defineStore("runs", () => {
     if (current.events.some((item) => item.event_id === event.event_id)) return;
     current.events.push(event);
     current.events.sort((a, b) => a.sequence - b.sequence);
-    if (current.events.length > 2_000) current.events.splice(0, 500);
+    if (current.events.length > 20_000) current.events.splice(0, 2_000);
   }
 
   async function refreshLiveData(runId: string) {
-    const [run, tasks, agents, artifacts, permissions, plans] = await Promise.all([
+    const [
+      run,
+      tasks,
+      agents,
+      artifacts,
+      permissions,
+      plans,
+      graph,
+      errors,
+      diagnostics,
+    ] = await Promise.all([
       api.getRun(runId),
       api.listTasks(runId),
       api.listAgents(runId),
       api.listArtifacts(runId),
       api.listPermissions(runId),
       api.listPlans(runId),
+      api.taskGraph(runId),
+      api.errors(runId),
+      api.diagnostics(runId),
     ]);
-    Object.assign(current, { run, tasks, agents, artifacts, permissions, plans });
+    Object.assign(current, {
+      run,
+      tasks,
+      agents,
+      artifacts,
+      permissions,
+      plans,
+      graph,
+      errors,
+      diagnostics,
+    });
   }
 
   function resetCurrent() {

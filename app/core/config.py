@@ -93,6 +93,11 @@ class Settings(BaseSettings):
     max_team_size: int = 5
     max_spawn_depth: int = 2
     max_repair_rounds: int = 3
+    task_execution_timeout_seconds: float = 900.0
+    retry_base_delay_seconds: float = 2.0
+    retry_max_delay_seconds: float = 60.0
+    stalled_run_threshold_seconds: int = 180
+    audit_heartbeat_interval_seconds: float = 15.0
     default_auto_approve_low_risk: bool = False
     frontend_origin: str = "http://127.0.0.1:5173"
 
@@ -176,6 +181,9 @@ class Settings(BaseSettings):
             f"RateLimit: {self.rate_limit_per_minute} req/min\n"
             f"MaxMessageLength: {self.max_message_length}\n"
             f"PendingRunnerTTL: {self.pending_runner_ttl_minutes} min\n"
+            f"TaskTimeout: {self.task_execution_timeout_seconds}s\n"
+            f"RetryBackoff: {self.retry_base_delay_seconds}s..{self.retry_max_delay_seconds}s\n"
+            f"StalledThreshold: {self.stalled_run_threshold_seconds}s\n"
         )
 
 

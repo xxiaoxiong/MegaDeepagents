@@ -36,6 +36,7 @@ export interface Task {
   attempts: number;
   max_attempts: number;
   last_error?: string | null;
+  next_attempt_at?: string | null;
   produced_artifact_ids: string[];
   metadata: Record<string, unknown>;
 }
@@ -80,6 +81,39 @@ export interface EventEnvelope {
   payload: Record<string, unknown>;
 }
 
+export interface RunDiagnostics {
+  run_id: string;
+  status: string;
+  health: "healthy" | "attention" | "stalled" | "failed" | "completed";
+  phase: string;
+  checked_at: string;
+  last_activity_at?: string | null;
+  silence_seconds?: number | null;
+  stalled_threshold_seconds: number;
+  event_count: number;
+  last_sequence: number;
+  latest_event?: EventEnvelope | null;
+  active_assignments: Array<{
+    agent_id: string;
+    task_id: string;
+    session_id: string;
+  }>;
+  task_counts: Record<string, number>;
+  retryable_task_ids: string[];
+  delayed_retries: Array<{
+    task_id: string;
+    next_attempt_at: string;
+    attempt: number;
+    max_attempts: number;
+  }>;
+  blockers: Array<{
+    task_id: string;
+    status: string;
+    message: string;
+  }>;
+  recommended_action: string;
+}
+
 export interface TaskGraph {
   root_task_id: string | null;
   version: number;
@@ -119,4 +153,5 @@ export interface RunSnapshot {
   graph: TaskGraph | null;
   errors: Record<string, unknown>;
   git: Record<string, unknown>;
+  diagnostics: RunDiagnostics | null;
 }

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -20,6 +21,7 @@ from app.infrastructure.database.run_store import get_agent_run_history, make_ru
 from app.multiagent.task_graph import OutputContract, TaskGraph, TaskNode, TaskNodeStatus
 from app.multiagent.team_run_context import TeamRunContext
 from app.runtime.root_graph.state import AgentRunState
+from app.runtime.reliability import RetryPolicy
 from app.runtime.supervisor.agent import SupervisorAgent
 
 
@@ -62,6 +64,10 @@ class GovernedRunGraph:
         self.max_rounds = max_rounds
         self.max_repair_rounds = max_repair_rounds or settings.max_repair_rounds
         self.resume_graph = task_graph
+        self.retry_policy = RetryPolicy(
+            base_delay_seconds=settings.retry_base_delay_seconds,
+            max_delay_seconds=settings.retry_max_delay_seconds,
+        )
         self._checkpoint_connection = open_connection()
         self._compiled = self._compile()
 
@@ -225,13 +231,32 @@ class GovernedRunGraph:
         if state.get("task_graph_json") and self.resume_graph is not None:
             graph = self._load_graph(state)
         else:
-            try:
-                graph = self.planner(state["goal"], "")
-            except Exception as exc:
+            graph = None
+            last_error: Exception | None = None
+            for attempt in range(1, 4):
+                self._event("planning_started", {"attempt": attempt})
+                try:
+                    graph = self.planner(state["goal"], "")
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    decision = self.retry_policy.decide(
+                        str(exc), attempt=attempt, max_attempts=3
+                    )
+                    self._event("planning_attempt_failed", {
+                        "attempt": attempt,
+                        "error_type": type(exc).__name__,
+                        "message": str(exc),
+                        **decision.to_dict(),
+                    })
+                    if not decision.retryable:
+                        break
+                    time.sleep(decision.delay_seconds)
+            if graph is None:
                 return {
                     "phase": "planning",
                     "status": "failed",
-                    "error": f"planner_failed: {exc}",
+                    "error": f"planner_failed: {last_error}",
                 }
         self._persist_graph(graph)
         self._event("planning_completed", {"task_count": len(graph.nodes)})
@@ -245,6 +270,9 @@ class GovernedRunGraph:
     def _build_team(self, state: AgentRunState) -> dict[str, Any]:
         if state.get("error"):
             return {}
+        self._event("team_build_started", {
+            "task_graph_version": state.get("task_graph_version", 0),
+        })
         try:
             graph = self._load_graph(state)
             from app.multiagent.default_teams import get_team
@@ -253,6 +281,10 @@ class GovernedRunGraph:
             agents = TeamBuilder().build_team_sync(
                 self.ctx, get_team(self.ctx.team_id), graph
             )
+            self._event("team_build_completed", {
+                "agent_count": len(agents),
+                "ready_task_ids": [node.id for node in graph.ready_tasks()],
+            })
             return {
                 "phase": "team_ready",
                 "active_task_ids": [node.id for node in graph.ready_tasks()],
@@ -268,6 +300,10 @@ class GovernedRunGraph:
 
     def _dispatch(self, state: AgentRunState) -> dict[str, Any]:
         graph = self._load_graph(state)
+        self._event("dispatch_started", {
+            "task_count": len(graph.nodes),
+            "graph_version": graph.version,
+        })
         try:
             from app.multiagent.parallel_scheduler import ParallelTeamScheduler
             from app.multiagent.transactional_task_service import TransactionalTaskService
@@ -308,7 +344,7 @@ class GovernedRunGraph:
         from app.multiagent.task_board import BoardTaskStatus, get_task_board
 
         tasks = get_task_board().list_by_run(self.ctx.run_id)
-        return {
+        result = {
             "phase": "collected",
             "active_task_ids": [
                 task.task_id for task in tasks
@@ -327,6 +363,12 @@ class GovernedRunGraph:
             ],
             "task_graph_json": graph.model_dump_json(),
         }
+        self._event("collection_completed", {
+            "active_task_ids": result["active_task_ids"],
+            "completed_task_ids": result["completed_task_ids"],
+            "blocked_task_ids": result["blocked_task_ids"],
+        })
+        return result
 
     def _verify(self, state: AgentRunState) -> dict[str, Any]:
         graph = self._load_graph(state)
@@ -414,6 +456,11 @@ class GovernedRunGraph:
         if not created:
             return {"status": "failed", "error": "repair_requested_without_repairable_tasks"}
         self._persist_graph(graph)
+        self._event("repair_planned", {
+            "repair_round": int(state.get("repair_round", 0)) + 1,
+            "created_task_ids": created,
+            "verification": state.get("verification_summary", {}),
+        })
         return {
             "phase": "repair_planned",
             "repair_round": int(state.get("repair_round", 0)) + 1,
@@ -423,6 +470,10 @@ class GovernedRunGraph:
         }
 
     def _replan(self, state: AgentRunState) -> dict[str, Any]:
+        self._event("replan_requested", {
+            "repair_round": int(state.get("repair_round", 0)) + 1,
+            "verification": state.get("verification_summary", {}),
+        })
         return {
             "phase": "replanning",
             "task_graph_json": "",
@@ -431,6 +482,11 @@ class GovernedRunGraph:
         }
 
     def _human_interrupt(self, state: AgentRunState) -> dict[str, Any]:
+        self._event("human_input_requested", {
+            "reason": state.get("error") or "human approval required",
+            "pending_permission_ids": state.get("pending_permission_ids", []),
+            "pending_plan_ids": state.get("pending_plan_ids", []),
+        })
         response = interrupt({
             "run_id": self.ctx.run_id,
             "reason": state.get("error") or "human approval required",
