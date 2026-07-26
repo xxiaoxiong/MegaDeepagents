@@ -31,6 +31,23 @@ class PlanValidationError(Exception):
         self.details = details or []
 
 
+# Per-capability execution timeout (seconds).  0.0 means "use the scheduler's
+# global task_execution_timeout_seconds".  These values are written to
+# ``TaskBudget.max_seconds`` and read by ``ParallelTeamScheduler._run_one``.
+# Rationale: a single global timeout cannot fit both planning (deep LLM
+# thinking, observed 5-8 min in run_2a438328372441d8) and testing (fast shell
+# runs).  The previous global 300s killed planning tasks before they could
+# finish, then retries hit 429s and permanently failed the run.
+_CAP_TIMEOUTS: dict[str, float] = {
+    "planning": 900.0,      # 深度思考 + 多轮工具调用
+    "research": 600.0,      # 调研 + 网络请求
+    "coding": 600.0,        # 编码 + 编译 + 测试
+    "testing": 300.0,       # 测试相对快
+    "reviewing": 300.0,     # 评审相对快
+    "summarization": 600.0, # 总结需要读全部产物
+}
+
+
 def _llm_plan_to_taskgraph(json_output: dict | str, goal: str) -> TaskGraph:
     """将 LLM 的 JSON 输出解析为 TaskGraph。
 
@@ -111,6 +128,30 @@ def _llm_plan_to_taskgraph(json_output: dict | str, goal: str) -> TaskGraph:
             )
             caps = [keep_primary] + tool_caps
 
+        # LLM gateways intermittently 429 or time out; a 2-attempt budget
+        # turns a single transient failure into a permanent task failure.
+        # 4 attempts gives the RATE_LIMITED backoff (15/30/60s) room to
+        # outlast the throttle window.  The LLM frequently ignores the
+        # prompt's "默认 4" hint and emits max_attempts=2; ``max(..., 4)``
+        # enforces a sane floor regardless of what the LLM outputs.
+        # NB: set on the TaskNode directly — transactional_task_service,
+        # executor, and parallel_scheduler all read ``node.max_attempts``
+        # (NOT ``node.budget.max_attempts``).  Setting only on the budget
+        # (as the previous code did) was dead code; run_2a438328372441d8
+        # showed every task stuck at attempt 1/2 despite the planner
+        # claiming a default of 4.
+        enforced_max_attempts = max(int(t.get("max_attempts", 4) or 4), 4)
+
+        # Per-capability execution timeout.  A single global timeout cannot
+        # fit both planning (deep LLM thinking, ~5-8 min) and testing (fast
+        # shell runs, ~2-3 min).  The planner picks the timeout from the
+        # task's primary capability; 0.0 means "use scheduler default".
+        # 300s was too short for planning tasks — run_2a438328372441d8 T01
+        # (a planning task) was killed at 300s before it could finish, then
+        # its retry hit a 429 and permanently failed the run.
+        primary_cap = next((c for c in caps if c in _CAP_TIMEOUTS), None)
+        timeout_seconds = _CAP_TIMEOUTS.get(primary_cap, 0.0)
+
         node = TaskNode(
             id=t["id"],
             title=t.get("title", t["id"]),
@@ -127,7 +168,11 @@ def _llm_plan_to_taskgraph(json_output: dict | str, goal: str) -> TaskGraph:
                 allow_parallel=allow_parallel,
             ),
             priority=t.get("priority", 5),
-            budget=TaskBudget(max_attempts=t.get("max_attempts", 2)),
+            max_attempts=enforced_max_attempts,
+            budget=TaskBudget(
+                max_attempts=enforced_max_attempts,
+                max_seconds=timeout_seconds,
+            ),
         )
         graph.add_node(node)
 
@@ -218,7 +263,7 @@ def plan_with_llm(
         "- acceptance_criteria: 验收条件列表\n"
         "- priority: 优先级（0-10，越高越优先）\n"
         "- allow_parallel: 布尔值，是否允许与其他任务并行\n"
-        "- max_attempts: 最大尝试次数（默认 2）\n\n"
+        "- max_attempts: 最大尝试次数（默认 4；LLM 偶发 429/超时时需要更多重试机会）\n\n"
         "规则：\n"
         "1. 无依赖的任务可以并行执行\n"
         "2. 一个 task 产出的 artifact 必须能被子 task 引用\n"

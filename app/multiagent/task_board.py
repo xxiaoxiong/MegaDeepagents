@@ -21,6 +21,17 @@ from pydantic import BaseModel, Field
 from app.core.logging import logger
 
 
+# Extra retries granted to rate-limited (429) failures beyond the normal
+# max_attempts budget.  RetryPolicy.decide() returns retryable=False once
+# attempts >= max_attempts, so without this grace a single 429 at the tail
+# of the retry budget permanently fails the task.  429s are transient
+# (gateway throttle windows are typically 10-60s); 5 grace retries with
+# 15s exponential backoff (15/30/60/120/240s, capped at 300s) gives the
+# gateway ample time to recover.  See run_2a438328372441d8 for the failure
+# mode this prevents.
+_RATE_LIMIT_GRACE = 5
+
+
 class BoardTaskStatus(str, Enum):
     PENDING = "pending"
     CLAIMED = "claimed"
@@ -364,6 +375,34 @@ class TaskBoard:
                 logger.warning(
                     f"[TaskBoard] task={task_id} failed (attempt {task.attempts}/{task.max_attempts}), "
                     f"retry after {max(0.0, retry_delay_seconds):.1f}s"
+                )
+            elif (
+                failure_category == "rate_limited"
+                and task.metadata.get("rate_limit_grace_used", 0) < _RATE_LIMIT_GRACE
+            ):
+                # 429 宽限重试 —— RetryPolicy.decide() 在 max_attempts 耗尽时
+                # 返回 retryable=False / delay_seconds=0.0，所以正常分支不会触发。
+                # 但 429 是临时错误：网关限流窗口（10-60s）过去后通常会恢复。
+                # 这里给 5 次额外宽限重试，用 15s 指数退避（15/30/60/120/240s，
+                # 封顶 300s）让网关有时间恢复。
+                #
+                # 没有这个分支，run_2a438328372441d8 T01 在 max_attempts=2 耗尽后
+                # 直接永久失败，15s 退避根本没机会执行。
+                grace_used = task.metadata.get("rate_limit_grace_used", 0)
+                task.metadata["rate_limit_grace_used"] = grace_used + 1
+                task.status = BoardTaskStatus.PENDING
+                task.claimed_by = None
+                task.claimed_at = None
+                exponent = max(0, task.attempts - 1)
+                grace_delay = min(300.0, 15.0 * (2 ** exponent))
+                task.next_attempt_at = (
+                    task.updated_at + timedelta(seconds=grace_delay)
+                )
+                logger.warning(
+                    f"[TaskBoard] task={task_id} rate-limited "
+                    f"(grace {grace_used + 1}/{_RATE_LIMIT_GRACE}, "
+                    f"attempt {task.attempts}/{task.max_attempts}), "
+                    f"retry after {grace_delay:.1f}s"
                 )
             else:
                 task.status = BoardTaskStatus.FAILED

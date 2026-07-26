@@ -93,9 +93,17 @@ class Settings(BaseSettings):
     max_team_size: int = 5
     max_spawn_depth: int = 2
     max_repair_rounds: int = 3
-    task_execution_timeout_seconds: float = 900.0
+    # 900s left planning tasks stuck for 15 min before the scheduler could
+    # re-dispatch failed siblings.  300s is long enough for a coding/test
+    # turn yet short enough that a stuck task doesn't paralyse the team.
+    task_execution_timeout_seconds: float = 300.0
     retry_base_delay_seconds: float = 2.0
     retry_max_delay_seconds: float = 60.0
+    # 429 backoff: LLM gateways throttle for 10-60s; a 2s base delay retries
+    # while the throttle is still active and burns the retry budget.  15s
+    # base / 300s cap gives the window room to clear.
+    retry_rate_limit_base_delay_seconds: float = 15.0
+    retry_rate_limit_max_delay_seconds: float = 300.0
     stalled_run_threshold_seconds: int = 180
     audit_heartbeat_interval_seconds: float = 15.0
     default_auto_approve_low_risk: bool = False

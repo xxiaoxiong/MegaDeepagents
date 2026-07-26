@@ -88,9 +88,15 @@ class TaskBudget(BaseModel):
     `human_required` 或 `replan` verdict。
     """
 
-    max_attempts: int = Field(default=2, ge=1, le=10)
+    max_attempts: int = Field(default=4, ge=1, le=10)
     max_tool_calls: int = Field(default=20, ge=1, le=200)
-    max_seconds: float = Field(default=120.0, ge=1.0)
+    # 0.0 means "use the scheduler's global task_execution_timeout_seconds".
+    # The planner sets this per-task based on the primary capability
+    # (planning→900s, coding→600s, testing→300s, ...).  0.0 preserves the
+    # fallback behaviour for nodes built without the planner (e.g.
+    # ``_task_graph_from_board``) and for any path that still relies on the
+    # global default.
+    max_seconds: float = Field(default=0.0, ge=0.0)
     max_tokens: int | None = Field(default=None, ge=1)
 
 
@@ -142,7 +148,12 @@ class TaskNode(BaseModel):
 
     priority: int = Field(default=0, ge=0)
     attempts: int = Field(default=0, ge=0)
-    max_attempts: int = Field(default=2, ge=1)
+    # NB: this is the field actually read by transactional_task_service,
+    # executor, and parallel_scheduler (NOT budget.max_attempts, which is
+    # kept for structural completeness only).  The planner overrides this
+    # explicitly; the default of 4 ensures non-planner-built nodes (e.g.
+    # ``_task_graph_from_board`` fallback) also get a sane retry floor.
+    max_attempts: int = Field(default=4, ge=1)
     budget: TaskBudget = Field(default_factory=TaskBudget)
 
     error: ExecutionError | None = None

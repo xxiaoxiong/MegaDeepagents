@@ -94,10 +94,29 @@ class RetryPolicy:
         *,
         base_delay_seconds: float = 2.0,
         max_delay_seconds: float = 60.0,
+        rate_limit_base_delay_seconds: float | None = None,
+        rate_limit_max_delay_seconds: float | None = None,
     ) -> None:
         self.base_delay_seconds = max(0.0, float(base_delay_seconds))
         self.max_delay_seconds = max(
             self.base_delay_seconds, float(max_delay_seconds)
+        )
+        # 429 / quota errors need a much longer backoff than a transient
+        # network blip.  The default LLM gateway recovers in tens of
+        # seconds, not 2 s; retrying after 2 s simply burns the retry
+        # budget while the upstream is still throttling.  Defaults: 15 s
+        # base, 300 s cap, so a 4-attempt budget yields 15/30/60/120 s.
+        self.rate_limit_base_delay_seconds = max(
+            0.0,
+            float(rate_limit_base_delay_seconds)
+            if rate_limit_base_delay_seconds is not None
+            else 15.0,
+        )
+        self.rate_limit_max_delay_seconds = max(
+            self.rate_limit_base_delay_seconds,
+            float(rate_limit_max_delay_seconds)
+            if rate_limit_max_delay_seconds is not None
+            else 300.0,
         )
 
     def decide(
@@ -118,11 +137,14 @@ class RetryPolicy:
         retryable = has_budget and retryable_category
         delay = 0.0
         if retryable:
+            if category is FailureCategory.RATE_LIMITED:
+                base = self.rate_limit_base_delay_seconds
+                cap = self.rate_limit_max_delay_seconds
+            else:
+                base = self.base_delay_seconds
+                cap = self.max_delay_seconds
             exponent = max(0, attempt - 1)
-            delay = min(
-                self.max_delay_seconds,
-                self.base_delay_seconds * (2**exponent),
-            )
+            delay = min(cap, base * (2**exponent))
         reason = (
             "retry_budget_available"
             if retryable

@@ -299,7 +299,11 @@ class CapabilityRegistry:
                 name="Planner",
                 role="Planner",
                 description="高层计划拆解者",
-                capabilities={"planning", "summarization", "file_read", "file_write"},
+                # summarization is intentionally NOT here — it belongs to the
+                # Finalizer.  Listing it on the Planner let the planner claim
+                # final-report tasks, starving the Finalizer and misrouting
+                # work.  A planner only plans.
+                capabilities={"planning", "file_read", "file_write"},
                 model_policy=ModelPolicy(model_name="deepseek-chat", temperature=0.5),
                 tool_policy=ToolPolicy(
                     allowed_tools=["create_file", "edit_file", "read_file", "list_dir"],

@@ -16,6 +16,8 @@ from app.runtime.reliability import FailureCategory, RetryPolicy
 def test_retry_policy_classifies_failures_and_bounds_backoff():
     policy = RetryPolicy(base_delay_seconds=2, max_delay_seconds=5)
 
+    # Rate-limited errors use a separate, longer backoff so the gateway has
+    # time to recover (default 15s base / 300s cap).  attempt=2 → 15 * 2^1 = 30.
     rate_limited = policy.decide(
         "HTTP 429: too many requests",
         attempt=2,
@@ -23,8 +25,9 @@ def test_retry_policy_classifies_failures_and_bounds_backoff():
     )
     assert rate_limited.category == FailureCategory.RATE_LIMITED
     assert rate_limited.retryable is True
-    assert rate_limited.delay_seconds == 4
+    assert rate_limited.delay_seconds == 30.0
 
+    # Non-rate-limit errors still use base_delay/max_delay.
     capped = policy.decide(
         "gateway timeout",
         attempt=3,
@@ -41,6 +44,21 @@ def test_retry_policy_classifies_failures_and_bounds_backoff():
     assert authentication.category == FailureCategory.AUTHENTICATION
     assert authentication.retryable is False
     assert authentication.reason == "authentication_requires_intervention"
+
+
+def test_retry_policy_rate_limit_backoff_can_be_overridden():
+    """Explicit rate-limit params override the 15s/300s defaults."""
+    policy = RetryPolicy(
+        base_delay_seconds=2, max_delay_seconds=5,
+        rate_limit_base_delay_seconds=4, rate_limit_max_delay_seconds=20,
+    )
+    # attempt=2 → 4 * 2^1 = 8
+    rl = policy.decide("429 too many requests", attempt=2, max_attempts=4)
+    assert rl.delay_seconds == 8
+
+    # attempt=4 → 4 * 2^3 = 32, capped at 20
+    rl_capped = policy.decide("429", attempt=4, max_attempts=5)
+    assert rl_capped.delay_seconds == 20
 
 
 def test_task_board_defers_retry_and_supports_manual_recovery():

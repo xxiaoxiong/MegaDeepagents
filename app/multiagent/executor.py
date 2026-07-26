@@ -719,17 +719,27 @@ class DeepAgentExecutor:
                     for item in artifact_refs
                 ) + "\n"
 
-            cache_key = context.session_id or context.thread_id or f"{context.run_id}:{assignment.task_id}"
-            cached = self._session_agents.get(cache_key)
-            if cached is not None and cached[1] == str(task_workspace):
-                agent = cached[0]
-            else:
-                agent = create_deep_agent(
-                    name=f"{profile.id}:{context.thread_id or assignment.task_id}",
-                    model=model, tools=tools, system_prompt=system_prompt,
-                    checkpointer=checkpointer, debug=False,
-                )
-                self._session_agents[cache_key] = (agent, str(task_workspace))
+            # Always build a fresh DeepAgent graph per assignment.
+            #
+            # The tools built above close over the per-assignment
+            # ``cancel_event`` (via _tool_boundary / _atomic_write).  Caching
+            # the graph across assignments — as this executor used to do —
+            # freezes the tools with whatever cancel_event was active when
+            # the cache entry was created.  When a task times out the
+            # scheduler sets that cancel_event to interrupt the worker; on
+            # retry the cached agent would still observe the *old* (set)
+            # event and every tool call would raise ``cancelled_before_tool``,
+            # turning a recoverable timeout into a permanent failure.
+            #
+            # Conversation continuity across retries is preserved by the
+            # LangGraph checkpointer keyed on ``thread_id``; the graph itself
+            # does not need to be reused.
+            agent = create_deep_agent(
+                name=f"{profile.id}:{context.thread_id or assignment.task_id}",
+                model=model, tools=tools, system_prompt=system_prompt,
+                checkpointer=checkpointer, debug=False,
+            )
+            self._session_agents[context.session_id or context.thread_id or f"{context.run_id}:{assignment.task_id}"] = (agent, str(task_workspace))
 
             response = agent.invoke({
                 "messages": [

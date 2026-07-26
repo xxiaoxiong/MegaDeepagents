@@ -116,6 +116,8 @@ class ParallelTeamScheduler:
         self.retry_policy = retry_policy or RetryPolicy(
             base_delay_seconds=settings.retry_base_delay_seconds,
             max_delay_seconds=settings.retry_max_delay_seconds,
+            rate_limit_base_delay_seconds=settings.retry_rate_limit_base_delay_seconds,
+            rate_limit_max_delay_seconds=settings.retry_rate_limit_max_delay_seconds,
         )
         self.audit_heartbeat_interval = (
             settings.audit_heartbeat_interval_seconds
@@ -143,6 +145,56 @@ class ParallelTeamScheduler:
 
     # ===== 主循环 =====
 
+    def _deps_satisfied(self, task: BoardTask) -> bool:
+        """Return True only when every dependency of ``task`` is SUCCEEDED.
+
+        ``TaskBoard.list_pending`` returns every PENDING task regardless of
+        dependency state.  Dispatching a task whose dependencies are not
+        SUCCEEDED is wasteful and dangerous: ``board.claim`` rejects it with
+        ``dependency_not_succeeded``, the reserved agent is released
+        instantly, and the next round repeats the same dance.  With
+        ``max_rounds`` budget this busy-loop burns the entire round budget
+        in milliseconds (observed: 80 rounds in 38 ms) and aborts the run
+        with ``max_rounds`` before any retry backoff expires.
+        """
+        for dep_id in task.dependencies:
+            dep = self.board.get(dep_id, run_id=self.run_id)
+            if dep is None or dep.status != BoardTaskStatus.SUCCEEDED:
+                return False
+        return True
+
+    async def _run_wide_heartbeat(self, stop_event: asyncio.Event) -> None:
+        """Heartbeat every live agent in the run, including IDLE ones.
+
+        Without this loop, only the currently-executing task heartbeats its
+        own agent.  IDLE teammates sit with whatever ``last_heartbeat_at``
+        they had at registration, so once ``lease_timeout`` elapses
+        ``cleanup_expired`` marks them FAILED — killing the whole team
+        during any long-running task.  This loop keeps IDLE teammates
+        alive while the run is active, and still lets ``cleanup_expired``
+        reap truly crashed agents (their per-task heartbeat stops, but the
+        scheduler-level heartbeat below is intentionally best-effort and
+        skips agents whose status is already terminal).
+        """
+        from app.multiagent.agent_instance import AgentStatus
+        while not stop_event.is_set():
+            for agent in self.registry.list_by_run(self.run_id):
+                status = getattr(agent.status, "value", agent.status)
+                if status in {"stopped", "failed"}:
+                    continue
+                # Only heartbeat IDLE agents here.  RUNNING agents are
+                # heartbeated by their per-task ``_heartbeat_loop``; echoing
+                # them from the scheduler would mask a stuck executor thread
+                # and defeat the lease-based crash detection.
+                if status == AgentStatus.IDLE.value:
+                    self.registry.heartbeat(agent.agent_id)
+            try:
+                await asyncio.wait_for(
+                    stop_event.wait(), timeout=self.heartbeat_interval
+                )
+            except TimeoutError:
+                pass
+
     async def run(self, executor: Any) -> ParallelRunResult:
         """执行并行调度。executor 必须实现 execute_task(dag, task_id, task_input)。"""
         round_n = 0
@@ -152,139 +204,300 @@ class ParallelTeamScheduler:
             "task_execution_timeout_seconds": self.task_execution_timeout,
         })
 
-        # 申明所有 team 任务的来源（TaskGraph 转化为 BoardTask 由 caller 完成）
+        # Run-wide heartbeat keeps IDLE teammates alive across long tasks.
+        heartbeat_stop = asyncio.Event()
+        heartbeat_task = asyncio.create_task(self._run_wide_heartbeat(heartbeat_stop))
+
+        try:
+            return await self._run_loop(executor, round_n)
+        finally:
+            heartbeat_stop.set()
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
+
+    async def _run_loop(self, executor: Any, round_n: int) -> ParallelRunResult:
+        """Event-driven dispatch loop.
+
+        The previous implementation dispatched a batch of tasks then
+        ``await asyncio.gather(*coros)`` — waiting for **every** task in the
+        batch to finish before re-evaluating the pending queue.  A single
+        long-running task (e.g. a 15-minute planning task that eventually
+        timed out) blocked re-dispatch of siblings that had already failed
+        and were due for retry.  Observed in run_207f813863a04c39: T2
+        failed with a 429 at t+6m, its retry became due 2s later, but the
+        scheduler could not re-claim it until T1 timed out at t+15m — by
+        which point the researcher agent had been reaped by lease expiry.
+
+        This version dispatches new tasks as soon as a concurrency slot
+        frees up, using ``asyncio.wait(return_when=FIRST_COMPLETED)`` so a
+        slow task never blocks re-dispatch of ready retries.
+        """
+        from app.infrastructure.database.run_store import get_agent_run_history
+
+        # One semaphore for the whole run so concurrency is honoured across
+        # batches, not just within a single gather.
+        semaphore = asyncio.Semaphore(self.max_concurrency)
+        # future → task_id for the tasks currently dispatched.
+        running: dict[asyncio.Future, str] = {}
+
         while round_n < self.max_rounds:
-            from app.infrastructure.database.run_store import get_agent_run_history
             run_record = get_agent_run_history().get_team_run(self.run_id)
             if run_record and run_record.get("status") == "paused":
+                await self._cancel_running(running)
                 return self._finalize(round_n, status=ScheduleStatus.PAUSED.value,
                                       error="paused")
 
             if self.cancel_event.is_set():
+                await self._cancel_running(running)
                 self.board.cancel_run(self.run_id)
-                return self._finalize(round_n, status=ScheduleStatus.CANCELLED.value, error="cancelled")
+                return self._finalize(round_n, status=ScheduleStatus.CANCELLED.value,
+                                      error="cancelled")
 
-            # 租约清理
+            # Reap truly crashed agents (stale heartbeat while
+            # RUNNING/CLAIMING).  IDLE agents are kept alive by
+            # ``_run_wide_heartbeat`` and will not be reaped.
             self.registry.cleanup_expired()
 
-            pending = self.board.list_pending(self.run_id)
-            if not pending:
-                if self.board.all_succeeded(self.run_id):
-                    logger.info(f"[ParallelSched] run={self.run_id}: all succeeded at round={round_n}")
-                    return self._finalize_verified_run(round_n)
-                # 死锁：没有 pending 也没有 all_succeeded
-                running = self.board.list_by_run(self.run_id)
-                running_states = [t.status for t in running]
-                if any(s == BoardTaskStatus.RUNNING for s in running_states):
-                    # 等一会再 round
-                    logger.info(f"[ParallelSched] run={self.run_id}: 仍有 RUNNING 等待")
-                    await asyncio.sleep(0.5)
-                    continue
-                deferred = [
-                    task for task in running
-                    if task.status == BoardTaskStatus.PENDING
-                    and task.next_attempt_at is not None
-                    and task.next_attempt_at > datetime.utcnow()
-                ]
-                if deferred:
-                    due_at = min(task.next_attempt_at for task in deferred)
-                    wait_seconds = max(
-                        0.05, (due_at - datetime.utcnow()).total_seconds()
-                    )
-                    self._event("RetryBackoffWaiting", payload={
-                        "task_ids": [task.task_id for task in deferred],
-                        "next_attempt_at": due_at.isoformat(),
-                        "wait_seconds": round(wait_seconds, 3),
-                    })
-                    await asyncio.sleep(min(wait_seconds, 1.0))
-                    continue
-                if any(s in (BoardTaskStatus.BLOCKED, BoardTaskStatus.REPAIR_REQUIRED,
-                             BoardTaskStatus.REPLAN_REQUIRED) for s in running_states):
-                    return self._finalize(
-                        round_n, status=ScheduleStatus.WAITING_HUMAN.value,
-                        error="control_plane_intervention_required",
-                    )
-                logger.warning(
-                    f"[ParallelSched] run={self.run_id} deadlock: states={running_states}"
-                )
-                return self._finalize(
-                    round_n, status="failed", error="scheduler_deadlock",
-                )
+            # Discover newly-dispatchable tasks (deps satisfied + capability
+            # match + not already running).
+            new_dispatch = self._discover_dispatchable(running)
 
-            # Do not burn the complete round budget in a tight loop when a
-            # dynamically-created task requests a capability that no live
-            # teammate can provide.  This is an actionable control-plane
-            # condition, not an executor failure.
-            live_agents = [
-                agent
-                for agent in self.registry.list_by_run(self.run_id)
-                if getattr(agent.status, "value", agent.status)
-                not in {"stopped", "failed"}
-            ]
-            serviceable: list[BoardTask] = []
-            unserviceable: list[BoardTask] = []
-            for task in pending:
-                required = set(task.required_capabilities)
-                if any(
-                    not required or required.issubset(set(agent.capabilities))
-                    for agent in live_agents
-                ):
-                    serviceable.append(task)
-                else:
-                    unserviceable.append(task)
-            if unserviceable:
-                self._event("TasksWaitingForCapability", payload={
-                    "tasks": [
-                        {
-                            "task_id": task.task_id,
-                            "required_capabilities": task.required_capabilities,
-                        }
-                        for task in unserviceable
-                    ],
-                    "available_agents": [
-                        {
-                            "agent_id": agent.agent_id,
-                            "capabilities": agent.capabilities,
-                        }
-                        for agent in live_agents
-                    ],
+            if new_dispatch:
+                round_n += 1
+                self._event("SchedulerRoundStarted", payload={
+                    "round": round_n,
+                    "pending_task_ids": [t.task_id for t in new_dispatch],
+                    "task_count": len(new_dispatch),
                 })
-            if not serviceable:
-                return self._finalize(
-                    round_n,
-                    status=ScheduleStatus.WAITING_HUMAN.value,
-                    error="no_eligible_worker",
-                )
-            pending = serviceable
+                for task in new_dispatch:
+                    fut = asyncio.ensure_future(
+                        self._run_one_guarded(task, executor, semaphore)
+                    )
+                    running[fut] = task.task_id
 
-            round_n += 1
-            self._event("SchedulerRoundStarted", payload={
-                "round": round_n,
-                "pending_task_ids": [task.task_id for task in pending],
-                "task_count": len(pending),
-            })
-            # 用信号量限制并发
-            semaphore = asyncio.Semaphore(self.max_concurrency)
-            coros = [
-                self._run_one_guarded(task, executor, semaphore)
-                for task in pending
-            ]
-            await asyncio.gather(*coros, return_exceptions=False)
+            # Nothing running and nothing to dispatch → resolve the wait.
+            if not running:
+                resolved = await self._resolve_idle(round_n)
+                if resolved is not None:
+                    return resolved
+                # _resolve_idle either returned a final result or slept for a
+                # deferred retry; loop back to re-evaluate.
+                continue
+
+            # Wait for at least one in-flight task to finish, then loop to
+            # dispatch newly-ready tasks immediately.  This is the key
+            # difference from the old gather(): a slow task no longer blocks
+            # re-dispatch of ready retries.
+            done, _ = await asyncio.wait(
+                running.keys(), return_when=asyncio.FIRST_COMPLETED,
+            )
+            for fut in done:
+                running.pop(fut, None)
+                exc = fut.exception()
+                if exc is not None:
+                    logger.error(
+                        f"[ParallelSched] run={self.run_id} task raised: {exc}"
+                    )
 
             if self.cancel_event.is_set():
+                await self._cancel_running(running)
                 self.board.cancel_run(self.run_id)
-                return self._finalize(round_n, status=ScheduleStatus.CANCELLED.value, error="cancelled")
+                return self._finalize(round_n, status=ScheduleStatus.CANCELLED.value,
+                                      error="cancelled")
 
             run_record = get_agent_run_history().get_team_run(self.run_id)
             if run_record and run_record.get("status") == "paused":
+                await self._cancel_running(running)
                 return self._finalize(round_n, status=ScheduleStatus.PAUSED.value,
                                       error="paused")
 
             if self.board.all_succeeded(self.run_id):
                 return self._finalize_verified_run(round_n)
 
-        # 跑完 max_rounds 还没完成
+        # Exhausted max_rounds — cancel any still-running tasks.
+        await self._cancel_running(running)
         return self._finalize(round_n, status="incomplete", error="max_rounds")
+
+    def _discover_dispatchable(
+        self, running: dict[asyncio.Future, str],
+    ) -> list[BoardTask]:
+        """Return tasks that are ready to dispatch right now.
+
+        Filters ``list_pending`` by:
+        - dependency satisfaction (every dep must be SUCCEEDED)
+        - capability match (at least one IDLE agent can serve the task)
+        - not already in-flight (task_id not in ``running``)
+
+        Only IDLE agents are considered for the capability match.  Checking
+        all live agents (which includes RUNNING ones) causes a busy-loop:
+        the task is dispatched, ``_run_one`` fails to reserve an idle agent,
+        the future completes instantly, and ``round_n`` burns through
+        ``max_rounds`` before any running task finishes.  Observed in
+        ``test_v3_root_graph``: 2 tasks sharing 1 summarization agent
+        exhausted 10 rounds in milliseconds, aborting with ``max_rounds``
+        before the first task completed.
+        """
+        from app.multiagent.agent_instance import AgentStatus
+
+        pending = self.board.list_pending(self.run_id)
+        ready = [task for task in pending if self._deps_satisfied(task)]
+
+        idle_agents = [
+            agent
+            for agent in self.registry.list_by_run(self.run_id)
+            if getattr(agent.status, "value", agent.status) == AgentStatus.IDLE.value
+        ]
+        live_agents = [
+            agent
+            for agent in self.registry.list_by_run(self.run_id)
+            if getattr(agent.status, "value", agent.status)
+            not in {"stopped", "failed"}
+        ]
+
+        serviceable: list[BoardTask] = []
+        unserviceable: list[BoardTask] = []
+        for task in ready:
+            required = set(task.required_capabilities)
+            if any(
+                not required or required.issubset(set(agent.capabilities))
+                for agent in idle_agents
+            ):
+                serviceable.append(task)
+            else:
+                unserviceable.append(task)
+
+        # Only surface tasks that no live agent can ever serve (a true
+        # capability gap).  Tasks merely blocked by busy agents are
+        # expected — they will be dispatched when an agent returns to IDLE.
+        truly_unserviceable = [
+            task for task in unserviceable
+            if not any(
+                not set(task.required_capabilities)
+                or set(task.required_capabilities).issubset(set(a.capabilities))
+                for a in live_agents
+            )
+        ]
+        if truly_unserviceable:
+            self._event("TasksWaitingForCapability", payload={
+                "tasks": [
+                    {
+                        "task_id": task.task_id,
+                        "required_capabilities": task.required_capabilities,
+                    }
+                    for task in truly_unserviceable
+                ],
+                "available_agents": [
+                    {
+                        "agent_id": agent.agent_id,
+                        "capabilities": agent.capabilities,
+                    }
+                    for agent in live_agents
+                ],
+            })
+
+        already_running = set(running.values())
+        return [t for t in serviceable if t.task_id not in already_running]
+
+    async def _resolve_idle(self, round_n: int) -> ParallelRunResult | None:
+        """Handle the case where nothing is running and nothing is dispatchable.
+
+        Returns a final ``ParallelRunResult`` if the run is over, or ``None``
+        after sleeping for a deferred retry / transient gap so the caller can
+        loop back and re-evaluate.
+        """
+        if self.board.all_succeeded(self.run_id):
+            logger.info(
+                f"[ParallelSched] run={self.run_id}: all succeeded at round={round_n}"
+            )
+            return self._finalize_verified_run(round_n)
+
+        all_tasks = self.board.list_by_run(self.run_id)
+        states = [t.status for t in all_tasks]
+
+        # Deferred retries — wait for the next attempt to become due.
+        deferred = [
+            task for task in all_tasks
+            if task.status == BoardTaskStatus.PENDING
+            and task.next_attempt_at is not None
+            and task.next_attempt_at > datetime.utcnow()
+        ]
+        if deferred:
+            due_at = min(task.next_attempt_at for task in deferred)
+            wait_seconds = max(
+                0.05, (due_at - datetime.utcnow()).total_seconds()
+            )
+            self._event("RetryBackoffWaiting", payload={
+                "task_ids": [task.task_id for task in deferred],
+                "next_attempt_at": due_at.isoformat(),
+                "wait_seconds": round(wait_seconds, 3),
+            })
+            # Cap the sleep so a newly-freed agent or cancel is noticed
+            # promptly even when the next retry is far off.
+            await asyncio.sleep(min(wait_seconds, 1.0))
+            return None
+
+        # Control-plane intervention states.
+        if any(s in (BoardTaskStatus.BLOCKED, BoardTaskStatus.REPAIR_REQUIRED,
+                     BoardTaskStatus.REPLAN_REQUIRED) for s in states):
+            return self._finalize(
+                round_n, status=ScheduleStatus.WAITING_HUMAN.value,
+                error="control_plane_intervention_required",
+            )
+
+        # Permanent deadlock: a PENDING task depends on a terminal (FAILED /
+        # CANCELLED) task.  FAILED→SUCCEEDED is not a legal transition (see
+        # _LEGAL_TRANSITIONS in task_graph.py), so these PENDING tasks can
+        # never become dispatchable.  This is a hard failure, not "waiting
+        # for human" — the previous WAITING_HUMAN / "no_eligible_worker"
+        # return was misleading (the issue isn't a missing worker, it's a
+        # dead dependency) and prevented the run from routing to _fail.
+        # In run_2a438328372441d8, T01 FAILED and 14 PENDING tasks depended
+        # on it transitively; the scheduler returned WAITING_HUMAN instead
+        # of FAILED, obscuring the real cause.
+        terminal_blocker_ids = {
+            t.task_id for t in all_tasks
+            if t.status in (BoardTaskStatus.FAILED, BoardTaskStatus.CANCELLED)
+        }
+        if terminal_blocker_ids:
+            deadlocked = [
+                t for t in all_tasks
+                if t.status == BoardTaskStatus.PENDING
+                and any(dep in terminal_blocker_ids for dep in t.dependencies)
+            ]
+            if deadlocked:
+                return self._finalize(
+                    round_n, status=ScheduleStatus.FAILED.value,
+                    error=(
+                        "task_deadlock_due_to_failed_dependency: "
+                        f"{[t.task_id for t in deadlocked]}"
+                    ),
+                )
+
+        # No deferred retries, no BLOCKED, nothing running → genuine deadlock
+        # or permanent capability gap.
+        pending = [t for t in all_tasks if t.status == BoardTaskStatus.PENDING]
+        if pending:
+            # Pending tasks but none dispatchable → no eligible worker.
+            return self._finalize(
+                round_n, status=ScheduleStatus.WAITING_HUMAN.value,
+                error="no_eligible_worker",
+            )
+
+        logger.warning(
+            f"[ParallelSched] run={self.run_id} deadlock: states={states}"
+        )
+        return self._finalize(
+            round_n, status="failed", error="scheduler_deadlock",
+        )
+
+    async def _cancel_running(self, running: dict[asyncio.Future, str]) -> None:
+        """Cancel every in-flight task future and swallow CancelledError."""
+        for fut in running:
+            fut.cancel()
+        if running:
+            await asyncio.gather(*running.keys(), return_exceptions=True)
+        running.clear()
 
     # ===== 单任务运行 =====
 
@@ -527,9 +740,20 @@ class ParallelTeamScheduler:
                     )
                 )
                 if self.task_execution_timeout > 0:
+                    # Per-task timeout from the planner's TaskBudget, falling
+                    # back to the scheduler-wide default.  Planning tasks get
+                    # 900s (deep LLM thinking), coding 600s, testing 300s.
+                    # The previous single global 300s killed planning tasks
+                    # before they could finish (run_2a438328372441d8 T01).
+                    effective_timeout = (
+                        node_for_plan.budget.max_seconds
+                        if node_for_plan is not None
+                        and node_for_plan.budget.max_seconds > 0
+                        else self.task_execution_timeout
+                    )
                     done, _ = await asyncio.wait(
                         {assignment_future},
-                        timeout=self.task_execution_timeout,
+                        timeout=effective_timeout,
                     )
                     if not done:
                         self.runtime_manager.cancel_agent(
@@ -541,7 +765,7 @@ class ParallelTeamScheduler:
                             task_id=task.task_id,
                             payload={
                                 "task_run_id": task_run_id,
-                                "timeout_seconds": self.task_execution_timeout,
+                                "timeout_seconds": effective_timeout,
                                 "attempt": task.attempts + 1,
                             },
                         )
@@ -550,7 +774,7 @@ class ParallelTeamScheduler:
                             await assignment_future
                         raise TimeoutError(
                             "task execution timed out after "
-                            f"{self.task_execution_timeout:g}s"
+                            f"{effective_timeout:g}s"
                         )
                 result = await assignment_future
 

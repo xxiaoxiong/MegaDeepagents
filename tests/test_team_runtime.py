@@ -135,13 +135,35 @@ class TestAgentRegistry:
         a.update_status(AgentStatus.RUNNING)
         assert reg.find_idle("run1") is None
 
-    def test_lease_cleanup(self):
+    def test_lease_cleanup_skips_idle_agents(self):
+        """IDLE agents must NOT be reaped by cleanup_expired.
+
+        Reaping IDLE agents was the historical cause of whole-team death
+        during long-running tasks: every idle teammate got marked FAILED
+        the moment a sibling task ran past lease_timeout.  Only agents in
+        an active state (CLAIMING/RUNNING/STOPPING) with a stale heartbeat
+        should be reaped.
+        """
         reg = AgentRegistry(lease_timeout_seconds=0)  # 0 秒即过期
         a = reg.create_agent(
             profile_id="p", name="A", role="r",
             team_id="t", run_id="r",
         )
-        # 立即过期
+        # IDLE agent with stale heartbeat must not be reaped.
+        import time
+        time.sleep(0.01)
+        expired = reg.cleanup_expired()
+        assert a.agent_id not in expired
+        assert a.status == AgentStatus.IDLE
+
+    def test_lease_cleanup_reaps_running_agents_with_stale_heartbeat(self):
+        """RUNNING agents whose heartbeat went stale must be reaped."""
+        reg = AgentRegistry(lease_timeout_seconds=0)
+        a = reg.create_agent(
+            profile_id="p", name="A", role="r",
+            team_id="t", run_id="r",
+        )
+        a.update_status(AgentStatus.RUNNING)
         import time
         time.sleep(0.01)
         expired = reg.cleanup_expired()

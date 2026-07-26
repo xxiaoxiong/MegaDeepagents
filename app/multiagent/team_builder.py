@@ -62,10 +62,14 @@ class TeamBuilder:
                 )
             required_profile_ids.add(profile.id)
 
-        # Team size follows actual graph capability demand.  Verification and
-        # finalization are control-plane services, not a reason to spawn three
-        # decorative teammates for a one-worker plan.
-        selected = [p for p in profiles.list_profiles() if p.id in required_profile_ids][:5]
+        # Team size follows actual graph capability demand.  The
+        # ``required_profile_ids`` filter is the correct demand-based limiter:
+        # only profiles needed by at least one task are spawned.  A hard
+        # ``[:5]`` cap here used to silently drop the Finalizer (the 6th
+        # registered profile) when a plan required both Researcher and
+        # Finalizer, deadlocking every ``summarization`` task (T14/T15 in
+        # run_2a438328372441d8) with ``no_eligible_worker``.
+        selected = [p for p in profiles.list_profiles() if p.id in required_profile_ids]
         if not selected:
             raise RuntimeError("no_executable_teammates")
 

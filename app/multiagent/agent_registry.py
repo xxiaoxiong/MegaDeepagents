@@ -213,12 +213,27 @@ class AgentRegistry:
         return True
 
     def cleanup_expired(self) -> list[str]:
-        """清理租约过期的 Agent。返回被清理的 agent_id 列表。"""
+        """Reap agents whose lease has expired while in an active state.
+
+        Only agents that are CLAIMING/RUNNING/STOPPING (i.e. actively doing
+        work or mid-transition) are reaped.  IDLE agents are intentionally
+        left alone: they are not consuming a task and the scheduler's
+        run-wide heartbeat is responsible for keeping their lease fresh.
+        Reaping IDLE agents was the historical cause of whole-team death
+        during long-running tasks — every idle teammate got marked FAILED
+        the moment a sibling task ran past ``lease_timeout``.
+        """
+        from app.multiagent.agent_instance import AgentStatus
         expiry = []
         now = datetime.utcnow()
-        import datetime as dt
+        active_states = {
+            AgentStatus.CLAIMING, AgentStatus.RUNNING, AgentStatus.STOPPING,
+        }
         for agent_id, a in list(self._agents.items()):
             if a.last_heartbeat_at is None:
+                continue
+            if a.status not in active_states:
+                # IDLE/FAILED/STOPPED/BLOCKED agents are never reaped here.
                 continue
             idle_time = (now - a.last_heartbeat_at).total_seconds()
             if idle_time > self._lease_timeout and a.is_alive():
@@ -226,7 +241,8 @@ class AgentRegistry:
                 self._persist(a)
                 expiry.append(agent_id)
                 logger.warning(
-                    f"[AgentRegistry] agent {agent_id} lease expired ({idle_time:.0f}s)"
+                    f"[AgentRegistry] agent {agent_id} lease expired ({idle_time:.0f}s) "
+                    f"while status={a.status.value}"
                 )
         return expiry
 
