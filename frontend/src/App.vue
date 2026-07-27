@@ -1,18 +1,27 @@
 <script setup lang="ts">
+import { computed } from "vue";
+import { useRoute } from "vue-router";
 import {
   Activity,
   CloudSun,
   ListTree,
+  MessageCircle,
   Plus,
   Settings,
   Sparkles,
 } from "@lucide/vue";
+
+const route = useRoute();
+// 对话视图自带全屏布局（会话侧边栏 + 对话区），跳过全局 shell 侧边栏
+const isChatRoute = computed(() => route.path.startsWith("/chat"));
 </script>
 
 <template>
-  <div class="app-shell">
+  <RouterView v-if="isChatRoute" />
+
+  <div v-else class="app-shell">
     <aside class="sidebar">
-      <RouterLink class="brand" to="/runs">
+      <RouterLink class="brand" to="/chat">
         <span class="brand-mark"><Sparkles :size="20" /></span>
         <span>
           <strong>MegaDeepagents</strong>
@@ -22,6 +31,10 @@ import {
 
       <nav class="primary-nav" aria-label="主导航">
         <span class="nav-label">Workspace</span>
+        <RouterLink to="/chat">
+          <MessageCircle :size="18" />
+          对话
+        </RouterLink>
         <RouterLink to="/runs">
           <ListTree :size="18" />
           运行任务

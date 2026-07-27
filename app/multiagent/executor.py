@@ -15,7 +15,9 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +26,11 @@ from typing import Any, Protocol, Callable
 from app.core.logging import logger
 from app.multiagent.agent_profile import AgentProfile, get_capability_registry
 from app.multiagent.task_graph import TaskGraph, TaskNode
+
+try:  # langchain 可能在部分测试环境缺失；缺失时回调降级为空操作
+    from langchain_core.callbacks import BaseCallbackHandler
+except Exception:  # pragma: no cover
+    BaseCallbackHandler = object  # type: ignore[assignment, misc]
 
 
 # ===== 数据模型 =====
@@ -195,10 +202,49 @@ def _tool_boundary(cancel_event: Any | None, safety_point: Callable[[], Any] | N
         raise RuntimeError("cancelled_before_tool")
 
 
+# ===== 工具调用事件追踪（供前端 ToolCallCard 实时展示）=====
+_TOOL_CALL_LOCK = threading.Lock()
+_TOOL_CALL_STACKS: dict[tuple[str, str, str, str], list[tuple[str, float]]] = {}
+
+
+def _register_tool_start(run_id: str, agent_id: str, task_id: str, tool_name: str) -> tuple[str, float]:
+    """记录工具调用开始，返回 (tool_call_id, start_time)。LIFO 栈支持同工具连续/嵌套调用。"""
+    tool_call_id = f"tc_{uuid.uuid4().hex[:12]}"
+    started = time.time()
+    key = (run_id, agent_id, task_id, tool_name)
+    with _TOOL_CALL_LOCK:
+        _TOOL_CALL_STACKS.setdefault(key, []).append((tool_call_id, started))
+    return tool_call_id, started
+
+
+def _pop_tool_start(run_id: str, agent_id: str, task_id: str, tool_name: str) -> tuple[str, float] | None:
+    key = (run_id, agent_id, task_id, tool_name)
+    with _TOOL_CALL_LOCK:
+        stack = _TOOL_CALL_STACKS.get(key)
+        if stack:
+            return stack.pop()
+    return None
+
+
+def _preview(value: Any, limit: int = 2000) -> str:
+    """把任意值转成截断的字符串预览，供事件载荷安全持久化。"""
+    try:
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False, default=str)[:limit]
+        return str(value)[:limit]
+    except Exception:
+        return str(value)[:limit]
+
+
 def _tool_hook(event: str, *, run_id: str, agent_id: str, task_id: str,
                tool_name: str, arguments: dict[str, Any],
                result: dict[str, Any] | None = None) -> None:
-    """Run lifecycle hooks at the same governed boundary as every local tool."""
+    """Run lifecycle hooks at the same governed boundary as every local tool.
+
+    同时向 EventEmitter 发射 ``tool_call_started`` / ``tool_call_result`` 事件，
+    供前端 ChatGPT 式 ToolCallCard 实时展示工具名/参数/结果/耗时。事件发射失败
+    不应阻断工具执行主流程（整段 try/except 吞掉）。
+    """
     if not run_id:
         return
     from app.multiagent.lifecycle_hooks import LifecycleEvent, get_lifecycle_hook_engine
@@ -209,6 +255,41 @@ def _tool_hook(event: str, *, run_id: str, agent_id: str, task_id: str,
     )
     if hook_result.block or not hook_result.allow:
         raise PermissionError(hook_result.feedback or f"{event} hook blocked {tool_name}")
+
+    # 发射工具调用事件（供前端对话式 UI 的 ToolCallCard）
+    try:
+        from app.multiagent.event_emitter import EventType, get_event_emitter
+        emitter = get_event_emitter()
+        if event == "BeforeToolUse":
+            tool_call_id, _started = _register_tool_start(run_id, agent_id, task_id, tool_name)
+            emitter.emit(run_id, EventType.TOOL_CALL_STARTED, {
+                "run_id": run_id, "agent_id": agent_id, "task_id": task_id,
+                "tool_call_id": tool_call_id, "tool_name": tool_name,
+                "arguments": arguments,
+            })
+        elif event == "AfterToolUse":
+            popped = _pop_tool_start(run_id, agent_id, task_id, tool_name)
+            tool_call_id: str | None = None
+            duration_ms: int | None = None
+            if popped:
+                tool_call_id, started = popped
+                duration_ms = int((time.time() - started) * 1000)
+            status = "ok"
+            if isinstance(result, dict):
+                rc = result.get("returncode")
+                if rc is not None and rc != 0:
+                    status = "error"
+                elif result.get("error"):
+                    status = "error"
+            emitter.emit(run_id, EventType.TOOL_CALL_RESULT, {
+                "run_id": run_id, "agent_id": agent_id, "task_id": task_id,
+                "tool_call_id": tool_call_id, "tool_name": tool_name,
+                "result_preview": _preview(result) if result is not None else "",
+                "status": status, "duration_ms": duration_ms,
+            })
+    except Exception:
+        # 事件发射失败不应阻断工具执行主流程
+        pass
 
 
 def _atomic_write(path: Path, content: str, cancel_event: Any | None = None) -> None:
@@ -469,6 +550,74 @@ def _build_restricted_tools(
     tools.extend(team_tools or [])
 
     return tools
+
+
+# ===== 助手 token 流式回调（供前端 ChatGPT 式逐字渲染）=====
+class _AssistantStreamCallback(BaseCallbackHandler):
+    """LangChain 回调：把 LLM token 增量发为 ``assistant_token`` 事件，结束时发 ``assistant_message``。
+
+    节流策略：token 累积满 throttle_s 秒 flush 一次，``on_llm_end`` 时强制 flush 并
+    发 ``assistant_message``。用 ``message_id`` 把多个 token chunk 与最终消息关联，
+    前端据此累积成同一个流式气泡。回调失败不影响 LLM 主流程。
+    """
+
+    def __init__(self, run_id: str, agent_id: str, agent_name: str, throttle_s: float = 0.05):
+        self.run_id = run_id
+        self.agent_id = agent_id
+        self.agent_name = agent_name
+        self.throttle_s = throttle_s
+        self._message_id: str | None = None
+        self._buffer: list[str] = []
+        self._full: list[str] = []
+        self._last_flush = 0.0
+
+    def on_llm_start(self, serialized, prompts, **kwargs):
+        self._reset_message()
+
+    def on_chat_model_start(self, serialized, messages, **kwargs):
+        self._reset_message()
+
+    def _reset_message(self):
+        self._message_id = f"msg_{uuid.uuid4().hex[:12]}"
+        self._buffer = []
+        self._full = []
+        self._last_flush = time.time()
+
+    def on_llm_new_token(self, token, **kwargs):
+        if not token:
+            return
+        self._buffer.append(token)
+        self._full.append(token)
+        if time.time() - self._last_flush >= self.throttle_s:
+            self._flush(final=False)
+
+    def on_llm_end(self, response, **kwargs):
+        self._flush(final=True)
+
+    def _flush(self, final: bool = False):
+        if not self.run_id:
+            return
+        try:
+            from app.multiagent.event_emitter import EventType, get_event_emitter
+            if self._buffer:
+                chunk = "".join(self._buffer)
+                self._buffer = []
+                self._last_flush = time.time()
+                get_event_emitter().emit(self.run_id, EventType.ASSISTANT_TOKEN, {
+                    "run_id": self.run_id, "agent_id": self.agent_id,
+                    "agent_name": self.agent_name, "message_id": self._message_id,
+                    "delta": chunk,
+                })
+            if final:
+                content = "".join(self._full)
+                get_event_emitter().emit(self.run_id, EventType.ASSISTANT_MESSAGE, {
+                    "run_id": self.run_id, "agent_id": self.agent_id,
+                    "agent_name": self.agent_name, "message_id": self._message_id,
+                    "content": content,
+                })
+        except Exception:
+            # 流式回调失败不应影响 LLM 主流程
+            pass
 
 
 # ===== DeepAgentExecutor =====
@@ -752,6 +901,7 @@ class DeepAgentExecutor:
             }, config={
                 "configurable": {"thread_id": getattr(context, "thread_id", None) or f"{context.run_id}:{assignment.task_id}"},
                 "recursion_limit": 80,
+                "callbacks": [_AssistantStreamCallback(context.run_id, context.agent_id or "", profile.name)],
             })
 
             elapsed = time.time() - start

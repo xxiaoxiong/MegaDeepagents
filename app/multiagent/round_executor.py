@@ -435,8 +435,16 @@ class TeamRoundExecutor:
         return False
 
     def _emit(self, event: str, payload: dict) -> None:
-        """发送 SSE 事件。"""
+        """发送 SSE 事件。
+
+        payload 注入 run_id=self.task_id（DISCUSSION 模式下 task_id == run_id），
+        供 EventEmitter 桥接按正确 run_id 落库到 DB 事件库——SSE 端点
+        ``/runs/{run_id}/stream`` 按真实 run_id 查询，而非 room_id。emit key 仍用
+        room_id 以兼容内存订阅者（routes_team.stream_team_task_events）。
+        """
         try:
-            self.emitter.emit(self.room_id or "", event, payload)
+            enriched = dict(payload)
+            enriched.setdefault("run_id", self.task_id)
+            self.emitter.emit(self.room_id or "", event, enriched)
         except Exception:
             pass

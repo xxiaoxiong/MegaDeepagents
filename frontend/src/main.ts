@@ -2,6 +2,7 @@ import { createApp } from "vue";
 import { createPinia } from "pinia";
 import { createRouter, createWebHistory } from "vue-router";
 import App from "@/App.vue";
+import ChatView from "@/views/ChatView.vue";
 import RunsView from "@/views/RunsView.vue";
 import CreateRunView from "@/views/CreateRunView.vue";
 import RunDetailView from "@/views/RunDetailView.vue";
@@ -11,7 +12,14 @@ import "@/styles/main.css";
 const router = createRouter({
   history: createWebHistory(),
   routes: [
-    { path: "/", redirect: "/runs" },
+    { path: "/", redirect: "/chat" },
+    { path: "/chat", component: ChatView, meta: { title: "对话" } },
+    {
+      path: "/chat/:runId",
+      component: ChatView,
+      props: true,
+      meta: { title: "对话" },
+    },
     { path: "/runs", component: RunsView, meta: { title: "运行任务" } },
     { path: "/runs/new", component: CreateRunView, meta: { title: "创建运行" } },
     {

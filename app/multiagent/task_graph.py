@@ -81,6 +81,44 @@ def is_legal_transition(from_status: TaskNodeStatus, to_status: TaskNodeStatus) 
     return to_status in _LEGAL_TRANSITIONS.get(from_status, set())
 
 
+# Per-capability execution timeout (seconds).  0.0 means "use the scheduler's
+# global task_execution_timeout_seconds".  Shared by the planner (which sets
+# ``TaskBudget.max_seconds`` on every planned node), ``add_repair_task`` (which
+# inherits it so repair tasks don't fall back to the global 300s default), and
+# ``ParallelTeamScheduler._run_one`` (which uses it as a last-resort fallback
+# when a node has no explicit budget).
+#
+# Rationale: a single global timeout cannot fit both planning (deep LLM
+# thinking, observed 5-8 min in run_2a438328372441d8 / run_e8587ea68ac64ff5)
+# and testing (fast shell runs).  The previous global 300s killed planning
+# tasks — and crucially their repair tasks — before they could finish, then
+# retries hit 429s and permanently failed the run.
+CAPABILITY_TIMEOUTS: dict[str, float] = {
+    "planning": 900.0,      # 深度思考 + 多轮工具调用
+    "research": 600.0,      # 调研 + 网络请求
+    "coding": 600.0,        # 编码 + 编译 + 测试
+    "testing": 300.0,       # 测试相对快
+    "reviewing": 300.0,     # 评审相对快
+    "summarization": 600.0, # 总结需要读全部产物
+}
+
+
+def capability_timeout(required_capabilities: list[str] | None) -> float:
+    """Return the per-capability timeout for a task, or 0.0 to use the default.
+
+    Picks the timeout from the task's primary capability (the first matching
+    entry in ``CAPABILITY_TIMEOUTS``).  Returns 0.0 when no primary capability
+    is present, signalling the caller to fall back to the scheduler default.
+    """
+    if not required_capabilities:
+        return 0.0
+    for cap in required_capabilities:
+        timeout = CAPABILITY_TIMEOUTS.get(cap)
+        if timeout and timeout > 0:
+            return timeout
+    return 0.0
+
+
 class TaskBudget(BaseModel):
     """任务预算约束。
 
@@ -368,6 +406,22 @@ class TaskGraph(BaseModel):
         while repair_id in self.nodes:
             i += 1
             repair_id = f"{target_node_id}__repair_v{self.version}_{i}"
+        repair_caps = required_capabilities or list(target.required_capabilities) or ["coding", "file_write"]
+        # Inherit the per-capability timeout from the target node so a repair
+        # of a planning task (900s) is not killed by the global 300s default.
+        # ``add_repair_task`` previously built a default ``TaskBudget`` with
+        # ``max_seconds=0.0``, which caused ``ParallelTeamScheduler._run_one``
+        # to fall back to ``self.task_execution_timeout`` (300s) — see
+        # run_e8587ea68ac64ff5 T1__repair_v17: 4 attempts, the last killed at
+        # 300s before the planning LLM could finish.
+        repair_timeout = target.budget.max_seconds
+        if repair_timeout <= 0:
+            repair_timeout = capability_timeout(repair_caps)
+        repair_max_attempts = max(
+            target.max_attempts if target.max_attempts else 4,
+            target.budget.max_attempts if target.budget.max_attempts else 4,
+            4,
+        )
         node = TaskNode(
             id=repair_id,
             title=f"Repair {target_node_id}",
@@ -376,7 +430,7 @@ class TaskGraph(BaseModel):
             status=TaskNodeStatus.PENDING,
             # 继承 target 的上游依赖（不依赖已 FAILED 的 target）
             dependencies=list(target.dependencies),
-            required_capabilities=required_capabilities or ["coding", "file_write"],
+            required_capabilities=repair_caps,
             output_contract=OutputContract(
                 artifact_type="patch",
                 description="修复产物",
@@ -384,6 +438,11 @@ class TaskGraph(BaseModel):
                 required_artifacts=["repair_patch"],
             ),
             priority=10,
+            max_attempts=repair_max_attempts,
+            budget=TaskBudget(
+                max_attempts=repair_max_attempts,
+                max_seconds=repair_timeout,
+            ),
         )
         self.add_node(node)
         # 将下游节点从依赖 target 改为依赖 repair

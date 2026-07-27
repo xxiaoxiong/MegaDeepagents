@@ -155,3 +155,77 @@ export interface RunSnapshot {
   git: Record<string, unknown>;
   diagnostics: RunDiagnostics | null;
 }
+
+// ===== 对话式 UI：ChatMessage 模型 =====
+// 把 EventEnvelope 映射成对话流中的气泡/卡片。每条消息有唯一 id（用于 Vue :key）
+// 和 createdAt（排序）。discriminant 字段决定渲染组件。
+
+export interface UserChatMessage {
+  id: string;
+  role: "user";
+  content: string;
+  createdAt: string;
+}
+
+export interface AssistantChatMessage {
+  id: string;
+  role: "assistant";
+  content: string;
+  streaming: boolean; // true 时正在累积 token，显示流式光标
+  messageId?: string; // 关联 assistant_token/assistant_message 事件的 message_id
+  agentId?: string | null;
+  agentName?: string | null;
+  createdAt: string;
+}
+
+export interface ToolCallChatMessage {
+  id: string;
+  type: "tool_call";
+  toolCallId?: string | null;
+  toolName: string;
+  args: Record<string, unknown>;
+  status: "running" | "ok" | "error";
+  resultPreview?: string;
+  durationMs?: number | null;
+  agentName?: string | null;
+  createdAt: string;
+}
+
+export interface ArtifactChatMessage {
+  id: string;
+  type: "artifact";
+  artifactId: string;
+  taskId?: string | null;
+  producedBy?: string | null;
+  createdAt: string;
+}
+
+export interface ApprovalChatMessage {
+  id: string;
+  type: "approval";
+  kind: "permission" | "plan";
+  requestId: string;
+  operation?: string;
+  title?: string;
+  summary?: string;
+  reason?: string;
+  target?: string;
+  status: string; // 原始状态：pending/approved/denied…
+  createdAt: string;
+}
+
+export interface StatusChatMessage {
+  id: string;
+  type: "status";
+  text: string;
+  tone: "info" | "running" | "ok" | "error" | "warn";
+  createdAt: string;
+}
+
+export type ChatMessage =
+  | UserChatMessage
+  | AssistantChatMessage
+  | ToolCallChatMessage
+  | ArtifactChatMessage
+  | ApprovalChatMessage
+  | StatusChatMessage;

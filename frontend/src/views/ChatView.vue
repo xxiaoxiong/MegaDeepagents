@@ -1,0 +1,399 @@
+<script setup lang="ts">
+import {
+  computed,
+  nextTick,
+  onMounted,
+  ref,
+  watch,
+} from "vue";
+import { useRoute, useRouter } from "vue-router";
+import {
+  ArrowRight,
+  ListTree,
+  LoaderCircle,
+  MessageSquarePlus,
+  PanelRight,
+  Search,
+  Send,
+  Settings,
+  Sparkles,
+  Square,
+} from "@lucide/vue";
+import { api } from "@/lib/api";
+import { useChatThread } from "@/composables/useChatThread";
+import type { AgentRun, CreateRunInput, RunMode } from "@/types";
+import StatusBadge from "@/components/StatusBadge.vue";
+import ChatMessageItem from "@/components/chat/ChatMessageItem.vue";
+
+const route = useRoute();
+const router = useRouter();
+
+// ===== 当前会话 =====
+const propsRunId = computed(() => {
+  const id = route.params.runId;
+  return typeof id === "string" ? id : "";
+});
+const runIdRef = ref(propsRunId.value);
+watch(propsRunId, (v) => {
+  runIdRef.value = v;
+});
+
+const thread = useChatThread(runIdRef);
+
+// ===== 侧边栏：运行列表 =====
+const runs = ref<AgentRun[]>([]);
+const runsLoading = ref(false);
+const runsError = ref("");
+const query = ref("");
+
+async function loadRuns() {
+  runsLoading.value = true;
+  runsError.value = "";
+  try {
+    runs.value = await api.listRuns();
+  } catch (e) {
+    runsError.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    runsLoading.value = false;
+  }
+}
+
+const visibleRuns = computed(() => {
+  const needle = query.value.toLowerCase().trim();
+  const list = needle
+    ? runs.value.filter(
+        (r) =>
+          r.goal.toLowerCase().includes(needle) ||
+          r.run_id.toLowerCase().includes(needle) ||
+          r.status.toLowerCase().includes(needle),
+      )
+    : runs.value;
+  // 最近的在前
+  return [...list].sort((a, b) =>
+    String(b.updated_at ?? b.created_at ?? "").localeCompare(
+      String(a.updated_at ?? a.created_at ?? ""),
+    ),
+  );
+});
+
+const currentRun = computed(() =>
+  runs.value.find((r) => r.run_id === runIdRef.value) ?? null,
+);
+
+// ===== 输入框 =====
+const draft = ref("");
+const sending = ref(false);
+const sendError = ref("");
+const composerRef = ref<HTMLTextAreaElement | null>(null);
+const threadScrollRef = ref<HTMLElement | null>(null);
+
+const canSend = computed(
+  () => draft.value.trim().length >= 4 && !sending.value,
+);
+
+function autoGrow() {
+  const el = composerRef.value;
+  if (!el) return;
+  el.style.height = "auto";
+  el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+}
+
+watch(draft, () => nextTick(autoGrow));
+
+async function scrollToBottom(force = false) {
+  await nextTick();
+  const el = threadScrollRef.value;
+  if (!el) return;
+  const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+  if (force || distance < 120) {
+    el.scrollTop = el.scrollHeight;
+  }
+}
+
+watch(
+  () => thread.messages.value.length,
+  () => scrollToBottom(false),
+);
+
+// 助手流式时持续贴底
+watch(
+  () =>
+    thread.messages.value
+      .map((m) => ("role" in m && m.role === "assistant" ? m.content : ""))
+      .join("|"),
+  () => {
+    const el = threadScrollRef.value;
+    if (!el) return;
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (distance < 160) el.scrollTop = el.scrollHeight;
+  },
+);
+
+async function startNewChat() {
+  // 进入空白对话页（不创建 Run，等用户输入第一条消息再创建）
+  if (route.params.runId) {
+    await router.push("/chat");
+  }
+  draft.value = "";
+  sendError.value = "";
+  await nextTick(() => composerRef.value?.focus());
+}
+
+async function send() {
+  if (!canSend.value) return;
+  const content = draft.value.trim();
+  draft.value = "";
+  sendError.value = "";
+  await nextTick(autoGrow);
+
+  sending.value = true;
+  try {
+    if (runIdRef.value) {
+      // 已有 Run：把消息追加到对话流
+      await api.sendRunMessage(runIdRef.value, content);
+    } else {
+      // 新对话：用第一条消息作为 Run 的 goal，创建后跳转
+      const payload: CreateRunInput = {
+        goal: content,
+        mode: "auto" as RunMode,
+        team_template: "software_dev_team",
+        repository_path: null,
+        base_branch: null,
+        review_required: true,
+        auto_approve_low_risk: false,
+        metadata: {},
+      };
+      const run = await api.createRun(payload);
+      await loadRuns();
+      await router.push(`/chat/${run.run_id}`);
+    }
+    await scrollToBottom(true);
+  } catch (e) {
+    sendError.value = e instanceof Error ? e.message : String(e);
+    // 失败时把消息还回输入框
+    if (!draft.value) draft.value = content;
+  } finally {
+    sending.value = false;
+  }
+}
+
+function onComposerKey(e: KeyboardEvent) {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    void send();
+  }
+}
+
+// ===== 流式状态文案 =====
+const streamStateLabel = computed(() => {
+  switch (thread.state.value) {
+    case "live":
+      return "实时";
+    case "reconnecting":
+      return "重连中";
+    default:
+      return "离线";
+  }
+});
+
+// ===== 生命周期 =====
+onMounted(async () => {
+  await loadRuns();
+  await scrollToBottom(true);
+});
+
+// 路由切到 /chat（空白）时清空选择
+watch(
+  () => route.path,
+  async (p) => {
+    if (p === "/chat") {
+      await nextTick(() => composerRef.value?.focus());
+    }
+  },
+);
+
+// 快捷示例
+const examples = [
+  "审计这个仓库的认证模块，列出高风险问题。",
+  "为 utils/logging.py 补齐单元测试，覆盖率到 85%。",
+  "把 README 翻译成英文，并补充部署章节。",
+];
+</script>
+
+<template>
+  <div class="chat-layout">
+    <!-- 侧边栏：会话列表 -->
+    <aside class="chat-sidebar">
+      <RouterLink class="chat-brand" to="/chat">
+        <span class="brand-mark"><Sparkles :size="18" /></span>
+        <span>
+          <strong>MegaDeepagents</strong>
+          <small>Agent Control Plane</small>
+        </span>
+      </RouterLink>
+
+      <button class="chat-new-btn" type="button" @click="startNewChat">
+        <MessageSquarePlus :size="14" /> 新对话
+      </button>
+
+      <label class="chat-search">
+        <Search :size="14" />
+        <input v-model="query" type="search" placeholder="搜索目标或 Run ID" />
+      </label>
+
+      <div v-if="runsLoading && !runs.length" class="chat-history-loading">
+        <LoaderCircle class="spin" :size="14" /> 读取中…
+      </div>
+      <div v-else-if="runsError" class="chat-history-loading">
+        {{ runsError }}
+      </div>
+
+      <nav v-else class="chat-thread-list" aria-label="会话列表">
+        <button
+          v-for="run in visibleRuns"
+          :key="run.run_id"
+          type="button"
+          class="chat-thread-item"
+          :class="{ active: run.run_id === runIdRef }"
+          @click="router.push(`/chat/${run.run_id}`)"
+        >
+          <span class="thread-title">{{ run.goal || run.run_id }}</span>
+          <span class="thread-meta">
+            <StatusBadge :status="run.status" />
+            <span>{{ run.resolved_mode || run.mode }}</span>
+          </span>
+        </button>
+        <div v-if="!visibleRuns.length" class="chat-history-loading">
+          暂无运行记录
+        </div>
+      </nav>
+
+      <div class="chat-sidebar-foot">
+        <RouterLink to="/runs">
+          <ListTree :size="15" /> 运行任务
+        </RouterLink>
+        <RouterLink to="/settings">
+          <Settings :size="15" /> 系统设置
+        </RouterLink>
+      </div>
+    </aside>
+
+    <!-- 主区：对话窗口 -->
+    <main class="chat-main">
+      <header v-if="runIdRef" class="chat-header">
+        <div class="chat-header-title">
+          <span class="eyebrow">Run {{ runIdRef }}</span>
+          <h2>{{ currentRun?.goal ?? "对话中" }}</h2>
+        </div>
+        <div class="chat-header-actions">
+          <span
+            class="chat-stream-state"
+            :data-state="thread.state.value"
+            :title="thread.lastError.value || ''"
+          >
+            {{ streamStateLabel }}
+          </span>
+          <RouterLink
+            class="btn btn-ghost btn-small"
+            :to="`/runs/${runIdRef}`"
+            title="查看编排仪表盘"
+          >
+            <PanelRight :size="14" /> 高级视图
+          </RouterLink>
+          <button
+            v-if="currentRun && !['succeeded', 'failed', 'cancelled'].includes(currentRun.status)"
+            class="btn btn-ghost btn-small danger"
+            type="button"
+            @click="api.controlRun(runIdRef, 'cancel').then(loadRuns)"
+          >
+            <Square :size="13" /> 取消
+          </button>
+        </div>
+      </header>
+
+      <!-- 对话流 -->
+      <div
+        v-if="runIdRef"
+        ref="threadScrollRef"
+        class="chat-thread"
+      >
+        <div v-if="thread.loadingHistory.value" class="chat-history-loading">
+          <LoaderCircle class="spin" :size="16" /> 正在回放历史事件…
+        </div>
+        <div v-else-if="thread.error.value" class="chat-history-loading">
+          {{ thread.error.value }}
+        </div>
+
+        <div class="chat-thread-inner">
+          <ChatMessageItem
+            v-for="msg in thread.messages.value"
+            :key="msg.id"
+            :message="msg"
+            :run-id="runIdRef"
+          />
+          <div v-if="!thread.messages.value.length && !thread.loadingHistory.value" class="chat-history-loading">
+            还没有事件，向 Agent 发送一条消息开始对话。
+          </div>
+        </div>
+      </div>
+
+      <!-- 空会话欢迎页 -->
+      <div v-else class="chat-empty">
+        <div class="chat-empty-card">
+          <span class="brand-mark" style="margin: 0 auto;"><Sparkles :size="22" /></span>
+          <h3>跟你的 Agent 团队对话</h3>
+          <p>
+            描述你想完成的事，Root Graph 会自动选择单 Agent 或团队路径。
+            执行过程中的工具调用、产出与审批都会实时出现在这里。
+          </p>
+          <div class="chat-empty-examples">
+            <button
+              v-for="ex in examples"
+              :key="ex"
+              type="button"
+              class="chat-empty-example"
+              @click="draft = ex; composerRef?.focus()"
+            >
+              {{ ex }}
+              <ArrowRight :size="13" />
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 输入框 -->
+      <div class="chat-composer">
+        <div class="chat-composer-inner">
+          <textarea
+            ref="composerRef"
+            v-model="draft"
+            rows="1"
+            :placeholder="
+              runIdRef
+                ? '继续对话，或追加指令…（Enter 发送，Shift+Enter 换行）'
+                : '描述你想完成的事，将作为新运行的目标…（Enter 发送）'
+            "
+            @input="autoGrow"
+            @keydown="onComposerKey"
+          />
+          <button
+            class="chat-send"
+            type="button"
+            :disabled="!canSend"
+            :title="sending ? '发送中…' : '发送（Enter）'"
+            @click="send"
+          >
+            <LoaderCircle v-if="sending" class="spin" :size="16" />
+            <Send v-else :size="16" />
+          </button>
+        </div>
+        <div v-if="sendError" class="chat-composer-hint" style="color: var(--danger);">
+          {{ sendError }}
+        </div>
+        <div v-else class="chat-composer-hint">
+          MegaDeepagents · 受治理的 Agent 运行时 · 高风险操作仍需人工审批
+        </div>
+      </div>
+    </main>
+  </div>
+</template>

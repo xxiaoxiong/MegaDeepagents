@@ -48,6 +48,13 @@ class RunApplicationService:
                 "auto_approve_low_risk": auto_approve_low_risk,
             },
         )
+        # 记录首条用户消息事件，使其作为对话流的第一条用户气泡
+        get_agent_run_history().record_event(
+            event_id=make_run_event_id(),
+            run_id=ctx.run_id,
+            event_type="user_message",
+            payload={"content": goal, "source": "human", "role": "user"},
+        )
         self._spawn(
             runtime.start_run(ctx, goal, team_template, max_rounds, review_required),
             run_id=ctx.run_id,
@@ -148,9 +155,16 @@ class RunApplicationService:
 
     async def broadcast_message(self, run_id: str, content: str) -> int:
         """Deliver a user message through the same durable mailbox as agents."""
+        history = get_agent_run_history()
         if self.get(run_id) is None:
             return 0
-        history = get_agent_run_history()
+        # 记录用户消息事件，使其在对话流中显示为用户气泡
+        history.record_event(
+            event_id=make_run_event_id(),
+            run_id=run_id,
+            event_type="user_message",
+            payload={"content": content, "source": "human", "role": "user"},
+        )
         agent_ids = [
             item["agent_id"] for item in history.list_by_run(run_id)
             if item.get("status") not in {"stopped", "failed"}

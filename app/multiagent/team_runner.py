@@ -218,7 +218,7 @@ class TeamRunner:
         self.emitter.emit(
             self.room_id or "",
             "task_started",
-            {"goal": self.room.config.goal, "agents": [a.name for a in self.room.agents]},
+            {"run_id": self.task_id, "goal": self.room.config.goal, "agents": [a.name for a in self.room.agents]},
         )
 
         self.room.send_system_message(
@@ -346,6 +346,7 @@ class TeamRunner:
             self.room_id or "",
             "task_terminated",
             {
+                "run_id": self.task_id,
                 "status": result.status,
                 "phase": result.phase,
                 "total_rounds": result.total_rounds,

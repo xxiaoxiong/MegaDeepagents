@@ -179,8 +179,24 @@ app.include_router(
 )
 app.include_router(v1_router, tags=["v1"])
 
-# 挂载 Web 静态文件
+# 挂载 Web 静态文件（SPA fallback：未匹配的客户端路由回退到 index.html，
+# 让 /chat、/chat/:runId、/runs/:runId 等深链与刷新都能正常进入 Vue Router）
 from pathlib import Path
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+
+class SpaStaticFiles(StaticFiles):
+    """SPA 静态文件：文件不存在时回退到 index.html，由前端路由接管。"""
+
+    async def get_response(self, path: str, scope):
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code == 404:
+                return await super().get_response("index.html", scope)
+            raise
+
+
 frontend_dist = Path(__file__).parent.parent / "frontend" / "dist"
 if frontend_dist.exists():
-    app.mount("/", StaticFiles(directory=str(frontend_dist), html=True), name="web")
+    app.mount("/", SpaStaticFiles(directory=str(frontend_dist), html=True), name="web")

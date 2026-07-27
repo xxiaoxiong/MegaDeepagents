@@ -36,6 +36,7 @@ from app.multiagent.task_board import (
     TaskBoard,
     get_task_board,
 )
+from app.multiagent.task_graph import capability_timeout
 from app.runtime.reliability import RetryDecision, RetryPolicy
 
 
@@ -289,9 +290,25 @@ class ParallelTeamScheduler:
             # dispatch newly-ready tasks immediately.  This is the key
             # difference from the old gather(): a slow task no longer blocks
             # re-dispatch of ready retries.
+            #
+            # BUT: a bare ``FIRST_COMPLETED`` wait with no timeout also blocks
+            # re-dispatch of *retry-ready* tasks.  If task A (15-min planning)
+            # is running and task B failed with a 15-s backoff, B becomes due
+            # while A is still running — but the scheduler won't notice until
+            # A finishes.  In run_e8587ea68ac64ff5, T2's retry sat for 10 min
+            # behind T1's 900-s run.  Cap the wait at the next deferred retry's
+            # due time so the loop wakes up and re-evaluates ``list_pending``.
+            wait_timeout = self._next_retry_delay()
             done, _ = await asyncio.wait(
-                running.keys(), return_when=asyncio.FIRST_COMPLETED,
+                running.keys(),
+                return_when=asyncio.FIRST_COMPLETED,
+                timeout=wait_timeout,
             )
+            if not done:
+                # The wait timed out without any task finishing — a deferred
+                # retry is likely due now.  Loop back to re-dispatch it
+                # without consuming a round.
+                continue
             for fut in done:
                 running.pop(fut, None)
                 exc = fut.exception()
@@ -398,6 +415,42 @@ class ParallelTeamScheduler:
 
         already_running = set(running.values())
         return [t for t in serviceable if t.task_id not in already_running]
+
+    def _next_retry_delay(self) -> float | None:
+        """Return how long to wait before re-checking for retry-ready tasks.
+
+        Scans every PENDING task with a future ``next_attempt_at`` and returns
+        the time until the earliest one becomes due, capped at a small upper
+        bound so the scheduler also stays responsive to cancel/pause signals.
+        Returns ``None`` when no deferred retries exist, letting
+        ``asyncio.wait`` block indefinitely (the old behaviour) — this is
+        correct when every pending task is already dispatchable and we're
+        purely waiting for a running task to finish.
+
+        Without this cap, ``asyncio.wait(FIRST_COMPLETED)`` blocks until a
+        running task finishes.  In run_e8587ea68ac64ff5, T2's 15-s retry sat
+        for 10 minutes behind T1's 900-s planning run because the scheduler
+        never woke up to re-evaluate ``list_pending``.
+        """
+        now = datetime.utcnow()
+        soonest: float | None = None
+        for task in self.board.list_by_run(self.run_id):
+            if task.status != BoardTaskStatus.PENDING:
+                continue
+            due = task.next_attempt_at
+            if due is None:
+                continue
+            remaining = (due - now).total_seconds()
+            if remaining <= 0:
+                # Already due — wake immediately.
+                return 0.05
+            if soonest is None or remaining < soonest:
+                soonest = remaining
+        if soonest is None:
+            return None
+        # Cap at 5 s so cancel/pause signals are still picked up promptly
+        # even when the next retry is far off.
+        return min(soonest, 5.0)
 
     async def _resolve_idle(self, round_n: int) -> ParallelRunResult | None:
         """Handle the case where nothing is running and nothing is dispatchable.
@@ -740,16 +793,22 @@ class ParallelTeamScheduler:
                     )
                 )
                 if self.task_execution_timeout > 0:
-                    # Per-task timeout from the planner's TaskBudget, falling
-                    # back to the scheduler-wide default.  Planning tasks get
-                    # 900s (deep LLM thinking), coding 600s, testing 300s.
-                    # The previous single global 300s killed planning tasks
-                    # before they could finish (run_2a438328372441d8 T01).
+                    # Per-task timeout resolution order:
+                    # 1. node_for_plan.budget.max_seconds (planner-set)
+                    # 2. capability_timeout(required_capabilities) — covers
+                    #    repair tasks whose ``add_repair_task`` may not have
+                    #    inherited the budget (defensive), and any node built
+                    #    via ``_task_graph_from_board`` fallback.
+                    # 3. scheduler-wide ``task_execution_timeout`` (300s).
+                    # The previous code skipped step 2, so repair tasks like
+                    # T1__repair_v17 (planning) fell to 300s and were killed
+                    # before the LLM could finish (run_e8587ea68ac64ff5).
                     effective_timeout = (
                         node_for_plan.budget.max_seconds
                         if node_for_plan is not None
                         and node_for_plan.budget.max_seconds > 0
-                        else self.task_execution_timeout
+                        else capability_timeout(task.required_capabilities)
+                        or self.task_execution_timeout
                     )
                     done, _ = await asyncio.wait(
                         {assignment_future},

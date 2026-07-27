@@ -21,6 +21,7 @@ from app.multiagent.task_graph import (
     TaskNodeStatus,
     TaskBudget,
     OutputContract,
+    capability_timeout,
 )
 
 
@@ -31,21 +32,9 @@ class PlanValidationError(Exception):
         self.details = details or []
 
 
-# Per-capability execution timeout (seconds).  0.0 means "use the scheduler's
-# global task_execution_timeout_seconds".  These values are written to
-# ``TaskBudget.max_seconds`` and read by ``ParallelTeamScheduler._run_one``.
-# Rationale: a single global timeout cannot fit both planning (deep LLM
-# thinking, observed 5-8 min in run_2a438328372441d8) and testing (fast shell
-# runs).  The previous global 300s killed planning tasks before they could
-# finish, then retries hit 429s and permanently failed the run.
-_CAP_TIMEOUTS: dict[str, float] = {
-    "planning": 900.0,      # 深度思考 + 多轮工具调用
-    "research": 600.0,      # 调研 + 网络请求
-    "coding": 600.0,        # 编码 + 编译 + 测试
-    "testing": 300.0,       # 测试相对快
-    "reviewing": 300.0,     # 评审相对快
-    "summarization": 600.0, # 总结需要读全部产物
-}
+# Per-capability execution timeouts now live in ``task_graph.CAPABILITY_TIMEOUTS``
+# so that ``add_repair_task`` and ``ParallelTeamScheduler`` can share the same
+# map.  See ``capability_timeout()`` for the lookup helper.
 
 
 def _llm_plan_to_taskgraph(json_output: dict | str, goal: str) -> TaskGraph:
@@ -149,8 +138,7 @@ def _llm_plan_to_taskgraph(json_output: dict | str, goal: str) -> TaskGraph:
         # 300s was too short for planning tasks — run_2a438328372441d8 T01
         # (a planning task) was killed at 300s before it could finish, then
         # its retry hit a 429 and permanently failed the run.
-        primary_cap = next((c for c in caps if c in _CAP_TIMEOUTS), None)
-        timeout_seconds = _CAP_TIMEOUTS.get(primary_cap, 0.0)
+        timeout_seconds = capability_timeout(caps)
 
         node = TaskNode(
             id=t["id"],
