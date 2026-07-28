@@ -102,6 +102,7 @@ const statusMsg = computed(() =>
       :result-preview="toolCallMsg.resultPreview"
       :duration-ms="toolCallMsg.durationMs"
       :agent-name="toolCallMsg.agentName"
+      :started-at="toolCallMsg.createdAt"
     />
   </div>
 

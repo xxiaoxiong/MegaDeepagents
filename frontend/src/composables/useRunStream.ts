@@ -6,7 +6,9 @@ export function useRunStream(
   runId: Ref<string>,
   afterSequence: Ref<number>,
   onEvent: (event: EventEnvelope) => void,
+  enabled?: Ref<boolean>,
 ) {
+  const active = enabled ?? ref(true);
   const connected = ref(false);
   const reconnecting = ref(false);
   const reconnectAttempt = ref(0);
@@ -76,6 +78,12 @@ export function useRunStream(
   };
 
   const reconnect = () => {
+    if (!active.value || !runId.value) {
+      stopped = true;
+      reconnecting.value = false;
+      disconnect();
+      return;
+    }
     reconnectAttempt.value = 0;
     connect();
   };
@@ -84,10 +92,24 @@ export function useRunStream(
     reconnecting.value = false;
     disconnect();
   };
-  const online = () => reconnect();
+  const online = () => {
+    if (active.value) reconnect();
+  };
   window.addEventListener("online", online);
 
-  watch(runId, reconnect, { immediate: true });
+  watch(
+    [runId, active],
+    ([, isActive]) => {
+      if (isActive) {
+        reconnect();
+      } else {
+        stopped = true;
+        reconnecting.value = false;
+        disconnect();
+      }
+    },
+    { immediate: true },
+  );
   onBeforeUnmount(() => {
     close();
     window.removeEventListener("online", online);

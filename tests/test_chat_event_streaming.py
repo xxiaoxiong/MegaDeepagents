@@ -11,6 +11,8 @@
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from app.infrastructure.database.run_store import get_agent_run_history
@@ -132,6 +134,31 @@ def test_tool_hook_without_run_id_is_noop():
     assert _events("") == []
 
 
+def test_read_tool_early_error_still_emits_paired_terminal_event(tmp_path):
+    """Every admitted tool call must leave the UI with a terminal state."""
+    from app.multiagent.executor import _build_restricted_tools
+
+    run_id = "run_tool_missing_file"
+    tool = _build_restricted_tools(
+        allowed_tools=["read_file"],
+        deny_default=True,
+        task_workspace=str(tmp_path),
+        run_id=run_id,
+        agent_id="a1",
+        task_id="t1",
+    )[0]
+
+    result_text = tool.invoke({"file_path": "missing.txt"})
+
+    started = _events(run_id, "tool_call_started")
+    result = _events(run_id, "tool_call_result")
+    assert "文件不存在" in result_text
+    assert len(started) == 1
+    assert len(result) == 1
+    assert started[0]["payload"]["tool_call_id"] == result[0]["payload"]["tool_call_id"]
+    assert result[0]["payload"]["status"] == "error"
+
+
 # ===== A2: token 级流式回调 =====
 
 
@@ -187,6 +214,56 @@ def test_assistant_stream_callback_throttle_batches_tokens():
     # 6 个 token 但 throttle=60s，应合并成 1 个 chunk（on_llm_end 时 flush）
     assert len(tokens) == 1
     assert tokens[0]["payload"]["delta"] == "abcdef"
+
+
+def test_assistant_stream_callback_uses_authoritative_final_content():
+    """The final provider message repairs any missing streamed delta."""
+    from app.multiagent.executor import _AssistantStreamCallback
+
+    cb = _AssistantStreamCallback(
+        run_id="run_tok_final",
+        agent_id="a1",
+        agent_name="Coder",
+        throttle_s=60.0,
+    )
+    cb.on_chat_model_start(serialized={}, messages=[])
+    cb.on_llm_new_token("部分")
+    response = SimpleNamespace(
+        generations=[
+            [
+                SimpleNamespace(
+                    message=SimpleNamespace(content="部分但最终完整的回答")
+                )
+            ]
+        ]
+    )
+
+    cb.on_llm_end(response=response)
+
+    message = _events("run_tok_final", "assistant_message")[0]["payload"]
+    assert message["content"] == "部分但最终完整的回答"
+    assert message["finish_reason"] == "completed"
+
+
+def test_assistant_stream_callback_error_finalizes_partial_message():
+    """A model error must stop the live cursor while preserving partial text."""
+    from app.multiagent.executor import _AssistantStreamCallback
+
+    cb = _AssistantStreamCallback(
+        run_id="run_tok_error",
+        agent_id="a1",
+        agent_name="Coder",
+        throttle_s=60.0,
+    )
+    cb.on_chat_model_start(serialized={}, messages=[])
+    cb.on_llm_new_token("已经生成的部分")
+
+    cb.on_llm_error(RuntimeError("gateway disconnected"))
+
+    message = _events("run_tok_error", "assistant_message")[0]["payload"]
+    assert message["content"] == "已经生成的部分"
+    assert message["finish_reason"] == "error"
+    assert message["error"] == "gateway disconnected"
 
 
 # ===== A4: 用户消息回显 =====

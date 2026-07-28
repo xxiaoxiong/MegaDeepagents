@@ -179,13 +179,14 @@ def stream_events(run_id: str, after_sequence: int = Query(0, ge=0)):
 
     def generate():
         cursor = after_sequence
-        idle_ticks = 0
-        while idle_ticks < 300:
+        idle_deadline = time.monotonic() + 300
+        next_keepalive = 0.0
+        while time.monotonic() < idle_deadline:
             events = get_agent_run_history().list_event_envelopes(
                 run_id, cursor, 200
             )
             if events:
-                idle_ticks = 0
+                idle_deadline = time.monotonic() + 300
                 for event in events:
                     cursor = max(cursor, int(event["sequence"]))
                     yield (
@@ -193,9 +194,15 @@ def stream_events(run_id: str, after_sequence: int = Query(0, ge=0)):
                         f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                     )
             else:
-                idle_ticks += 1
-                yield ": keepalive\n\n"
-                time.sleep(1)
+                now = time.monotonic()
+                if now >= next_keepalive:
+                    yield ": keepalive\n\n"
+                    next_keepalive = now + 15
+                # A one-second database polling interval made token chunks
+                # arrive in visible bursts.  Five lightweight reads per
+                # second keeps perceived latency low while keepalives remain
+                # sparse enough for proxies and browser tooling.
+                time.sleep(0.2)
 
     return StreamingResponse(
         generate(),
