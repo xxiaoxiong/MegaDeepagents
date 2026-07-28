@@ -83,10 +83,19 @@ function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex)
           createdAt: env.timestamp,
         };
         messages.push(created);
-        m = created;
+        // Vue wraps objects when they enter a reactive array.  Keep the
+        // wrapped instance in the index; mutating ``created`` afterwards
+        // bypasses Vue and leaves the UI stuck on the first token until some
+        // unrelated render (or a full page refresh) happens.
+        m = messages[messages.length - 1] as AssistantChatMessage;
         if (msgId) idx.assistantByMsgId.set(msgId, m);
       }
       m.content += delta;
+      // A transient SSE disconnect intentionally clears stale cursors.  If
+      // replay or the recovered connection delivers another token for the
+      // same message, that token is authoritative evidence that generation
+      // resumed, so restore the live state as well as appending the text.
+      m.streaming = true;
       // 记录最后收到 token 的时间，用于超时清除 streaming 光标
       if (msgId) idx.lastTokenAt.set(msgId, Date.now());
       break;
@@ -120,7 +129,12 @@ function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex)
           createdAt: env.timestamp,
         };
         messages.push(created);
-        if (msgId) idx.assistantByMsgId.set(msgId, created);
+        if (msgId) {
+          idx.assistantByMsgId.set(
+            msgId,
+            messages[messages.length - 1] as AssistantChatMessage,
+          );
+        }
       }
       break;
     }
@@ -137,7 +151,12 @@ function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex)
         createdAt: env.timestamp,
       };
       messages.push(created);
-      if (tcId) idx.toolByCallId.set(tcId, created);
+      if (tcId) {
+        idx.toolByCallId.set(
+          tcId,
+          messages[messages.length - 1] as ToolCallChatMessage,
+        );
+      }
       break;
     }
     case "tool_call_result": {
@@ -161,7 +180,12 @@ function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex)
           createdAt: env.timestamp,
         };
         messages.push(created);
-        if (tcId) idx.toolByCallId.set(tcId, created);
+        if (tcId) {
+          idx.toolByCallId.set(
+            tcId,
+            messages[messages.length - 1] as ToolCallChatMessage,
+          );
+        }
       }
       break;
     }
@@ -234,37 +258,57 @@ export function useChatThread(runId: Ref<string>) {
   const afterSequence = ref(0);
   const loadingHistory = ref(false);
   const error = ref("");
+  const historyReady = ref(false);
   let idx: ThreadIndex = newIndex();
+  let loadGeneration = 0;
 
   function applyEvent(env: EventEnvelope) {
     applyOne(messages.value, env, idx);
+    afterSequence.value = Math.max(afterSequence.value, env.sequence);
   }
 
   async function loadHistory(id: string) {
+    const generation = ++loadGeneration;
+    historyReady.value = false;
+    idx = newIndex();
+    messages.value = [];
+    afterSequence.value = 0;
     if (!id) {
-      messages.value = [];
-      idx = newIndex();
-      afterSequence.value = 0;
+      loadingHistory.value = false;
+      error.value = "";
       return;
     }
     loadingHistory.value = true;
     error.value = "";
     try {
       const events = await api.listAllEvents(id);
-      idx = newIndex(); // 重置索引，避免跨会话泄漏
-      messages.value = [];
+      if (generation !== loadGeneration || runId.value !== id) return;
       for (const env of [...events].sort((a, b) => a.sequence - b.sequence)) {
         applyOne(messages.value, env, idx);
       }
       afterSequence.value = events.at(-1)?.sequence ?? 0;
     } catch (e) {
+      if (generation !== loadGeneration || runId.value !== id) return;
       error.value = e instanceof Error ? e.message : String(e);
     } finally {
-      loadingHistory.value = false;
+      if (generation === loadGeneration && runId.value === id) {
+        loadingHistory.value = false;
+        // Start SSE only after the replay cursor is known.  Starting both in
+        // parallel lets a late history response overwrite live token events.
+        historyReady.value = true;
+      }
     }
   }
 
-  const stream = useRunStream(runId, afterSequence, applyEvent);
+  watch(
+    runId,
+    (id) => {
+      void loadHistory(id);
+    },
+    { immediate: true },
+  );
+
+  const stream = useRunStream(runId, afterSequence, applyEvent, historyReady);
 
   // SSE 断开时清除所有 streaming 光标 — 防止连接中断后光标永久残留。
   watch(() => stream.connected.value, (connected) => {
@@ -293,14 +337,6 @@ export function useChatThread(runId: Ref<string>) {
   onBeforeUnmount(() => {
     clearInterval(cleanupTimer);
   });
-
-  watch(
-    runId,
-    async (id) => {
-      await loadHistory(id);
-    },
-    { immediate: true },
-  );
 
   return {
     messages,

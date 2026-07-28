@@ -1,5 +1,10 @@
-import { describe, expect, it } from "vitest";
-import { mapEventsToMessages } from "@/composables/useChatThread";
+import { createApp, h, nextTick, ref } from "vue";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  mapEventsToMessages,
+  useChatThread,
+} from "@/composables/useChatThread";
+import { api } from "@/lib/api";
 import type { EventEnvelope } from "@/types";
 
 let seq = 0;
@@ -23,6 +28,11 @@ function env(
 function resetSeq() {
   seq = 0;
 }
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 
 describe("mapEventsToMessages", () => {
   it("maps user_message to a user bubble", () => {
@@ -268,5 +278,99 @@ describe("mapEventsToMessages", () => {
       content: "README 已读取，这是 MegaDeepagents 项目。",
       streaming: false,
     });
+  });
+
+  it("renders every live token through Vue and starts SSE after history replay", async () => {
+    resetSeq();
+    const historyEvent = env("user_message", { content: "stream please" });
+    vi.spyOn(api, "listAllEvents").mockResolvedValue([historyEvent]);
+
+    class FakeEventSource {
+      static instances: FakeEventSource[] = [];
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      closed = false;
+
+      constructor(public readonly url: string) {
+        FakeEventSource.instances.push(this);
+      }
+
+      close() {
+        this.closed = true;
+      }
+
+      emit(event: EventEnvelope) {
+        this.onmessage?.({
+          data: JSON.stringify(event),
+        } as MessageEvent);
+      }
+    }
+    vi.stubGlobal("EventSource", FakeEventSource);
+
+    const runId = ref("run_test");
+    let thread!: ReturnType<typeof useChatThread>;
+    const container = document.createElement("div");
+    const app = createApp({
+      setup() {
+        thread = useChatThread(runId);
+        return () =>
+          h(
+            "div",
+            thread.messages.value.map((message) =>
+              "role" in message && message.role === "assistant"
+                ? h(
+                    "p",
+                    { "data-streaming": String(message.streaming) },
+                    message.content,
+                  )
+                : h("p", "role" in message ? message.content : message.type),
+            ),
+          );
+      },
+    });
+
+    try {
+      app.mount(container);
+      await vi.waitFor(() => {
+        expect(FakeEventSource.instances).toHaveLength(1);
+      });
+      const source = FakeEventSource.instances[0];
+      expect(source.url).toContain("after_sequence=1");
+      source.onopen?.();
+
+      source.emit(
+        env("assistant_token", { message_id: "live", delta: "实时" }),
+      );
+      await nextTick();
+      expect(container.textContent).toContain("实时");
+      expect(container.querySelector("p[data-streaming='true']")).not.toBeNull();
+
+      // A dropped transport closes the cursor, but the first token delivered
+      // after recovery must resume the same bubble instead of leaving it in a
+      // visually finalized state.
+      source.onerror?.();
+      await nextTick();
+      expect(container.querySelector("p[data-streaming='false']")).not.toBeNull();
+      source.emit(
+        env("assistant_token", { message_id: "live", delta: "内容持续增长" }),
+      );
+      await nextTick();
+      expect(container.textContent).toContain("实时内容持续增长");
+      expect(container.querySelector("p[data-streaming='true']")).not.toBeNull();
+
+      source.emit(
+        env("assistant_message", {
+          message_id: "live",
+          content: "实时内容持续增长并完整结束。",
+        }),
+      );
+      await nextTick();
+      expect(container.textContent).toContain("实时内容持续增长并完整结束。");
+      expect(container.querySelector("p[data-streaming='false']")).not.toBeNull();
+      expect(thread.afterSequence.value).toBe(4);
+    } finally {
+      app.unmount();
+    }
   });
 });

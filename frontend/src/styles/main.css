@@ -4159,30 +4159,43 @@ select:focus-visible {
 /* 工具调用卡片 */
 .tool-call-card {
   width: 100%;
-  background: white;
-  border: 1px solid var(--line);
-  border-radius: 11px;
-  box-shadow: var(--shadow-sm);
-  overflow: hidden;
+  color: var(--ink-soft);
 }
 
 .tool-head {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: 7px;
   width: 100%;
-  padding: 9px 12px;
-  background: transparent;
+  min-height: 32px;
+  padding: 5px 8px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  cursor: pointer;
+  list-style: none;
+  transition: 120ms ease;
+}
+
+.tool-head::-webkit-details-marker {
+  display: none;
+}
+
+.tool-head:hover {
+  background: white;
+  border-color: #d9d4ed;
 }
 
 .tool-icon {
   display: grid;
   place-items: center;
-  width: 24px;
-  height: 24px;
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
   color: var(--ink-soft);
   background: var(--surface-muted);
-  border-radius: 7px;
+  border-radius: 5px;
 }
 
 .tool-call-card[data-status="running"] .tool-icon {
@@ -4200,63 +4213,95 @@ select:focus-visible {
   background: var(--danger-soft);
 }
 
-.tool-head svg:not(.tool-icon svg) {
-  flex: 0 0 auto;
-}
-
-.tool-call-card[data-status="running"] .tool-head > svg:nth-of-type(1) {
-  color: var(--primary);
-}
-
-.tool-call-card[data-status="ok"] .tool-head > svg:nth-of-type(1) {
-  color: var(--mint);
-}
-
-.tool-call-card[data-status="error"] .tool-head > svg:nth-of-type(1) {
-  color: var(--danger);
-}
-
 .tool-name {
   flex: 0 1 auto;
   color: var(--ink);
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: 12px;
+  font-size: 10.5px;
   font-weight: 700;
+  white-space: nowrap;
 }
 
-.tool-duration {
+.tool-arg-summary {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: var(--muted-light);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-status {
   display: inline-flex;
   align-items: center;
-  gap: 3px;
-  color: var(--muted-light);
-  font-size: 10px;
+  gap: 4px;
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 9px;
+  white-space: nowrap;
 }
 
-.tool-running-label {
-  margin-left: auto;
+.tool-call-card[data-status="running"] .tool-status {
   color: var(--primary);
-  font-size: 10px;
-  font-weight: 600;
 }
 
-/* 参数区：直接展示 key-value，不需要点击展开 */
+.tool-call-card[data-status="ok"] .tool-status {
+  color: var(--mint);
+}
+
+.tool-call-card[data-status="error"] .tool-status {
+  color: var(--danger);
+}
+
+.tool-chevron {
+  flex: 0 0 auto;
+  color: var(--muted-light);
+  transition: transform 120ms ease;
+}
+
+.tool-call-card[open] .tool-chevron {
+  transform: rotate(90deg);
+}
+
+.tool-details {
+  margin: 4px 0 0;
+  overflow: hidden;
+  background: white;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.tool-timing-note,
+.tool-pending-detail {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0;
+  padding: 7px 10px;
+  color: var(--muted-light);
+  background: var(--surface-muted);
+  font-size: 9px;
+}
+
 .tool-args {
-  padding: 0 12px 8px;
+  padding: 4px 10px 6px;
   border-top: 1px solid var(--line);
 }
 
 .tool-arg {
   display: flex;
   gap: 8px;
-  padding: 5px 0;
+  padding: 4px 0;
 }
 
 .tool-arg-key {
   flex: 0 0 auto;
-  min-width: 50px;
+  min-width: 46px;
   color: var(--muted);
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: 10.5px;
+  font-size: 9.5px;
   font-weight: 700;
   padding-top: 1px;
 }
@@ -4265,22 +4310,21 @@ select:focus-visible {
   flex: 1;
   min-width: 0;
   margin: 0;
-  max-height: 200px;
+  max-height: 180px;
   overflow: auto;
   padding: 6px 8px;
   color: var(--ink-soft);
   background: var(--surface-muted);
   border-radius: 6px;
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: 10.5px;
+  font-size: 9.5px;
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
 }
 
-/* 结果区：直接展示，error 时红色背景 */
 .tool-result {
-  padding: 0 12px 10px;
+  padding: 6px 10px 8px;
   border-top: 1px solid var(--line);
 }
 
@@ -4291,13 +4335,13 @@ select:focus-visible {
 .tool-result-text {
   margin: 0;
   padding: 8px 10px;
-  max-height: 200px;
+  max-height: 180px;
   overflow: auto;
   color: var(--ink-soft);
   background: var(--surface-muted);
   border-radius: 8px;
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: 10.5px;
+  font-size: 9.5px;
   line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;

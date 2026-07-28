@@ -18,10 +18,11 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Protocol, Callable
+from typing import Any, Callable, Iterator, Protocol
 
 from app.core.logging import logger
 from app.multiagent.agent_profile import AgentProfile, get_capability_registry
@@ -279,7 +280,11 @@ def _tool_hook(event: str, *, run_id: str, agent_id: str, task_id: str,
                 rc = result.get("returncode")
                 if rc is not None and rc != 0:
                     status = "error"
-                elif result.get("error"):
+                elif (
+                    result.get("error")
+                    or result.get("timed_out")
+                    or result.get("cancelled")
+                ):
                     status = "error"
             emitter.emit(run_id, EventType.TOOL_CALL_RESULT, {
                 "run_id": run_id, "agent_id": agent_id, "task_id": task_id,
@@ -290,6 +295,50 @@ def _tool_hook(event: str, *, run_id: str, agent_id: str, task_id: str,
     except Exception:
         # 事件发射失败不应阻断工具执行主流程
         pass
+
+
+@contextmanager
+def _tool_execution(
+    *,
+    run_id: str,
+    agent_id: str,
+    task_id: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> Iterator[dict[str, Any]]:
+    """Guarantee a terminal tool event for every admitted invocation.
+
+    Several tool adapters previously returned early for invalid paths,
+    idempotency hits, or permission/runtime errors without emitting
+    ``AfterToolUse``.  The browser then showed the tool as running forever.
+    The mutable result payload lets each adapter attach concise evidence while
+    this boundary guarantees the paired terminal event in ``finally``.
+    """
+
+    _tool_hook(
+        "BeforeToolUse",
+        run_id=run_id,
+        agent_id=agent_id,
+        task_id=task_id,
+        tool_name=tool_name,
+        arguments=arguments,
+    )
+    result: dict[str, Any] = {}
+    try:
+        yield result
+    except Exception as exc:
+        result.setdefault("error", str(exc))
+        raise
+    finally:
+        _tool_hook(
+            "AfterToolUse",
+            run_id=run_id,
+            agent_id=agent_id,
+            task_id=task_id,
+            tool_name=tool_name,
+            arguments=arguments,
+            result=result,
+        )
 
 
 def _atomic_write(path: Path, content: str, cancel_event: Any | None = None) -> None:
@@ -325,21 +374,26 @@ def _make_read_file_tool(
     def read_file(file_path: str) -> str:
         """读取指定文件的全部内容。"""
         _tool_boundary(cancel_event, safety_point)
-        _tool_hook("BeforeToolUse", run_id=run_id, agent_id=agent_id,
-                   task_id=task_id, tool_name="read_file",
-                   arguments={"file_path": file_path})
-        try:
-            path = _safe_workspace_path(task_workspace, file_path)
-        except ValueError as exc:
-            return f"错误: {exc}"
-        if not path.is_file():
-            return f"错误: 文件不存在 {file_path}"
-        with path.open("r", encoding="utf-8") as f:
-            content = f.read()
-        _tool_hook("AfterToolUse", run_id=run_id, agent_id=agent_id,
-                   task_id=task_id, tool_name="read_file",
-                   arguments={"file_path": file_path}, result={"size": len(content)})
-        return content
+        arguments = {"file_path": file_path}
+        with _tool_execution(
+            run_id=run_id,
+            agent_id=agent_id,
+            task_id=task_id,
+            tool_name="read_file",
+            arguments=arguments,
+        ) as audit:
+            try:
+                path = _safe_workspace_path(task_workspace, file_path)
+            except ValueError as exc:
+                audit["error"] = str(exc)
+                return f"错误: {exc}"
+            if not path.is_file():
+                audit["error"] = f"文件不存在 {file_path}"
+                return f"错误: 文件不存在 {file_path}"
+            with path.open("r", encoding="utf-8") as f:
+                content = f.read()
+            audit["size"] = len(content)
+            return content
     return read_file
 
 
@@ -355,19 +409,25 @@ def _make_list_dir_tool(
         """列出指定目录中的文件和子目录。"""
         import json
         _tool_boundary(cancel_event, safety_point)
-        _tool_hook("BeforeToolUse", run_id=run_id, agent_id=agent_id,
-                   task_id=task_id, tool_name="list_dir", arguments={"path": path})
-        try:
-            resolved = _safe_workspace_path(task_workspace, path)
-        except ValueError as exc:
-            return f"错误: {exc}"
-        if not resolved.is_dir():
-            return f"错误: 目录不存在 {path}"
-        items = [entry.name for entry in resolved.iterdir()]
-        _tool_hook("AfterToolUse", run_id=run_id, agent_id=agent_id,
-                   task_id=task_id, tool_name="list_dir", arguments={"path": path},
-                   result={"count": len(items)})
-        return json.dumps(items, ensure_ascii=False)
+        arguments = {"path": path}
+        with _tool_execution(
+            run_id=run_id,
+            agent_id=agent_id,
+            task_id=task_id,
+            tool_name="list_dir",
+            arguments=arguments,
+        ) as audit:
+            try:
+                resolved = _safe_workspace_path(task_workspace, path)
+            except ValueError as exc:
+                audit["error"] = str(exc)
+                return f"错误: {exc}"
+            if not resolved.is_dir():
+                audit["error"] = f"目录不存在 {path}"
+                return f"错误: 目录不存在 {path}"
+            items = [entry.name for entry in resolved.iterdir()]
+            audit["count"] = len(items)
+            return json.dumps(items, ensure_ascii=False)
     return list_dir
 
 
@@ -383,24 +443,28 @@ def _make_create_file_tool(
     def create_file(file_path: str, content: str) -> str:
         """创建或覆写文件。路径相对于工作目录。"""
         _tool_boundary(cancel_event, safety_point)
-        _tool_hook("BeforeToolUse", run_id=run_id, agent_id=agent_id,
-                   task_id=task_id, tool_name="create_file",
-                   arguments={"file_path": file_path, "size": len(content)})
-        try:
-            path = _safe_workspace_path(task_workspace, file_path)
-        except ValueError as exc:
-            return f"错误: {exc}"
-        if permission_broker is not None:
-            from app.multiagent.permission import PermissionKind
-            permission_broker.authorize(
-                run_id=run_id, agent_id=agent_id, kind=PermissionKind.FILE_WRITE,
-                operation="create_file", parameters={"path": str(path)},
-            )
-        _atomic_write(path, content, cancel_event)
-        _tool_hook("AfterToolUse", run_id=run_id, agent_id=agent_id,
-                   task_id=task_id, tool_name="create_file",
-                   arguments={"file_path": file_path}, result={"path": str(path)})
-        return f"文件已写入: {path}"
+        arguments = {"file_path": file_path, "size": len(content)}
+        with _tool_execution(
+            run_id=run_id,
+            agent_id=agent_id,
+            task_id=task_id,
+            tool_name="create_file",
+            arguments=arguments,
+        ) as audit:
+            try:
+                path = _safe_workspace_path(task_workspace, file_path)
+            except ValueError as exc:
+                audit["error"] = str(exc)
+                return f"错误: {exc}"
+            if permission_broker is not None:
+                from app.multiagent.permission import PermissionKind
+                permission_broker.authorize(
+                    run_id=run_id, agent_id=agent_id, kind=PermissionKind.FILE_WRITE,
+                    operation="create_file", parameters={"path": str(path)},
+                )
+            _atomic_write(path, content, cancel_event)
+            audit["path"] = file_path
+            return f"文件已写入: {path}"
     return create_file
 
 
@@ -416,31 +480,37 @@ def _make_edit_file_tool(
     def edit_file(file_path: str, old_string: str, new_string: str) -> str:
         """编辑文件的字符串替换。"""
         _tool_boundary(cancel_event, safety_point)
-        _tool_hook("BeforeToolUse", run_id=run_id, agent_id=agent_id,
-                   task_id=task_id, tool_name="edit_file",
-                   arguments={"file_path": file_path})
-        try:
-            path = _safe_workspace_path(task_workspace, file_path)
-        except ValueError as exc:
-            return f"错误: {exc}"
-        if not path.is_file():
-            return f"错误: 文件不存在 {path}"
-        with path.open("r", encoding="utf-8") as f:
-            content = f.read()
-        if old_string not in content:
-            return f"未找到要替换的字符串"
-        if permission_broker is not None:
-            from app.multiagent.permission import PermissionKind
-            permission_broker.authorize(
-                run_id=run_id, agent_id=agent_id, kind=PermissionKind.FILE_WRITE,
-                operation="edit_file", parameters={"path": str(path)},
-            )
-        content = content.replace(old_string, new_string, 1)
-        _atomic_write(path, content, cancel_event)
-        _tool_hook("AfterToolUse", run_id=run_id, agent_id=agent_id,
-                   task_id=task_id, tool_name="edit_file",
-                   arguments={"file_path": file_path}, result={"path": str(path)})
-        return f"已编辑 {path}"
+        arguments = {"file_path": file_path}
+        with _tool_execution(
+            run_id=run_id,
+            agent_id=agent_id,
+            task_id=task_id,
+            tool_name="edit_file",
+            arguments=arguments,
+        ) as audit:
+            try:
+                path = _safe_workspace_path(task_workspace, file_path)
+            except ValueError as exc:
+                audit["error"] = str(exc)
+                return f"错误: {exc}"
+            if not path.is_file():
+                audit["error"] = f"文件不存在 {file_path}"
+                return f"错误: 文件不存在 {path}"
+            with path.open("r", encoding="utf-8") as f:
+                content = f.read()
+            if old_string not in content:
+                audit["error"] = "未找到要替换的字符串"
+                return "未找到要替换的字符串"
+            if permission_broker is not None:
+                from app.multiagent.permission import PermissionKind
+                permission_broker.authorize(
+                    run_id=run_id, agent_id=agent_id, kind=PermissionKind.FILE_WRITE,
+                    operation="edit_file", parameters={"path": str(path)},
+                )
+            content = content.replace(old_string, new_string, 1)
+            _atomic_write(path, content, cancel_event)
+            audit["path"] = file_path
+            return f"已编辑 {path}"
     return edit_file
 
 
@@ -458,45 +528,61 @@ def _make_execute_tool(
     def execute(argv: list[str]) -> str:
         """以结构化 argv 执行命令；不会经过 shell 字符串解析。"""
         from app.multiagent.shell_policy import ShellCommandRunner
-        from app.infrastructure.database.run_store import get_agent_run_history, make_run_event_id
         from app.multiagent.tool_runtime import ToolInvocation, ToolInvocationStatus, ToolSideEffectJournal
         _tool_boundary(cancel_event, safety_point)
-        _tool_hook("BeforeToolUse", run_id=run_id, agent_id=agent_id,
-                   task_id=task_id, tool_name="execute", arguments={"argv": argv})
-        journal = ToolSideEffectJournal()
-        key = ToolInvocation.key_for(run_id, agent_id, task_id, "execute", {"argv": argv})
-        invocation, created = journal.begin(ToolInvocation(
-            idempotency_key=key, run_id=run_id, agent_id=agent_id,
-            task_id=task_id, tool_name="execute", arguments={"argv": argv},
-            side_effecting=True,
-        ))
-        if not created:
-            if invocation.status == ToolInvocationStatus.COMPLETED:
-                return json.dumps(invocation.result, ensure_ascii=False)
-            return f"执行被幂等日志阻止: {invocation.status.value}"
-        try:
-            result = ShellCommandRunner(permission_broker=permission_broker).run(
-                argv, cwd=task_workspace, run_id=run_id, agent_id=agent_id,
-                timeout=30, cancel_token=cancel_event,
+        arguments = {"argv": argv}
+        with _tool_execution(
+            run_id=run_id,
+            agent_id=agent_id,
+            task_id=task_id,
+            tool_name="execute",
+            arguments=arguments,
+        ) as audit:
+            journal = ToolSideEffectJournal()
+            key = ToolInvocation.key_for(
+                run_id, agent_id, task_id, "execute", arguments
             )
-            payload = {
-                "returncode": result.returncode, "stdout": result.stdout[:4000],
-                "stderr": result.stderr[:2000], "timed_out": result.timed_out,
-                "cancelled": result.cancelled,
-                "cancellation_phase": result.cancellation_phase,
-                "environment": result.environment,
-            }
-            _tool_hook("AfterToolUse", run_id=run_id, agent_id=agent_id,
-                       task_id=task_id, tool_name="execute",
-                       arguments={"argv": argv}, result=payload)
-            journal.complete(key, payload)
-            return json.dumps(payload, ensure_ascii=False)
-        except Exception as exc:
-            journal.fail(key, str(exc), cancelled=bool(cancel_event and cancel_event.is_set()))
-            from app.multiagent.permission import PermissionRequired
-            if isinstance(exc, PermissionRequired):
-                raise
-            return f"执行失败: {exc}"
+            invocation, created = journal.begin(ToolInvocation(
+                idempotency_key=key, run_id=run_id, agent_id=agent_id,
+                task_id=task_id, tool_name="execute", arguments=arguments,
+                side_effecting=True,
+            ))
+            if not created:
+                audit["idempotent_replay"] = True
+                audit["status"] = invocation.status.value
+                if invocation.status == ToolInvocationStatus.COMPLETED:
+                    audit.update(invocation.result or {})
+                    return json.dumps(invocation.result, ensure_ascii=False)
+                audit["error"] = (
+                    f"执行被幂等日志阻止: {invocation.status.value}"
+                )
+                return audit["error"]
+            try:
+                result = ShellCommandRunner(permission_broker=permission_broker).run(
+                    argv, cwd=task_workspace, run_id=run_id, agent_id=agent_id,
+                    timeout=30, cancel_token=cancel_event,
+                )
+                payload = {
+                    "returncode": result.returncode, "stdout": result.stdout[:4000],
+                    "stderr": result.stderr[:2000], "timed_out": result.timed_out,
+                    "cancelled": result.cancelled,
+                    "cancellation_phase": result.cancellation_phase,
+                    "environment": result.environment,
+                }
+                audit.update(payload)
+                journal.complete(key, payload)
+                return json.dumps(payload, ensure_ascii=False)
+            except Exception as exc:
+                audit["error"] = str(exc)
+                journal.fail(
+                    key,
+                    str(exc),
+                    cancelled=bool(cancel_event and cancel_event.is_set()),
+                )
+                from app.multiagent.permission import PermissionRequired
+                if isinstance(exc, PermissionRequired):
+                    raise
+                return f"执行失败: {exc}"
     return execute
 
 
@@ -561,7 +647,13 @@ class _AssistantStreamCallback(BaseCallbackHandler):
     前端据此累积成同一个流式气泡。回调失败不影响 LLM 主流程。
     """
 
-    def __init__(self, run_id: str, agent_id: str, agent_name: str, throttle_s: float = 0.05):
+    def __init__(
+        self,
+        run_id: str,
+        agent_id: str,
+        agent_name: str,
+        throttle_s: float = 0.12,
+    ):
         self.run_id = run_id
         self.agent_id = agent_id
         self.agent_name = agent_name
@@ -570,6 +662,7 @@ class _AssistantStreamCallback(BaseCallbackHandler):
         self._buffer: list[str] = []
         self._full: list[str] = []
         self._last_flush = 0.0
+        self._ended = False
 
     def on_llm_start(self, serialized, prompts, **kwargs):
         self._reset_message()
@@ -581,40 +674,100 @@ class _AssistantStreamCallback(BaseCallbackHandler):
         self._message_id = f"msg_{uuid.uuid4().hex[:12]}"
         self._buffer = []
         self._full = []
-        self._last_flush = time.time()
+        self._last_flush = time.monotonic()
+        self._ended = False
 
     def on_llm_new_token(self, token, **kwargs):
         if not token:
             return
-        self._buffer.append(token)
-        self._full.append(token)
-        if time.time() - self._last_flush >= self.throttle_s:
+        if self._message_id is None or self._ended:
+            self._reset_message()
+        text = str(token)
+        self._buffer.append(text)
+        self._full.append(text)
+        if time.monotonic() - self._last_flush >= self.throttle_s:
             self._flush(final=False)
 
     def on_llm_end(self, response, **kwargs):
-        self._flush(final=True)
+        self._flush(
+            final=True,
+            authoritative_content=self._response_content(response),
+            finish_reason="completed",
+        )
 
-    def _flush(self, final: bool = False):
+    def on_llm_error(self, error, **kwargs):
+        # Persist the partial response and a terminal marker so the browser
+        # never leaves a cursor or tool-adjacent message running forever.
+        self._flush(
+            final=True,
+            finish_reason="error",
+            error=str(error)[:500],
+        )
+
+    @staticmethod
+    def _content_text(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    text = item.get("text") or item.get("content")
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "".join(parts)
+        return ""
+
+    @classmethod
+    def _response_content(cls, response: Any) -> str:
+        """Read the provider's authoritative final text when available."""
+        candidates: list[str] = []
+        for batch in getattr(response, "generations", None) or []:
+            for generation in batch or []:
+                message = getattr(generation, "message", None)
+                content = cls._content_text(getattr(message, "content", None))
+                if not content:
+                    content = cls._content_text(
+                        getattr(generation, "text", None)
+                    )
+                if content:
+                    candidates.append(content)
+        return candidates[-1] if candidates else ""
+
+    def _flush(
+        self,
+        final: bool = False,
+        authoritative_content: str = "",
+        finish_reason: str | None = None,
+        error: str | None = None,
+    ):
         if not self.run_id:
+            return
+        if final and self._ended:
             return
         try:
             from app.multiagent.event_emitter import EventType, get_event_emitter
             if self._buffer:
                 chunk = "".join(self._buffer)
                 self._buffer = []
-                self._last_flush = time.time()
+                self._last_flush = time.monotonic()
                 get_event_emitter().emit(self.run_id, EventType.ASSISTANT_TOKEN, {
                     "run_id": self.run_id, "agent_id": self.agent_id,
                     "agent_name": self.agent_name, "message_id": self._message_id,
                     "delta": chunk,
                 })
             if final:
-                content = "".join(self._full)
+                content = authoritative_content or "".join(self._full)
                 get_event_emitter().emit(self.run_id, EventType.ASSISTANT_MESSAGE, {
                     "run_id": self.run_id, "agent_id": self.agent_id,
                     "agent_name": self.agent_name, "message_id": self._message_id,
                     "content": content,
+                    "finish_reason": finish_reason or "completed",
+                    "error": error,
                 })
+                self._ended = True
         except Exception:
             # 流式回调失败不应影响 LLM 主流程
             pass
