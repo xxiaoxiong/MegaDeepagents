@@ -1066,10 +1066,11 @@ def create_executor(profile: AgentProfile) -> AgentExecutor:
 def _default_workspace_root() -> str:
     """workspace 未注入时的默认根目录。
 
-    用项目根下的 runtime/workspaces/<default_run>，与 RunWorkspace 默认布局对齐。
+    读取 settings.workspace_root（容器内由 WORKSPACE_ROOT 环境变量注入），
+    让任务产物落到持久化 volume 而非容器可写层。
     """
-    import os
     from pathlib import Path
-    root = Path(os.getcwd()) / "runtime" / "workspaces" / "default_run"
+    from app.core.config import settings
+    root = Path(settings.workspace_root) / "default_run"
     root.mkdir(parents=True, exist_ok=True)
     return str(root)

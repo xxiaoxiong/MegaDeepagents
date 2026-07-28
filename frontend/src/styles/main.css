@@ -3094,8 +3094,6 @@ select:focus-visible {
   color: white;
   background: linear-gradient(135deg, #766bea, #4f87dc);
   border-radius: 9px;
-  font-size: 13px;
-  font-weight: 700;
 }
 
 .msg-bubble {
@@ -3119,6 +3117,27 @@ select:focus-visible {
   border: 1px solid var(--line);
   border-bottom-left-radius: 4px;
   box-shadow: var(--shadow-sm);
+}
+
+/* "正在思考..." 指示器（streaming 但内容为空时显示，替代空气泡） */
+.thinking-dots {
+  display: inline-flex;
+  align-items: center;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.thinking-dots::after {
+  content: "...";
+  margin-left: 2px;
+  animation: thinking-dots-blink 1.4s infinite step-start;
+}
+
+@keyframes thinking-dots-blink {
+  0%, 33% { content: "."; }
+  34%, 66% { content: ".."; }
+  67%, 100% { content: "..."; }
 }
 
 .msg-sender {
@@ -3275,14 +3294,6 @@ select:focus-visible {
   width: 100%;
   padding: 9px 12px;
   background: transparent;
-  border: 0;
-  cursor: pointer;
-  text-align: left;
-  transition: 120ms ease;
-}
-
-.tool-head:hover {
-  background: var(--surface-muted);
 }
 
 .tool-icon {
@@ -3334,15 +3345,6 @@ select:focus-visible {
   font-weight: 700;
 }
 
-.tool-agent {
-  padding: 1px 7px;
-  color: var(--muted);
-  background: var(--surface-muted);
-  border-radius: 999px;
-  font-size: 9px;
-  font-weight: 700;
-}
-
 .tool-duration {
   display: inline-flex;
   align-items: center;
@@ -3351,32 +3353,66 @@ select:focus-visible {
   font-size: 10px;
 }
 
-.tool-chevron {
+.tool-running-label {
   margin-left: auto;
-  color: var(--muted-light);
+  color: var(--primary);
+  font-size: 10px;
+  font-weight: 600;
 }
 
-.tool-detail {
-  padding: 0 12px 12px;
+/* 参数区：直接展示 key-value，不需要点击展开 */
+.tool-args {
+  padding: 0 12px 8px;
   border-top: 1px solid var(--line);
 }
 
-.tool-section {
-  margin-top: 9px;
+.tool-arg {
+  display: flex;
+  gap: 8px;
+  padding: 5px 0;
 }
 
-.tool-section-label {
-  margin-bottom: 4px;
+.tool-arg-key {
+  flex: 0 0 auto;
+  min-width: 50px;
   color: var(--muted);
-  font-size: 9px;
-  font-weight: 750;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 10.5px;
+  font-weight: 700;
+  padding-top: 1px;
 }
 
-.tool-json {
+.tool-arg-value {
+  flex: 1;
+  min-width: 0;
   margin: 0;
-  padding: 10px;
+  max-height: 200px;
+  overflow: auto;
+  padding: 6px 8px;
+  color: var(--ink-soft);
+  background: var(--surface-muted);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 结果区：直接展示，error 时红色背景 */
+.tool-result {
+  padding: 0 12px 10px;
+  border-top: 1px solid var(--line);
+}
+
+.tool-result.error {
+  background: var(--danger-soft);
+}
+
+.tool-result-text {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 200px;
   overflow: auto;
   color: var(--ink-soft);
   background: var(--surface-muted);
@@ -3385,6 +3421,12 @@ select:focus-visible {
   font-size: 10.5px;
   line-height: 1.55;
   white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.tool-result.error .tool-result-text {
+  color: var(--danger);
+  background: var(--danger-soft);
 }
 
 /* Artifact 卡片 */

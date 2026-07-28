@@ -1,4 +1,4 @@
-import { ref, watch, type Ref } from "vue";
+import { onBeforeUnmount, ref, watch, type Ref } from "vue";
 import { api } from "@/lib/api";
 import { useRunStream } from "@/composables/useRunStream";
 import type {
@@ -28,6 +28,8 @@ interface ThreadIndex {
   assistantByMsgId: Map<string, AssistantChatMessage>;
   toolByCallId: Map<string, ToolCallChatMessage>;
   seen: Set<string>;
+  // messageId → 最后收到 token 的时间戳，用于超时清除 streaming 光标
+  lastTokenAt: Map<string, number>;
 }
 
 function newIndex(): ThreadIndex {
@@ -35,6 +37,7 @@ function newIndex(): ThreadIndex {
     assistantByMsgId: new Map(),
     toolByCallId: new Map(),
     seen: new Set(),
+    lastTokenAt: new Map(),
   };
 }
 
@@ -61,6 +64,9 @@ function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex)
     }
     case "assistant_token": {
       const msgId = String(p.message_id ?? "");
+      const delta = String(p.delta ?? "");
+      // 空 delta 不创建消息（避免空气泡）
+      if (!delta) break;
       let m = msgId ? idx.assistantByMsgId.get(msgId) : undefined;
       if (!m) {
         const created: AssistantChatMessage = {
@@ -80,20 +86,30 @@ function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex)
         m = created;
         if (msgId) idx.assistantByMsgId.set(msgId, m);
       }
-      m.content += String(p.delta ?? "");
+      m.content += delta;
+      // 记录最后收到 token 的时间，用于超时清除 streaming 光标
+      if (msgId) idx.lastTokenAt.set(msgId, Date.now());
       break;
     }
     case "assistant_message": {
       const msgId = String(p.message_id ?? "");
+      const content = String(p.content ?? "");
       const existing = msgId ? idx.assistantByMsgId.get(msgId) : undefined;
       if (existing) {
-        existing.content = String(p.content ?? existing.content);
         existing.streaming = false;
-      } else {
+        if (content) existing.content = content;
+        // 最终内容为空 → 移除空气泡，不残留空消息
+        if (!existing.content.trim()) {
+          const i = messages.indexOf(existing);
+          if (i >= 0) messages.splice(i, 1);
+          if (msgId) idx.assistantByMsgId.delete(msgId);
+        }
+      } else if (content.trim()) {
+        // 只有非空内容才创建新消息（避免空气泡）
         const created: AssistantChatMessage = {
           id: env.event_id,
           role: "assistant",
-          content: String(p.content ?? ""),
+          content,
           streaming: false,
           messageId: msgId || undefined,
           agentId:
@@ -194,13 +210,8 @@ function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex)
       break;
     }
     case "speaker_selected": {
-      messages.push({
-        id: env.event_id,
-        type: "status",
-        tone: "info",
-        text: `${p.agent ?? "Agent"} 发言（第 ${p.round ?? "?"} 轮）`,
-        createdAt: env.timestamp,
-      });
+      // speaker_selected 是噪声事件（每轮都发射），不进入对话流。
+      // 用户关心的是工具调用和助手消息，不是谁在发言。
       break;
     }
     default:
@@ -254,6 +265,34 @@ export function useChatThread(runId: Ref<string>) {
   }
 
   const stream = useRunStream(runId, afterSequence, applyEvent);
+
+  // SSE 断开时清除所有 streaming 光标 — 防止连接中断后光标永久残留。
+  watch(() => stream.connected.value, (connected) => {
+    if (!connected) {
+      for (const msg of idx.assistantByMsgId.values()) {
+        if (msg.streaming) msg.streaming = false;
+      }
+    }
+  });
+
+  // Token 超时清除：如果某条 streaming 消息超过 15s 没有收到新 token，
+  // 自动将 streaming 置为 false。防止后端未发射 assistant_message 事件
+  // （LLM 异常/超时/message_id 不匹配）时光标永久闪烁。
+  const cleanupTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [msgId, msg] of idx.assistantByMsgId) {
+      if (msg.streaming) {
+        const last = idx.lastTokenAt.get(msgId) ?? 0;
+        if (last > 0 && now - last > 8_000) {
+          msg.streaming = false;
+        }
+      }
+    }
+  }, 5_000);
+
+  onBeforeUnmount(() => {
+    clearInterval(cleanupTimer);
+  });
 
   watch(
     runId,

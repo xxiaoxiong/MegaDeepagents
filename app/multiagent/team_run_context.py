@@ -106,9 +106,10 @@ class TeamRunContext(BaseModel):
         run_id = "run_" + uuid.uuid4().hex[:16]
 
         if not workspace_root:
-            workspace_root = str(
-                Path(os.getcwd()) / "runtime" / "workspaces" / run_id
-            )
+            # 读取 settings.workspace_root（容器内由 WORKSPACE_ROOT 环境变量注入），
+            # 让任务产物落到持久化 volume 而非容器可写层。
+            from app.core.config import settings
+            workspace_root = str(Path(settings.workspace_root) / run_id)
 
         ctx = cls(
             run_id=run_id,

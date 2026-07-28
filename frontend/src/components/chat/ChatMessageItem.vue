@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed } from "vue";
+import { Bot } from "@lucide/vue";
 import type {
   ApprovalChatMessage,
   ArtifactChatMessage,
@@ -69,16 +70,23 @@ const statusMsg = computed(() =>
     </div>
   </div>
 
-  <!-- 助手气泡：左对齐 + 头像 + 流式光标 -->
-  <div v-else-if="assistantMsg" class="msg-row assistant">
+  <!-- 助手气泡：空内容非 streaming 不渲染；空内容 streaming 显示"正在思考..." -->
+  <div
+    v-else-if="assistantMsg && (assistantMsg.content.trim() || assistantMsg.streaming)"
+    class="msg-row assistant"
+  >
     <div class="msg-avatar" :title="assistantMsg.agentName ?? 'Agent'">
-      {{ (assistantMsg.agentName ?? "A").slice(0, 1).toUpperCase() }}
+      <Bot :size="16" />
     </div>
     <div class="msg-bubble assistant-bubble">
-      <div v-if="assistantMsg.agentName" class="msg-sender">
-        {{ assistantMsg.agentName }}
-      </div>
+      <span
+        v-if="!assistantMsg.content.trim() && assistantMsg.streaming"
+        class="thinking-dots"
+      >
+        正在思考
+      </span>
       <MarkdownMessage
+        v-else
         :content="assistantMsg.content"
         :streaming="assistantMsg.streaming"
       />

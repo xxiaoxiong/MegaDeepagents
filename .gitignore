@@ -27,5 +27,6 @@ runtime/review_queue/
 openspec/
 .codegraph/
 .trae/
+deploy/
 
 .vercel
