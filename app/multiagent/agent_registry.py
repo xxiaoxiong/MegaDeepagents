@@ -131,7 +131,11 @@ class AgentRegistry:
         return None
 
     def reserve_idle_agent(
-        self, run_id: str, required_capabilities: set[str], task_id: str,
+        self,
+        run_id: str,
+        required_capabilities: set[str],
+        task_id: str,
+        preferred_agent_id: str | None = None,
     ) -> AgentInstance | None:
         """Atomically select and reserve a compatible idle teammate.
 
@@ -154,8 +158,13 @@ class AgentRegistry:
             if stripped and stripped != required_capabilities:
                 use_caps_list.append(stripped)
 
+            agents = list(self._agents.values())
+            if preferred_agent_id:
+                agents.sort(
+                    key=lambda item: item.agent_id != preferred_agent_id
+                )
             for use_caps in use_caps_list:
-                for agent in self._agents.values():
+                for agent in agents:
                     if agent.run_id != run_id or agent.status != AgentStatus.IDLE:
                         continue
                     if not use_caps.issubset(set(agent.capabilities)):

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, toRef, watch } from "vue";
+import { useRoute, useRouter } from "vue-router";
 import {
   ArrowLeft,
   Bot,
@@ -21,17 +22,23 @@ import {
 } from "@lucide/vue";
 import { api } from "@/lib/api";
 import { useRunStream } from "@/composables/useRunStream";
-import { useRunsStore } from "@/stores/runs";
+import {
+  useRunsStore,
+  type LiveRefreshScope,
+} from "@/stores/runs";
 import StatusBadge from "@/components/StatusBadge.vue";
 import TaskGraphPanel from "@/components/TaskGraphPanel.vue";
-import AgentPanel from "@/components/AgentPanel.vue";
+import ExecutionWorkbench from "@/components/ExecutionWorkbench.vue";
 import EventTimeline from "@/components/EventTimeline.vue";
 import ApprovalQueue from "@/components/ApprovalQueue.vue";
 import ArtifactExplorer from "@/components/ArtifactExplorer.vue";
 import RecoveryPanel from "@/components/RecoveryPanel.vue";
 import RunHealthPanel from "@/components/RunHealthPanel.vue";
+import type { EventEnvelope } from "@/types";
 
 const props = defineProps<{ runId: string }>();
+const route = useRoute();
+const router = useRouter();
 const store = useRunsStore();
 const activeTab = ref("artifacts");
 const controlling = ref(false);
@@ -39,16 +46,70 @@ const runMessage = ref("");
 const pageError = ref("");
 const actionNotice = ref("");
 const refreshTimer = ref<number | null>(null);
+const focusedAgentId = ref<string | null>(null);
+const focusedTaskId = ref<string | null>(null);
+const selectedArtifactId = ref<string | null>(null);
+const pendingRefreshScopes = new Set<LiveRefreshScope>();
 const streamRunId = toRef(props, "runId");
 const sequence = computed(() => store.lastSequence);
+const requestedAgentId = computed(() => {
+  const value = route.query.agent;
+  return typeof value === "string" ? value : null;
+});
+
+function refreshScopesFor(event: EventEnvelope): LiveRefreshScope[] {
+  const type = event.event_type.replace(/^root_graph:/, "").toLowerCase();
+  if (
+    ["assistant_token", "taskheartbeat", "teammateheartbeat"].some((token) =>
+      type.includes(token),
+    )
+  ) {
+    return [];
+  }
+  const scopes = new Set<LiveRefreshScope>(["execution"]);
+  if (
+    ["task", "scheduler", "verification", "repair", "replan"].some((token) =>
+      type.includes(token),
+    )
+  ) {
+    scopes.add("tasks");
+    scopes.add("agents");
+    scopes.add("diagnostics");
+  }
+  if (["agent", "teammate", "message"].some((token) => type.includes(token))) {
+    scopes.add("agents");
+  }
+  if (["artifact", "produced", "delivery"].some((token) => type.includes(token))) {
+    scopes.add("artifacts");
+  }
+  if (["permission", "approval", "plan"].some((token) => type.includes(token))) {
+    scopes.add("approvals");
+  }
+  if (["failed", "error", "timeout"].some((token) => type.includes(token))) {
+    scopes.add("errors");
+    scopes.add("diagnostics");
+  }
+  if (type.includes("git") || type.includes("merge") || type.includes("worktree")) {
+    scopes.add("git");
+  }
+  if (type.includes("run")) {
+    scopes.add("run");
+    scopes.add("diagnostics");
+  }
+  return [...scopes];
+}
 
 const stream = useRunStream(streamRunId, sequence, (event) => {
   store.applyEvent(event);
+  const scopes = refreshScopesFor(event);
+  if (!scopes.length) return;
+  for (const scope of scopes) pendingRefreshScopes.add(scope);
   window.clearTimeout(refreshTimer.value ?? undefined);
-  refreshTimer.value = window.setTimeout(
-    () => store.refreshLiveData(props.runId),
-    350,
-  );
+  refreshTimer.value = window.setTimeout(async () => {
+    const requested = [...pendingRefreshScopes];
+    pendingRefreshScopes.clear();
+    await store.refreshLiveData(props.runId, requested);
+  }, 600);
 });
 
 const progress = computed(() => {
@@ -139,8 +200,63 @@ async function sendRunMessage() {
   }
 }
 
+function scrollToSection(id: string) {
+  window.requestAnimationFrame(() => {
+    document.getElementById(id)?.scrollIntoView({
+      behavior: "smooth",
+      block: "start",
+    });
+  });
+}
+
+function focusAgent(agentId: string | null) {
+  focusedAgentId.value = agentId;
+  focusedTaskId.value = null;
+  if (agentId) scrollToSection("audit-console");
+}
+
+function focusTask(taskId: string | null) {
+  focusedTaskId.value = taskId;
+  focusedAgentId.value = null;
+  if (taskId) scrollToSection("audit-console");
+}
+
+function clearAuditFocus() {
+  focusedAgentId.value = null;
+  focusedTaskId.value = null;
+}
+
+function artifactFromHash(hash: string) {
+  if (!hash.startsWith("#artifact-")) return null;
+  try {
+    return decodeURIComponent(hash.slice("#artifact-".length));
+  } catch {
+    return hash.slice("#artifact-".length);
+  }
+}
+
+function openArtifact(artifactId: string, scroll = true) {
+  activeTab.value = "artifacts";
+  selectedArtifactId.value = artifactId;
+  const hash = `#artifact-${encodeURIComponent(artifactId)}`;
+  if (route.hash !== hash) void router.replace({ hash });
+  if (scroll) scrollToSection("deliverables");
+}
+
 watch(() => props.runId, refresh);
-onMounted(refresh);
+watch(
+  () => route.hash,
+  (hash) => {
+    const artifactId = artifactFromHash(hash);
+    if (artifactId) openArtifact(artifactId, false);
+  },
+  { immediate: true },
+);
+onMounted(async () => {
+  await refresh();
+  const artifactId = artifactFromHash(route.hash);
+  if (artifactId) openArtifact(artifactId);
+});
 onBeforeUnmount(() => {
   store.resetCurrent();
   if (refreshTimer.value) window.clearTimeout(refreshTimer.value);
@@ -250,6 +366,17 @@ onBeforeUnmount(() => {
         </div>
       </section>
 
+      <ExecutionWorkbench
+        id="execution-workbench"
+        :run-id="runId"
+        :execution="store.current.execution"
+        :initial-agent-id="requestedAgentId"
+        @refresh="store.refreshLiveData(runId, ['agents', 'execution', 'diagnostics'])"
+        @focus-agent="focusAgent"
+        @focus-task="focusTask"
+        @open-artifact="openArtifact"
+      />
+
       <section class="detail-workspace">
         <TaskGraphPanel :tasks="store.current.tasks" :graph="store.current.graph" />
         <aside class="operations-rail">
@@ -258,19 +385,18 @@ onBeforeUnmount(() => {
             :connected="stream.connected.value"
             @recover="recoverFailed"
           />
-          <AgentPanel
-            :run-id="runId"
-            :agents="store.current.agents"
-            @refresh="store.refreshLiveData(runId)"
-          />
         </aside>
       </section>
 
       <EventTimeline
+        id="audit-console"
         :events="store.current.events"
         :connected="stream.connected.value"
         :stream-state="stream.state.value"
         :stream-error="stream.lastError.value"
+        :agent-filter="focusedAgentId"
+        :task-filter="focusedTaskId"
+        @clear-focus="clearAuditFocus"
       />
 
       <section class="panel run-message">
@@ -288,7 +414,7 @@ onBeforeUnmount(() => {
         </button>
       </section>
 
-      <section class="panel detail-bottom">
+      <section id="deliverables" class="panel detail-bottom">
         <nav class="tab-nav" aria-label="运行数据">
           <button :class="{ active: activeTab === 'artifacts' }" @click="activeTab = 'artifacts'">
             <FileArchive :size="15" /> Artifacts <span>{{ store.current.artifacts.length }}</span>
@@ -309,6 +435,8 @@ onBeforeUnmount(() => {
             v-if="activeTab === 'artifacts'"
             :run-id="runId"
             :artifacts="store.current.artifacts"
+            :initial-artifact-id="selectedArtifactId"
+            @selected="(artifactId) => openArtifact(artifactId, false)"
           />
           <ApprovalQueue
             v-else-if="activeTab === 'approvals'"

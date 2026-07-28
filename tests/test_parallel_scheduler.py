@@ -145,6 +145,93 @@ class TestParallelClaim:
 # ===== ParallelTeamScheduler 烟雾测试 =====
 
 class TestParallelScheduler:
+    def test_discovery_matches_one_ready_task_per_idle_agent(self):
+        """A dispatch wave must not enqueue more work than workers can reserve."""
+        from app.multiagent.parallel_scheduler import ParallelTeamScheduler
+
+        board = get_task_board()
+        reg = get_agent_registry()
+        for index in range(5):
+            board.create_task(
+                task_id=f"t{index}",
+                run_id="r_capacity",
+                title=f"T{index}",
+                objective="work",
+                required_capabilities=["coding"],
+            )
+        agent = reg.create_agent(
+            profile_id="coder",
+            name="Coder",
+            role="worker",
+            team_id="team",
+            run_id="r_capacity",
+            capabilities=["coding"],
+        )
+        scheduler = ParallelTeamScheduler(
+            run_id="r_capacity",
+            max_rounds=10,
+            max_concurrency=4,
+        )
+        scheduler.board = board
+        scheduler.registry = reg
+
+        discovered = scheduler._discover_dispatchable({})
+
+        assert len(discovered) == 1
+        assert scheduler._dispatch_agent_hints[discovered[0].task_id] == agent.agent_id
+
+    def test_discovery_preserves_specialists_and_accepts_tool_capability_fallback(self):
+        """Constrained tasks are matched first and tool caps do not deadlock."""
+        from app.multiagent.parallel_scheduler import ParallelTeamScheduler
+
+        board = get_task_board()
+        reg = get_agent_registry()
+        board.create_task(
+            task_id="planning",
+            run_id="r_match",
+            title="Plan",
+            objective="plan",
+            required_capabilities=["planning"],
+        )
+        board.create_task(
+            task_id="coding",
+            run_id="r_match",
+            title="Code",
+            objective="code",
+            required_capabilities=["coding", "file_write"],
+        )
+        generalist = reg.create_agent(
+            profile_id="generalist",
+            name="Generalist",
+            role="worker",
+            team_id="team",
+            run_id="r_match",
+            capabilities=["planning", "coding"],
+        )
+        specialist = reg.create_agent(
+            profile_id="coder",
+            name="Coder",
+            role="worker",
+            team_id="team",
+            run_id="r_match",
+            capabilities=["coding"],
+        )
+        scheduler = ParallelTeamScheduler(
+            run_id="r_match",
+            max_rounds=10,
+            max_concurrency=2,
+        )
+        scheduler.board = board
+        scheduler.registry = reg
+
+        discovered = scheduler._discover_dispatchable({})
+
+        assert {task.task_id for task in discovered} == {"planning", "coding"}
+        assert scheduler._dispatch_agent_hints == {
+            "planning": generalist.agent_id,
+            "coding": specialist.agent_id,
+        }
+
     @pytest.mark.asyncio
     async def test_scheduler_simple_run(self):
         """编写一个简易并行调度器验证基本流通。"""

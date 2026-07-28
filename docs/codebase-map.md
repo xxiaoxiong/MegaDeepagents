@@ -8,7 +8,7 @@
 MegaDeepagents/
 ├─ app/
 │  ├─ api/v1/                    # HTTP 契约、校验、SSE
-│  ├─ application/runs/          # Run 用例：创建、控制、恢复、诊断
+│  ├─ application/runs/          # Run 用例：创建、控制、恢复、诊断、只读执行投影
 │  ├─ domain/runs/               # 与框架无关的 Run 领域模型
 │  ├─ infrastructure/database/   # SQLite 连接与领域存储
 │  ├─ runtime/root_graph/        # 唯一生产编排图
@@ -33,6 +33,9 @@ domain ← multiagent ← infrastructure
 
 `domain` 不依赖 FastAPI、Vue 或具体数据库。`application` 只编排用例，不新增调度器。
 `runtime/root_graph` 是唯一生产控制流。
+
+`application/runs/execution_intelligence.py` 是可观测性读取模型：它只组合现有存储并重放
+事件，不认领 Task、不派发 Agent，也不持久化派生指标。
 
 ## `app/multiagent` 模块归属
 

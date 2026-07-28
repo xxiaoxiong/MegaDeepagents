@@ -40,6 +40,8 @@ SQLite + replayable Event Envelope
 - Verifier fail-closed；模型、测试、格式或 Artifact 完整性验证失败时不会伪造成功。
 - SQLite 使用统一连接、WAL、busy timeout 和事务，支持进程重启后的 Run 恢复。
 - 生命周期、工具、心跳、验证、重试和失败都会进入可重放审计流；控制台可查看完整 payload。
+- Mission Control 将持久事件重放为每个 Agent 的执行泳道、关键路径、并行效率和注意项。
+- Artifact 可直接预览、下载、追溯版本，并通过深链接交付给用户。
 - 失败按限流、超时、网络、权限、契约等分类，有界指数退避；操作者可恢复单个或全部失败 Task。
 - Run 健康诊断会明确标记正常、待处理、卡住、失败和完成，不再依赖“盯着页面猜”。
 - 代码任务可以绑定 Git 仓库，每个 Agent 使用独立 worktree，集成通过受治理队列完成。
@@ -94,6 +96,7 @@ docker compose up --build
 | Run | `POST/GET /api/v1/runs` |
 | 控制 | `POST /api/v1/runs/{id}/pause|resume|retry|cancel` |
 | 健康诊断 | `GET /api/v1/runs/{id}/diagnostics` |
+| 执行智能 | `GET /api/v1/runs/{id}/execution` |
 | 实时事件 | `GET /api/v1/runs/{id}/stream?after_sequence=N` |
 | Task / Graph | `GET /api/v1/runs/{id}/tasks`、`task-graph` |
 | Agent / 消息 | `GET /api/v1/runs/{id}/agents`、`POST .../messages` |

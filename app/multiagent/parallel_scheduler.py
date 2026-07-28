@@ -143,6 +143,7 @@ class ParallelTeamScheduler:
             from app.multiagent.permission import get_permission_broker
             permission_broker = get_permission_broker()
         self.permission_broker = permission_broker
+        self._dispatch_agent_hints: dict[str, str] = {}
 
     # ===== 主循环 =====
 
@@ -372,15 +373,16 @@ class ParallelTeamScheduler:
             not in {"stopped", "failed"}
         ]
 
-        serviceable: list[BoardTask] = []
+        serviceable: list[tuple[BoardTask, list[Any]]] = []
         unserviceable: list[BoardTask] = []
         for task in ready:
-            required = set(task.required_capabilities)
-            if any(
-                not required or required.issubset(set(agent.capabilities))
+            candidates = [
+                agent
                 for agent in idle_agents
-            ):
-                serviceable.append(task)
+                if self._agent_can_serve(agent, task)
+            ]
+            if candidates:
+                serviceable.append((task, candidates))
             else:
                 unserviceable.append(task)
 
@@ -390,8 +392,7 @@ class ParallelTeamScheduler:
         truly_unserviceable = [
             task for task in unserviceable
             if not any(
-                not set(task.required_capabilities)
-                or set(task.required_capabilities).issubset(set(a.capabilities))
+                self._agent_can_serve(a, task)
                 for a in live_agents
             )
         ]
@@ -414,7 +415,71 @@ class ParallelTeamScheduler:
             })
 
         already_running = set(running.values())
-        return [t for t in serviceable if t.task_id not in already_running]
+        available = {agent.agent_id: agent for agent in idle_agents}
+        capacity = max(0, self.max_concurrency - len(running))
+        selected: list[BoardTask] = []
+
+        # Build a one-wave bipartite match instead of launching one Future per
+        # ready task.  The old implementation could enqueue ten tasks for one
+        # idle teammate; nine futures then failed reservation immediately and
+        # the same work repeated in the next scheduler round.  Most-constrained
+        # tasks are matched first so a generalist does not starve a specialist.
+        ordered = sorted(
+            (
+                (task, candidates)
+                for task, candidates in serviceable
+                if task.task_id not in already_running
+            ),
+            key=lambda item: (
+                len(item[1]),
+                -int(item[0].priority),
+                item[0].created_at,
+                item[0].task_id,
+            ),
+        )
+        for task, _ in ordered:
+            candidates = [
+                agent
+                for agent in available.values()
+                if self._agent_can_serve(agent, task)
+            ]
+            if not candidates:
+                continue
+            # Prefer the narrowest capable worker; preserve broad generalists
+            # for tasks that have no specialist alternative.
+            chosen = min(
+                candidates,
+                # ``candidates`` preserves registry order, so equal-width
+                # workers retain the established first-registered fairness
+                # contract instead of being reordered by random agent IDs.
+                key=lambda agent: len(agent.capabilities),
+            )
+            selected.append(task)
+            self._dispatch_agent_hints[task.task_id] = chosen.agent_id
+            available.pop(chosen.agent_id, None)
+            if len(selected) >= capacity:
+                break
+        return selected
+
+    @staticmethod
+    def _agent_can_serve(agent: Any, task: BoardTask) -> bool:
+        """Mirror registry capability fallback during dispatch planning."""
+        required = set(task.required_capabilities)
+        if not required:
+            return True
+        available = set(agent.capabilities)
+        if required.issubset(available):
+            return True
+        tool_capabilities = {
+            "file_read",
+            "file_write",
+            "shell_execute",
+            "web_research",
+            "mcp_access",
+            "default",
+        }
+        primary = required - tool_capabilities
+        return bool(primary) and primary.issubset(available)
 
     def _next_retry_delay(self) -> float | None:
         """Return how long to wait before re-checking for retry-ready tasks.
@@ -567,7 +632,10 @@ class ParallelTeamScheduler:
         # find_idle here: a sibling coroutine can otherwise steal the same
         # worker before this task changes its status.
         agent = self.registry.reserve_idle_agent(
-            self.run_id, set(task.required_capabilities), task.task_id,
+            self.run_id,
+            set(task.required_capabilities),
+            task.task_id,
+            preferred_agent_id=self._dispatch_agent_hints.pop(task.task_id, None),
         )
         if agent is None:
             # 没有空闲 worker → 触发 Mailbox.wake_idle_agents 提示正在运行的

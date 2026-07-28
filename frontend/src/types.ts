@@ -52,6 +52,73 @@ export interface Agent {
   metadata: Record<string, unknown>;
 }
 
+export interface ExecutionSummary {
+  event_count: number;
+  wall_time_ms: number;
+  active_time_ms: number;
+  parallelism: number;
+  utilization: number;
+  peak_concurrency: number;
+  tool_call_count: number;
+  retry_count: number;
+  handoff_count: number;
+  artifact_count: number;
+  completed_tasks: number;
+  total_tasks: number;
+  critical_path: string[];
+  critical_path_remaining: number;
+}
+
+export interface AgentExecution {
+  agent_id: string;
+  name: string;
+  role: string;
+  status: string;
+  current_task_id?: string | null;
+  current_task_title?: string | null;
+  capabilities: string[];
+  assigned_task_ids: string[];
+  completed_task_ids: string[];
+  artifact_ids: string[];
+  event_count: number;
+  tool_call_count: number;
+  last_activity_at?: string | null;
+  latest_summary: string;
+  recent_events: EventEnvelope[];
+}
+
+export interface TaskExecution {
+  task_id: string;
+  title: string;
+  status: string;
+  claimed_by?: string | null;
+  dependencies: string[];
+  blocked_by: string[];
+  critical: boolean;
+  attempts: number;
+  max_attempts: number;
+  artifact_ids: string[];
+  last_activity_at?: string | null;
+}
+
+export interface ExecutionAttention {
+  severity: "info" | "warning" | "error";
+  kind: string;
+  title: string;
+  detail: string;
+  task_id?: string | null;
+  agent_id?: string | null;
+}
+
+export interface RunExecution {
+  run_id: string;
+  generated_at: string;
+  summary: ExecutionSummary;
+  agents: AgentExecution[];
+  tasks: TaskExecution[];
+  attention: ExecutionAttention[];
+}
+
 export interface Artifact {
   artifact_id: string;
   run_id: string;
@@ -154,6 +221,7 @@ export interface RunSnapshot {
   errors: Record<string, unknown>;
   git: Record<string, unknown>;
   diagnostics: RunDiagnostics | null;
+  execution: RunExecution | null;
 }
 
 // ===== 对话式 UI：ChatMessage 模型 =====

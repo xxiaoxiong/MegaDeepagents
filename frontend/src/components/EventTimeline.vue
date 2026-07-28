@@ -14,6 +14,7 @@ import {
   RotateCcw,
   Search,
   ShieldAlert,
+  SlidersHorizontal,
   Wrench,
 } from "@lucide/vue";
 import EmptyState from "@/components/EmptyState.vue";
@@ -24,14 +25,24 @@ const props = defineProps<{
   connected?: boolean;
   streamState?: string;
   streamError?: string;
+  agentFilter?: string | null;
+  taskFilter?: string | null;
 }>();
+const emit = defineEmits<{ clearFocus: [] }>();
 
-type EventCategory = "all" | "execution" | "tools" | "recovery" | "errors";
+type EventCategory =
+  | "all"
+  | "execution"
+  | "tools"
+  | "communication"
+  | "recovery"
+  | "errors";
 const query = ref("");
 const category = ref<EventCategory>("all");
 const expanded = ref(new Set<string>());
 const copied = ref("");
 const paused = ref(false);
+const showNoise = ref(false);
 const displayLimit = ref(500);
 
 const labels: Record<string, string> = {
@@ -91,7 +102,25 @@ const categoryOf = (event: EventEnvelope): Exclude<EventCategory, "all"> => {
     return "recovery";
   if (["tool", "permission", "approval"].some((token) => type.includes(token)))
     return "tools";
+  if (
+    ["message", "assistant", "handoff", "delegat"].some((token) =>
+      type.includes(token),
+    )
+  )
+    return "communication";
   return "execution";
+};
+
+const isNoise = (event: EventEnvelope) => {
+  const type = normalizedType(event).replace(/_/g, "").toLowerCase();
+  return [
+    "assistanttoken",
+    "taskheartbeat",
+    "teammateheartbeat",
+    "schedulerroundstarted",
+    "toolcallstarted",
+    "toolcallresult",
+  ].includes(type);
 };
 
 const severityOf = (event: EventEnvelope) => {
@@ -162,10 +191,19 @@ const fullTime = (value: string) =>
     fractionalSecondDigits: 3,
   }).format(new Date(value));
 
+const scopedEvents = computed(() =>
+  props.events.filter(
+    (event) =>
+      (!props.agentFilter || event.agent_id === props.agentFilter) &&
+      (!props.taskFilter || event.task_id === props.taskFilter),
+  ),
+);
+
 const filtered = computed(() => {
   const needle = query.value.trim().toLowerCase();
-  return [...props.events]
+  return [...scopedEvents.value]
     .reverse()
+    .filter((event) => showNoise.value || !isNoise(event))
     .filter((event) => category.value === "all" || categoryOf(event) === category.value)
     .filter((event) => {
       if (!needle) return true;
@@ -180,12 +218,21 @@ const filtered = computed(() => {
 });
 
 const visible = computed(() => filtered.value.slice(0, displayLimit.value));
-const tickerEvents = computed(() => [...props.events].reverse().slice(0, 8));
+const tickerEvents = computed(() =>
+  [...scopedEvents.value]
+    .reverse()
+    .filter((event) => !isNoise(event))
+    .slice(0, 8),
+);
 const counts = computed(() => ({
-  execution: props.events.filter((event) => categoryOf(event) === "execution").length,
-  tools: props.events.filter((event) => categoryOf(event) === "tools").length,
-  recovery: props.events.filter((event) => categoryOf(event) === "recovery").length,
-  errors: props.events.filter((event) => categoryOf(event) === "errors").length,
+  execution: scopedEvents.value.filter((event) => categoryOf(event) === "execution").length,
+  tools: scopedEvents.value.filter((event) => categoryOf(event) === "tools").length,
+  communication: scopedEvents.value.filter(
+    (event) => categoryOf(event) === "communication",
+  ).length,
+  recovery: scopedEvents.value.filter((event) => categoryOf(event) === "recovery").length,
+  errors: scopedEvents.value.filter((event) => categoryOf(event) === "errors").length,
+  noise: scopedEvents.value.filter(isNoise).length,
 }));
 
 function toggle(eventId: string) {
@@ -247,7 +294,7 @@ async function copyEvent(event: EventEnvelope) {
       </label>
       <div class="audit-filters" aria-label="事件分类">
         <button :class="{ active: category === 'all' }" @click="category = 'all'">
-          全部 <span>{{ events.length }}</span>
+          全部 <span>{{ scopedEvents.length }}</span>
         </button>
         <button :class="{ active: category === 'execution' }" @click="category = 'execution'">
           执行 <span>{{ counts.execution }}</span>
@@ -255,13 +302,30 @@ async function copyEvent(event: EventEnvelope) {
         <button :class="{ active: category === 'tools' }" @click="category = 'tools'">
           工具 <span>{{ counts.tools }}</span>
         </button>
+        <button
+          :class="{ active: category === 'communication' }"
+          @click="category = 'communication'"
+        >
+          协作 <span>{{ counts.communication }}</span>
+        </button>
         <button :class="{ active: category === 'recovery' }" @click="category = 'recovery'">
           恢复 <span>{{ counts.recovery }}</span>
         </button>
         <button :class="{ active: category === 'errors' }" @click="category = 'errors'">
           异常 <span>{{ counts.errors }}</span>
         </button>
+        <button :class="{ active: showNoise }" @click="showNoise = !showNoise">
+          <SlidersHorizontal :size="11" />
+          {{ showNoise ? "隐藏底层事件" : `原始事件 +${counts.noise}` }}
+        </button>
       </div>
+    </div>
+
+    <div v-if="agentFilter || taskFilter" class="audit-focus-bar">
+      <span>当前聚焦</span>
+      <strong v-if="agentFilter">Agent · {{ agentFilter }}</strong>
+      <strong v-if="taskFilter">Task · {{ taskFilter }}</strong>
+      <button @click="emit('clearFocus')">查看全部事件</button>
     </div>
 
     <EmptyState
