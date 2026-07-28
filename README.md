@@ -1,5 +1,7 @@
 # MegaDeepagents V3
 
+[简体中文](README.md) | [English](README.en.md)
+
 [Project website](https://megadeepagents.vercel.app) ·
 [Architecture](docs/architecture.md) ·
 [API](docs/api.md) ·
@@ -8,6 +10,8 @@
 MegaDeepagents 是一个单机优先、可恢复、可观测、受治理的多智能体任务运行平台。浏览器、
 API 与 CLI 的新请求进入同一套 LangGraph Root Graph；DeepAgents 只负责 Worker
 Agent Loop，任务的最终成功由控制面和 Verifier 判定。
+
+> 如果这个项目对你的多智能体工程有帮助，欢迎点一个 Star；问题、运行反馈和改进建议请通过 Issue 提交。
 
 ![MegaDeepagents — One runtime. Accountable agent teams.](website/public/og.png)
 
