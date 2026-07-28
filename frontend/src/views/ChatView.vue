@@ -2,6 +2,7 @@
 import {
   computed,
   nextTick,
+  onBeforeUnmount,
   onMounted,
   ref,
   watch,
@@ -9,6 +10,8 @@ import {
 import { useRoute, useRouter } from "vue-router";
 import {
   ArrowRight,
+  Bot,
+  GitFork,
   ListTree,
   LoaderCircle,
   MessageSquarePlus,
@@ -21,7 +24,12 @@ import {
 } from "@lucide/vue";
 import { api } from "@/lib/api";
 import { useChatThread } from "@/composables/useChatThread";
-import type { AgentRun, CreateRunInput, RunMode } from "@/types";
+import type {
+  AgentRun,
+  CreateRunInput,
+  RunExecution,
+  RunMode,
+} from "@/types";
 import StatusBadge from "@/components/StatusBadge.vue";
 import ChatMessageItem from "@/components/chat/ChatMessageItem.vue";
 
@@ -79,6 +87,49 @@ const visibleRuns = computed(() => {
 const currentRun = computed(() =>
   runs.value.find((r) => r.run_id === runIdRef.value) ?? null,
 );
+const execution = ref<RunExecution | null>(null);
+let executionTimer: number | null = null;
+
+async function loadExecution(id = runIdRef.value) {
+  if (!id) {
+    execution.value = null;
+    return;
+  }
+  try {
+    const result = await api.execution(id);
+    if (runIdRef.value === id) execution.value = result;
+  } catch {
+    // The chat stream remains usable when the optional operator projection
+    // is temporarily unavailable.
+  }
+}
+
+function scheduleExecutionRefresh() {
+  if (!runIdRef.value) return;
+  if (executionTimer !== null) window.clearTimeout(executionTimer);
+  executionTimer = window.setTimeout(() => {
+    executionTimer = null;
+    void loadExecution();
+  }, 700);
+}
+
+watch(
+  runIdRef,
+  (id) => {
+    execution.value = null;
+    void loadExecution(id);
+  },
+  { immediate: true },
+);
+watch(() => thread.messages.value.length, scheduleExecutionRefresh);
+
+function openAgent(agentId: string) {
+  void router.push({
+    path: `/runs/${runIdRef.value}`,
+    query: { agent: agentId },
+    hash: "#execution-workbench",
+  });
+}
 
 // ===== 输入框 =====
 const draft = ref("");
@@ -201,6 +252,9 @@ onMounted(async () => {
   await loadRuns();
   await scrollToBottom(true);
 });
+onBeforeUnmount(() => {
+  if (executionTimer !== null) window.clearTimeout(executionTimer);
+});
 
 // 路由切到 /chat（空白）时清空选择
 watch(
@@ -310,6 +364,43 @@ const examples = [
           </button>
         </div>
       </header>
+
+      <section
+        v-if="runIdRef && execution?.agents.length"
+        class="chat-team-pulse"
+      >
+        <div class="chat-team-pulse-head">
+          <span><GitFork :size="13" /> Agent 团队实时协作</span>
+          <small>
+            {{ execution.summary.peak_concurrency }} 峰值并发 ·
+            {{ execution.summary.tool_call_count }} 次工具调用
+          </small>
+        </div>
+        <div class="chat-team-pulse-agents">
+          <button
+            v-for="agent in execution.agents"
+            :key="agent.agent_id"
+            type="button"
+            @click="openAgent(agent.agent_id)"
+          >
+            <span class="chat-agent-avatar"><Bot :size="13" /></span>
+            <span>
+              <strong>{{ agent.name }}</strong>
+              <small>{{ agent.current_task_title || agent.latest_summary }}</small>
+            </span>
+            <StatusBadge :status="agent.status" />
+          </button>
+        </div>
+        <button
+          v-if="execution.attention.length"
+          type="button"
+          class="chat-team-attention"
+          @click="router.push(`/runs/${runIdRef}`)"
+        >
+          {{ execution.attention[0].title }}
+          <ArrowRight :size="12" />
+        </button>
+      </section>
 
       <!-- 对话流 -->
       <div

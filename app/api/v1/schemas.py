@@ -143,6 +143,73 @@ class AgentDetailResponse(ApiModel):
     events: list[EventEnvelopeResponse] = Field(default_factory=list)
 
 
+class ExecutionSummaryResponse(ApiModel):
+    event_count: int = 0
+    wall_time_ms: int = 0
+    active_time_ms: int = 0
+    parallelism: float = 0
+    utilization: float = 0
+    peak_concurrency: int = 0
+    tool_call_count: int = 0
+    retry_count: int = 0
+    handoff_count: int = 0
+    artifact_count: int = 0
+    completed_tasks: int = 0
+    total_tasks: int = 0
+    critical_path: list[str] = Field(default_factory=list)
+    critical_path_remaining: int = 0
+
+
+class AgentExecutionResponse(ApiModel):
+    agent_id: str
+    name: str = ""
+    role: str = ""
+    status: str = ""
+    current_task_id: str | None = None
+    current_task_title: str | None = None
+    capabilities: list[str] = Field(default_factory=list)
+    assigned_task_ids: list[str] = Field(default_factory=list)
+    completed_task_ids: list[str] = Field(default_factory=list)
+    artifact_ids: list[str] = Field(default_factory=list)
+    event_count: int = 0
+    tool_call_count: int = 0
+    last_activity_at: datetime | str | None = None
+    latest_summary: str = ""
+    recent_events: list[EventEnvelopeResponse] = Field(default_factory=list)
+
+
+class TaskExecutionResponse(ApiModel):
+    task_id: str
+    title: str = ""
+    status: str = ""
+    claimed_by: str | None = None
+    dependencies: list[str] = Field(default_factory=list)
+    blocked_by: list[str] = Field(default_factory=list)
+    critical: bool = False
+    attempts: int = 0
+    max_attempts: int = 0
+    artifact_ids: list[str] = Field(default_factory=list)
+    last_activity_at: datetime | str | None = None
+
+
+class ExecutionAttentionResponse(ApiModel):
+    severity: Literal["info", "warning", "error"]
+    kind: str
+    title: str
+    detail: str = ""
+    task_id: str | None = None
+    agent_id: str | None = None
+
+
+class RunExecutionResponse(ApiModel):
+    run_id: str
+    generated_at: datetime | str
+    summary: ExecutionSummaryResponse
+    agents: list[AgentExecutionResponse] = Field(default_factory=list)
+    tasks: list[TaskExecutionResponse] = Field(default_factory=list)
+    attention: list[ExecutionAttentionResponse] = Field(default_factory=list)
+
+
 class ArtifactResponse(ApiModel):
     artifact_id: str
     run_id: str

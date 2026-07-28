@@ -19,6 +19,7 @@ from app.api.v1.schemas import (
     CreateRunRequest,
     DeliveryResponse,
     EventEnvelopeResponse,
+    RunExecutionResponse,
     FlexibleResponse,
     PermissionDecisionBody,
     PlanDecisionBody,
@@ -212,6 +213,22 @@ def get_run_diagnostics(run_id: str):
     if result is None:
         raise HTTPException(status_code=404, detail="Run not found")
     return _public_operational_record(result)
+
+
+@router.get(
+    "/runs/{run_id}/execution", response_model=RunExecutionResponse
+)
+def get_run_execution(run_id: str):
+    """Return a replay-derived multi-agent execution explanation."""
+    _require_run(run_id)
+    from app.application.runs.execution_intelligence import (
+        RunExecutionIntelligenceService,
+    )
+
+    result = RunExecutionIntelligenceService().inspect(run_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return result
 
 
 @router.get("/runs/{run_id}/task-graph", response_model=TaskGraphResponse)

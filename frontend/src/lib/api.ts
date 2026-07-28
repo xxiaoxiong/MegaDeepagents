@@ -7,6 +7,7 @@ import type {
   PermissionRequest,
   PlanRequest,
   RunDiagnostics,
+  RunExecution,
   Task,
   TaskGraph,
 } from "@/types";
@@ -88,11 +89,17 @@ export const api = {
     request<TaskGraph>(`/api/v1/runs/${runId}/task-graph`),
   listAgents: (runId: string) =>
     request<Agent[]>(`/api/v1/runs/${runId}/agents`),
+  execution: (runId: string) =>
+    request<RunExecution>(`/api/v1/runs/${runId}/execution`),
   listArtifacts: (runId: string) =>
     request<Artifact[]>(`/api/v1/runs/${runId}/artifacts`),
   artifactContent: (runId: string, artifactId: string) =>
     request<{ content: string; truncated: boolean; path: string }>(
       `/api/v1/runs/${runId}/artifacts/${artifactId}/content`,
+    ),
+  artifactLineage: (runId: string, artifactId: string) =>
+    request<Artifact[]>(
+      `/api/v1/runs/${runId}/artifacts/${artifactId}/lineage`,
     ),
   listEvents: (runId: string, after = 0, limit = 2_000) =>
     request<EventEnvelope[]>(
