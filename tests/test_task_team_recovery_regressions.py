@@ -114,8 +114,18 @@ def test_facade_cold_resume_reconstructs_context_and_continues_execution(monkeyp
     runtime = TeamRuntimeFacade()
     continued: list[tuple[str, str, int]] = []
 
-    async def continue_task_team(ctx, goal, team_name, max_rounds, review_required, *, resume=False):
+    async def continue_task_team(
+        ctx,
+        goal,
+        team_name,
+        max_rounds,
+        review_required,
+        *,
+        resume=False,
+        resume_decision=None,
+    ):
         assert resume is True
+        assert resume_decision is None
         continued.append((ctx.run_id, goal, max_rounds))
         from app.multiagent.agent_spec import TeamRunResult
         return TeamRunResult(task_id=ctx.run_id, status="completed", final_output="done")
@@ -125,6 +135,180 @@ def test_facade_cold_resume_reconstructs_context_and_continues_execution(monkeyp
     assert continued == [("run_cold", "finish persisted work", 7)]
     run = asyncio.run(runtime.get_run("run_cold"))
     assert run["status"] == "completed"
+
+
+def test_facade_resume_failure_is_persisted_instead_of_staying_running(
+    monkeypatch, tmp_path,
+):
+    """A swallowed recovery exception must never create a ghost running Run."""
+    from app.infrastructure.database.run_store import get_agent_run_history
+    from app.multiagent.team_runtime import TeamRuntimeFacade
+
+    history = get_agent_run_history()
+    history.save_team_run(
+        run_id="run_resume_failure",
+        goal="resume durable work",
+        team_id="software_dev_team",
+        mode="task_team",
+        workspace_root=str(tmp_path / "workspace"),
+        status="interrupted",
+        max_rounds=7,
+        review_required=True,
+    )
+
+    class BrokenCoordinator:
+        def resume(self, _run_id):
+            raise RuntimeError("checkpoint is corrupt")
+
+    monkeypatch.setattr(
+        "app.multiagent.resume_coordinator.get_resume_coordinator",
+        lambda: BrokenCoordinator(),
+    )
+
+    runtime = TeamRuntimeFacade()
+    assert asyncio.run(runtime.resume_run("run_resume_failure")) is False
+
+    stored = history.get_team_run("run_resume_failure")
+    assert stored is not None
+    assert stored["status"] == "failed"
+    failure = history.list_event_envelopes("run_resume_failure")[-1]
+    assert failure["event_type"] == "RunFailed"
+    assert failure["payload"]["source"] == "resume_run"
+    assert failure["payload"]["message"] == "checkpoint is corrupt"
+    assert failure["payload"]["recovery"] is True
+
+
+def test_run_execution_lease_is_atomic_and_owner_fenced(tmp_path):
+    from app.infrastructure.database.run_store import get_agent_run_history
+
+    history = get_agent_run_history()
+    history.save_team_run(
+        run_id="run_atomic_lease",
+        goal="continue once",
+        team_id="software_dev_team",
+        mode="task_team",
+        workspace_root=str(tmp_path / "workspace"),
+        status="paused",
+        max_rounds=3,
+        review_required=True,
+    )
+    allowed = {"paused", "running"}
+
+    first = history.acquire_team_run_execution_lease(
+        "run_atomic_lease",
+        "lease_first",
+        ttl_seconds=30,
+        allowed_statuses=allowed,
+    )
+    assert first is not None
+    assert history.acquire_team_run_execution_lease(
+        "run_atomic_lease",
+        "lease_competitor",
+        ttl_seconds=30,
+        allowed_statuses=allowed,
+    ) is None
+    assert not history.refresh_team_run_execution_lease(
+        "run_atomic_lease",
+        "lease_competitor",
+    )
+    assert history.refresh_team_run_execution_lease(
+        "run_atomic_lease",
+        "lease_first",
+    )
+    assert not history.release_team_run_execution_lease(
+        "run_atomic_lease",
+        "lease_competitor",
+    )
+    assert history.release_team_run_execution_lease(
+        "run_atomic_lease",
+        "lease_first",
+    )
+    assert history.acquire_team_run_execution_lease(
+        "run_atomic_lease",
+        "lease_after_release",
+        ttl_seconds=30,
+        allowed_statuses=allowed,
+    ) is not None
+
+
+def test_concurrent_resume_requests_execute_the_checkpoint_only_once(
+    monkeypatch,
+    tmp_path,
+):
+    from app.infrastructure.database.run_store import get_agent_run_history
+    from app.multiagent.agent_spec import TeamRunResult
+    from app.multiagent.team_runtime import TeamRuntimeFacade
+
+    history = get_agent_run_history()
+    history.save_team_run(
+        run_id="run_resume_once",
+        goal="continue exactly once",
+        team_id="software_dev_team",
+        mode="task_team",
+        workspace_root=str(tmp_path / "workspace"),
+        status="paused",
+        max_rounds=3,
+        review_required=True,
+    )
+
+    class CoordinatorResult:
+        @staticmethod
+        def to_dict():
+            return {"resumed_agents": 0, "skipped_tasks": 0}
+
+    class Coordinator:
+        @staticmethod
+        def resume(_run_id):
+            return CoordinatorResult()
+
+    monkeypatch.setattr(
+        "app.multiagent.resume_coordinator.get_resume_coordinator",
+        lambda: Coordinator(),
+    )
+    runtime = TeamRuntimeFacade()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls: list[dict | None] = []
+
+    async def execute_once(
+        _ctx,
+        _goal,
+        _team_name,
+        _max_rounds,
+        _review_required,
+        *,
+        resume=False,
+        restart=False,
+        resume_decision=None,
+    ):
+        assert resume is True
+        assert restart is False
+        calls.append(resume_decision)
+        entered.set()
+        await release.wait()
+        return TeamRunResult(
+            task_id="run_resume_once",
+            status="completed",
+            final_output="done",
+        )
+
+    monkeypatch.setattr(runtime, "_run_task_team", execute_once)
+
+    async def exercise():
+        first = asyncio.create_task(runtime.resume_run("run_resume_once"))
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        duplicate = await runtime.resume_run("run_resume_once")
+        assert duplicate is False
+        release.set()
+        assert await first is True
+
+    asyncio.run(exercise())
+
+    assert calls == [{"decision": "approve"}]
+    stored = history.get_team_run("run_resume_once")
+    assert stored is not None
+    assert stored["status"] == "completed"
+    assert "execution_lease" not in (stored.get("metadata") or {})
 
 
 def test_resume_restores_full_task_graph_not_only_board_projection(tmp_path):

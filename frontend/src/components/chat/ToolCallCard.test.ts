@@ -11,6 +11,7 @@ describe("ToolCallCard", () => {
           toolName: "read_file",
           args: { file_path: "README.md" },
           status: "ok",
+          agentName: "Coder",
           resultPreview: "# MegaDeepagents",
           durationMs: 125,
           startedAt: "2026-07-28T08:00:00Z",
@@ -23,6 +24,7 @@ describe("ToolCallCard", () => {
       const summary = container.querySelector("summary");
       expect(details?.open).toBe(false);
       expect(summary?.textContent).toContain("read_file");
+      expect(summary?.textContent).toContain("Coder");
       expect(summary?.textContent).toContain("已完成");
       expect(summary?.textContent).toContain("125ms");
       expect(container.querySelector(".tool-details")).not.toBeNull();

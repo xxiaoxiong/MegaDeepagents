@@ -6,6 +6,7 @@ Legacy API、CLI 和恢复代码通过该 Facade；V3 使用 application service
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import os
 import threading
 import uuid
@@ -158,6 +159,7 @@ class TeamRuntimeFacade:
         *,
         resume: bool = False,
         restart: bool = False,
+        resume_decision: dict[str, Any] | None = None,
     ) -> TeamRunResult:
         """Execute through the unified V3 LangGraph root graph."""
         from app.multiagent.executor import DeepAgentExecutor
@@ -202,6 +204,7 @@ class TeamRuntimeFacade:
             cancel_event=self._active_runs[ctx.run_id]["cancel_event"],
             task_graph=resume_graph,
             resume=resume and not restart,
+            resume_decision=resume_decision,
             max_rounds=max_rounds,
         )
 
@@ -426,18 +429,88 @@ class TeamRuntimeFacade:
         """Start a fresh checkpoint generation from the persisted TaskGraph."""
         return await self.resume_run(run_id, restart=True)
 
-    async def resume_run(self, run_id: str, *, restart: bool = False) -> bool:
+    async def resume_run(
+        self,
+        run_id: str,
+        *,
+        restart: bool = False,
+        resume_decision: dict[str, Any] | None = None,
+    ) -> bool:
         """Restore durable state and continue the same TASK_TEAM execution."""
         from app.multiagent.resume_coordinator import get_resume_coordinator
-        from app.infrastructure.database.run_store import get_agent_run_history
+        from app.infrastructure.database.run_store import (
+            get_agent_run_history,
+            make_run_event_id,
+        )
 
+        history = get_agent_run_history()
+        lease_id = "runlease_" + uuid.uuid4().hex
+        lease_ttl_seconds = 60.0
+        claimed = history.acquire_team_run_execution_lease(
+            run_id,
+            lease_id,
+            ttl_seconds=lease_ttl_seconds,
+            allowed_statuses={
+                "created",
+                "running",
+                "paused",
+                "waiting_human",
+                "interrupted",
+                "failed",
+            },
+        )
+        if claimed is None:
+            logger.info(
+                "[TeamRuntime] resume skipped run=%s; another execution owns it",
+                run_id,
+            )
+            return False
+        stored_status = str(claimed.get("status", ""))
+        lease_stop = asyncio.Event()
+
+        async def maintain_execution_lease() -> None:
+            while not lease_stop.is_set():
+                try:
+                    await asyncio.wait_for(lease_stop.wait(), timeout=15.0)
+                    continue
+                except TimeoutError:
+                    pass
+                try:
+                    refreshed = await asyncio.to_thread(
+                        history.refresh_team_run_execution_lease,
+                        run_id,
+                        lease_id,
+                        ttl_seconds=lease_ttl_seconds,
+                    )
+                except Exception:
+                    refreshed = False
+                    logger.exception(
+                        "[TeamRuntime] execution lease heartbeat failed run=%s",
+                        run_id,
+                    )
+                if not refreshed:
+                    active = self._active_runs.get(run_id)
+                    if active is not None:
+                        active["cancel_event"].set()
+                    history.record_event(
+                        event_id=make_run_event_id(),
+                        run_id=run_id,
+                        event_type="RunExecutionLeaseLost",
+                        payload={"lease_id": lease_id},
+                    )
+                    return
+
+        lease_heartbeat = asyncio.create_task(maintain_execution_lease())
         run = self._active_runs.get(run_id)
-        if not run:
-            stored = get_agent_run_history().get_team_run(run_id)
-            if not stored:
-                return False
-            logger.info("[TeamRuntime] cold resume run=%s from durable state", run_id)
-            try:
+        try:
+            if not run:
+                stored = history.get_team_run(run_id)
+                if not stored:
+                    return False
+                logger.info(
+                    "[TeamRuntime] cold resume run=%s from durable state",
+                    run_id,
+                )
                 mode = TeamRunMode.from_legacy(stored.get("mode", "task_team"))
                 ctx = TeamRunContext(
                     run_id=run_id,
@@ -455,18 +528,14 @@ class TeamRuntimeFacade:
                     ctx, stored.get("goal", ""), stored["team_id"],
                     int(stored.get("max_rounds", 20)), bool(stored.get("review_required", True)),
                 )
-            except Exception as exc:
-                logger.error("[TeamRuntime] failed to reconstruct run=%s: %s", run_id, exc)
-                return False
-        try:
             coordinator = get_resume_coordinator()
             result = coordinator.resume(run_id)
             run["status"] = "running"
-            get_agent_run_history().update_team_run_status(run_id, "running")
+            history.update_team_run_status(run_id, "running")
             logger.info(f"[TeamRuntime] resume_run result run={run_id}: {result.to_dict()}")
             ctx = run["ctx"]
             if restart:
-                stored = get_agent_run_history().get_team_run(run_id) or {}
+                stored = history.get_team_run(run_id) or {}
                 stored_metadata = stored.get("metadata") or {}
                 ctx = ctx.model_copy(deep=True)
                 ctx.metadata.update(stored_metadata)
@@ -480,18 +549,70 @@ class TeamRuntimeFacade:
                     continuation["restart"] = True
                 task_result = await self._run_task_team(
                     ctx, run["goal"], run["team_name"], run["max_rounds"],
-                    run["review_required"], **continuation,
+                    run["review_required"],
+                    resume_decision=(
+                        resume_decision
+                        if resume_decision is not None
+                        else {"decision": "approve"}
+                        if stored_status in {"paused", "waiting_human"}
+                        else None
+                    ),
+                    **continuation,
                 )
             else:
                 task_result = await self._run_discussion(
                     ctx, run["goal"], run["team_name"], run["max_rounds"], run["review_required"],
                 )
             run["status"] = task_result.status
-            get_agent_run_history().update_team_run_status(run_id, task_result.status)
+            history.update_team_run_status(run_id, task_result.status)
             return task_result.status not in ("failed", "cancelled")
         except Exception as exc:
-            logger.error(f"[TeamRuntime] resume_run failed run={run_id}: {exc}")
+            self._persist_recovery_failure(run_id, exc, source="resume_run")
             return False
+        finally:
+            lease_stop.set()
+            lease_heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await lease_heartbeat
+            try:
+                history.release_team_run_execution_lease(run_id, lease_id)
+            except Exception:
+                logger.exception(
+                    "[TeamRuntime] failed to release execution lease run=%s",
+                    run_id,
+                )
+
+    def _persist_recovery_failure(
+        self, run_id: str, error: Exception, *, source: str
+    ) -> None:
+        """Close a failed recovery instead of leaving a ghost running Run."""
+        from app.infrastructure.database.run_store import (
+            get_agent_run_history,
+            make_run_event_id,
+        )
+
+        active = self._active_runs.get(run_id)
+        if active is not None:
+            active["status"] = "failed"
+        history = get_agent_run_history()
+        history.update_team_run_status(run_id, "failed")
+        history.record_event(
+            event_id=make_run_event_id(),
+            run_id=run_id,
+            event_type="RunFailed",
+            payload={
+                "error_type": type(error).__name__,
+                "message": str(error),
+                "source": source,
+                "recovery": True,
+            },
+        )
+        logger.exception(
+            "[TeamRuntime] recovery failed run=%s source=%s",
+            run_id,
+            source,
+            exc_info=error,
+        )
 
     def _activate_restored_run(
         self, ctx: TeamRunContext, goal: str, team_name: str,

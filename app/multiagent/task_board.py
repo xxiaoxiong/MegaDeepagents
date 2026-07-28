@@ -467,6 +467,36 @@ class TaskBoard:
             self._persist(task)
             return True
 
+    def request_replan(
+        self,
+        task_id: str,
+        reason: str,
+        *,
+        requested_by: str,
+        run_id: str | None = None,
+    ) -> bool:
+        """Persist a control-plane replan fence against stale worker success."""
+        with self._lock:
+            task = self.get(task_id, run_id=run_id)
+            if task is None or task.status == BoardTaskStatus.CANCELLED:
+                return False
+            requested_at = datetime.utcnow()
+            requests = task.metadata.setdefault("replan_requests", [])
+            requests.append({
+                "requested_by": requested_by,
+                "reason": reason,
+                "requested_at": requested_at.isoformat(),
+                "previous_status": task.status.value,
+            })
+            if len(requests) > 20:
+                del requests[:-20]
+            task.status = BoardTaskStatus.REPLAN_REQUIRED
+            task.last_error = reason
+            task.completed_at = None
+            task.updated_at = requested_at
+            self._persist(task)
+            return True
+
     def cancel_run(self, run_id: str, reason: str = "run_cancelled") -> int:
         """Cancel every non-terminal task so a persisted run cannot revive it."""
         with self._lock:
@@ -565,6 +595,7 @@ class TaskBoard:
             return True
         return all(
             t.status == BoardTaskStatus.SUCCEEDED
+            or bool(t.metadata.get("superseded_by_plan_revision"))
             or (
                 t.status == BoardTaskStatus.REPAIR_REQUIRED
                 and bool(t.metadata.get("superseded_by_repair"))

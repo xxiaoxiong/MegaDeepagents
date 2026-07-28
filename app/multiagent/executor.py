@@ -47,6 +47,7 @@ class TaskAssignment:
     dependencies: list[str] = field(default_factory=list)
     required_capabilities: list[str] = field(default_factory=list)
     max_attempts: int = 2
+    output_contract: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -201,6 +202,100 @@ def _tool_boundary(cancel_event: Any | None, safety_point: Callable[[], Any] | N
         safety_point()
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeError("cancelled_before_tool")
+
+
+class _TaskToolBudgetGuard:
+    """Durable per-task tool-call admission shared across retry attempts."""
+
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        agent_id: str,
+        max_tool_calls: int,
+        safety_point: Callable[[], Any] | None,
+    ) -> None:
+        self.run_id = run_id
+        self.task_id = task_id
+        self.agent_id = agent_id
+        self.max_tool_calls = max(1, int(max_tool_calls))
+        self.safety_point = safety_point
+        self._lock = threading.Lock()
+        self._exceeded_emitted = False
+        self._used = self._restore_used()
+
+    def _restore_used(self) -> int:
+        try:
+            from app.infrastructure.database.run_store import get_agent_run_history
+
+            return sum(
+                1
+                for event in get_agent_run_history().list_events(
+                    self.run_id,
+                    event_type="TaskToolBudgetConsumed",
+                )
+                if event.get("task_id") == self.task_id
+            )
+        except Exception as exc:
+            logger.warning(
+                "[ToolBudget] restore failed run=%s task=%s: %s",
+                self.run_id,
+                self.task_id,
+                exc,
+            )
+            return 0
+
+    def _record(self, event_type: str, payload: dict[str, Any]) -> None:
+        try:
+            from app.infrastructure.database.run_store import (
+                get_agent_run_history,
+                make_run_event_id,
+            )
+
+            get_agent_run_history().record_event(
+                event_id=make_run_event_id(),
+                run_id=self.run_id,
+                event_type=event_type,
+                agent_id=self.agent_id or None,
+                task_id=self.task_id,
+                payload=payload,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[ToolBudget] event persist failed run=%s task=%s: %s",
+                self.run_id,
+                self.task_id,
+                exc,
+            )
+
+    def checkpoint(self) -> None:
+        if self.safety_point is not None:
+            self.safety_point()
+        with self._lock:
+            if self._used >= self.max_tool_calls:
+                if not self._exceeded_emitted:
+                    self._record(
+                        "TaskBudgetExceeded",
+                        {
+                            "budget": "max_tool_calls",
+                            "used": self._used,
+                            "limit": self.max_tool_calls,
+                        },
+                    )
+                    self._exceeded_emitted = True
+                raise RuntimeError(
+                    f"tool_call_budget_exceeded:{self.max_tool_calls}"
+                )
+            self._used += 1
+            self._record(
+                "TaskToolBudgetConsumed",
+                {
+                    "budget": "max_tool_calls",
+                    "used": self._used,
+                    "limit": self.max_tool_calls,
+                },
+            )
 
 
 # ===== 工具调用事件追踪（供前端 ToolCallCard 实时展示）=====
@@ -891,8 +986,11 @@ class DeepAgentExecutor:
             dependencies=list(node.dependencies),
             required_capabilities=list(node.required_capabilities),
             max_attempts=node.max_attempts,
+            output_contract=node.output_contract.model_dump(mode="json"),
             metadata={
                 "priority": node.priority,
+                "budget": node.budget.model_dump(mode="json"),
+                "task_metadata": dict(node.metadata),
                 "mailbox_messages": list(task_input.get("mailbox_messages", [])),
                 "artifact_refs": list(task_input.get("artifact_refs", [])),
                 "agent_id": task_input.get("agent_id"),
@@ -965,6 +1063,7 @@ class DeepAgentExecutor:
         start = time.time()
 
         try:
+            self._materialize_input_artifacts(assignment, task_workspace)
             # profile.model_policy 参与模型选择。
             # deepagents 0.6.8 的 create_deep_agent 内部走
             # ``init_chat_model(model_spec, **apply_provider_profile(model_spec))``,
@@ -990,6 +1089,15 @@ class DeepAgentExecutor:
 
             allowed_tools = profile.tool_policy.allowed_tools
             deny_default = profile.tool_policy.deny_all_by_default
+            task_budget = assignment.metadata.get("budget", {})
+            max_tool_calls = int(task_budget.get("max_tool_calls") or 20)
+            tool_budget = _TaskToolBudgetGuard(
+                run_id=context.run_id,
+                task_id=assignment.task_id,
+                agent_id=context.agent_id or "",
+                max_tool_calls=max_tool_calls,
+                safety_point=context.safety_point,
+            )
 
             tools = _build_restricted_tools(
                 allowed_tools, deny_default, task_workspace=str(task_workspace),
@@ -997,12 +1105,16 @@ class DeepAgentExecutor:
                 allow_file_write=profile.tool_policy.allow_file_write,
                 allow_shell=profile.tool_policy.allow_shell,
                 cancel_event=context.cancel_event,
-                safety_point=context.safety_point,
+                safety_point=tool_budget.checkpoint,
                 permission_broker=context.permission_broker,
                 run_id=context.run_id,
                 agent_id=context.agent_id or "",
                 task_id=assignment.task_id,
-                team_tools=self._build_team_tools(assignment, context),
+                team_tools=self._build_team_tools(
+                    assignment,
+                    context,
+                    safety_point=tool_budget.checkpoint,
+                ),
             )
 
             system_prompt = (
@@ -1015,6 +1127,29 @@ class DeepAgentExecutor:
                 f"你必须使用可用工具完成任务。工具受限，越权调用将被拒绝。\n"
                 f"所有产物必须写入工作目录 {task_workspace}。\n"
             )
+            system_prompt += (
+                "\n## Execution budget (hard limit)\n"
+                f"- Maximum tool calls for this task: {max_tool_calls}\n"
+                "Inspect first, batch related work, and do not repeat failed "
+                "calls without changing the approach.\n"
+            )
+            contract = assignment.output_contract
+            if contract:
+                required_artifacts = contract.get("required_artifacts") or []
+                acceptance_criteria = contract.get("acceptance_criteria") or []
+                system_prompt += (
+                    "\n## 交付契约（必须满足）\n"
+                    f"- 产物类型：{contract.get('artifact_type') or 'any'}\n"
+                    f"- 交付说明：{contract.get('description') or '(未指定)'}\n"
+                    "- 必需产物："
+                    + (", ".join(str(item) for item in required_artifacts)
+                       if required_artifacts else "(无强制文件名)")
+                    + "\n- 验收条件："
+                    + ("；".join(str(item) for item in acceptance_criteria)
+                       if acceptance_criteria else "(无额外条件)")
+                    + "\n完成前必须自行核对以上契约；需要文件交付时必须实际写入工作目录，"
+                    "不能只在最终消息里描述或粘贴内容。\n"
+                )
             mailbox_messages = assignment.metadata.get("mailbox_messages", [])
             if mailbox_messages:
                 directives = "\n".join(
@@ -1029,11 +1164,25 @@ class DeepAgentExecutor:
             artifact_refs = assignment.metadata.get("artifact_refs", [])
             if artifact_refs:
                 system_prompt += "\n## 已验证的上游产物\n" + "\n".join(
-                    f"- {item.get('artifact_id')}: path={item.get('path')} "
+                    f"- {item.get('artifact_id')}: "
+                    f"local_path={item.get('local_path') or '(unavailable)'} "
+                    f"source_path={item.get('path')} "
                     f"hash={item.get('content_hash')} commit={item.get('commit_sha') or '(none)'} "
                     f"summary={item.get('summary', '')}"
                     for item in artifact_refs
                 ) + "\n"
+            task_metadata = assignment.metadata.get("task_metadata", {})
+            if task_metadata.get("repair_of"):
+                system_prompt += (
+                    "\n## 修复上下文（必须针对失败证据修复）\n"
+                    f"- 原任务：{task_metadata.get('repair_of')}\n"
+                    f"- 原产物 IDs："
+                    f"{', '.join(task_metadata.get('source_artifact_ids', [])) or '(无)'}\n"
+                    "- 验证反馈："
+                    f"{json.dumps(task_metadata.get('verification_feedback', {}), ensure_ascii=False)}\n"
+                    "先读取上方 local_path 指向的原产物，再逐项修复失败条件；"
+                    "不要脱离原产物重新猜测实现。\n"
+                )
 
             # Always build a fresh DeepAgent graph per assignment.
             #
@@ -1062,12 +1211,13 @@ class DeepAgentExecutor:
                     ("user",
                      f"目标：{assignment.objective}\n\n"
                      f"描述：{assignment.description}\n\n"
-                     f"请使用可用工具完成此任务。所有产物必须写入工作目录。"
+                     f"请使用可用工具完成此任务，并逐项满足系统消息中的交付契约。"
+                     f"所有产物必须写入工作目录。"
                      f"完成后返回结果摘要。")
                 ]
             }, config={
                 "configurable": {"thread_id": getattr(context, "thread_id", None) or f"{context.run_id}:{assignment.task_id}"},
-                "recursion_limit": 80,
+                "recursion_limit": max(4, min(500, max_tool_calls * 2 + 4)),
                 "callbacks": [_AssistantStreamCallback(context.run_id, context.agent_id or "", profile.name)],
             })
 
@@ -1076,7 +1226,10 @@ class DeepAgentExecutor:
                 return AgentExecutionResult(success=False, error="cancelled", execution_time=elapsed)
             tool_calls = _extract_tool_calls(response)
 
-            ignored_parts = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".cache"}
+            ignored_parts = {
+                ".git", ".inputs", "__pycache__", ".pytest_cache",
+                ".mypy_cache", ".cache",
+            }
             if assignment.metadata.get("worktree_mode"):
                 import subprocess
                 status = subprocess.run(
@@ -1102,7 +1255,19 @@ class DeepAgentExecutor:
             # 移除"兼容回退"伪 ID：所有 artifact ID 必须来自真实 ArtifactStore.create
             if self._artifact_store is not None and context.run_id:
                 try:
+                    repair_source_ids = list(
+                        assignment.metadata.get("task_metadata", {}).get(
+                            "source_artifact_ids", []
+                        )
+                    )
                     for file_path in produced_files:
+                        if (
+                            context.cancel_event is not None
+                            and context.cancel_event.is_set()
+                        ):
+                            raise RuntimeError(
+                                "cancelled_before_artifact_publish"
+                            )
                         if assignment.metadata.get("worktree_mode"):
                             relative_path = (
                                 Path("artifacts") / assignment.task_id /
@@ -1110,6 +1275,21 @@ class DeepAgentExecutor:
                             ).as_posix()
                         else:
                             relative_path = file_path.relative_to(Path(context.workspace_root)).as_posix()
+                        matching_sources = [
+                            artifact_id
+                            for artifact_id in repair_source_ids
+                            if (
+                                (source := self._artifact_store.get(artifact_id))
+                                is not None
+                                and Path(source.path).name == file_path.name
+                            )
+                        ]
+                        parent_artifact_id = (
+                            matching_sources[0]
+                            if matching_sources
+                            else repair_source_ids[0] if len(repair_source_ids) == 1
+                            else None
+                        )
                         artifact = self._artifact_store.create(
                             run_id=context.run_id,
                             task_id=assignment.task_id,
@@ -1117,8 +1297,20 @@ class DeepAgentExecutor:
                             relative_path=relative_path,
                             content=file_path.read_bytes(),
                             produced_by=profile.name,
+                            parent_artifact_id=parent_artifact_id,
                             metadata={"profile_id": profile.id, "original_name": file_path.name},
                         )
+                        if (
+                            context.cancel_event is not None
+                            and context.cancel_event.is_set()
+                        ):
+                            # The cancellation raced the durable create.  Keep
+                            # the record auditable but make it ineligible for
+                            # dependency or run-level verification.
+                            self._artifact_store.mark_rejected(artifact.id)
+                            raise RuntimeError(
+                                "cancelled_during_artifact_publish"
+                            )
                         produced_artifact_ids.append(artifact.id)
                 except Exception as exc:
                     logger.warning(f"[DeepAgentExecutor] artifact create failed: {exc}")
@@ -1129,6 +1321,11 @@ class DeepAgentExecutor:
                     f"[DeepAgentExecutor] no artifact_store or run_id configured for "
                     f"run={context.run_id} – produced files are not registered"
                 )
+
+            if context.cancel_event is not None and context.cancel_event.is_set():
+                for artifact_id in produced_artifact_ids:
+                    self._artifact_store.mark_rejected(artifact_id)
+                raise RuntimeError("cancelled_after_artifact_publish")
 
             final_messages = response.get("messages", [{}]) if isinstance(response, dict) else [{}]
             last = final_messages[-1] if final_messages else {}
@@ -1155,13 +1352,54 @@ class DeepAgentExecutor:
             )
 
     @staticmethod
-    def _build_team_tools(assignment: TaskAssignment, context: ExecutionContext) -> list[Any]:
+    def _build_team_tools(
+        assignment: TaskAssignment,
+        context: ExecutionContext,
+        *,
+        safety_point: Callable[[], Any] | None = None,
+    ) -> list[Any]:
         control_plane = assignment.metadata.get("team_control_plane")
         if control_plane is None or not context.agent_id:
             return []
         from app.multiagent.control_plane import build_team_tools
-        return build_team_tools(control_plane, context.run_id, context.agent_id,
-                                context.safety_point)
+        return build_team_tools(
+            control_plane,
+            context.run_id,
+            context.agent_id,
+            safety_point or context.safety_point,
+        )
+
+    def _materialize_input_artifacts(
+        self,
+        assignment: TaskAssignment,
+        task_workspace: Path,
+    ) -> None:
+        """Copy verified inputs into the assignee's readable workspace.
+
+        File tools are sandboxed to ``task_workspace``.  A run-relative
+        artifact path alone therefore cannot be opened by a downstream
+        worker.  Copies under ``.inputs`` preserve that sandbox while making
+        dependency and repair evidence available to the assigned Agent.
+        """
+        refs = assignment.metadata.get("artifact_refs", [])
+        if not refs or self._artifact_store is None:
+            return
+        inputs_root = task_workspace / ".inputs"
+        for ref in refs:
+            artifact_id = str(ref.get("artifact_id") or "")
+            artifact = self._artifact_store.get(artifact_id)
+            content = self._artifact_store.read_bytes(artifact_id)
+            if artifact is None or content is None:
+                raise RuntimeError(f"input_artifact_unavailable:{artifact_id}")
+            safe_id = "".join(
+                char if char.isalnum() or char in {"-", "_"} else "_"
+                for char in artifact_id
+            )
+            source_name = Path(artifact.path).name or "artifact"
+            target = inputs_root / safe_id / source_name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+            ref["local_path"] = target.relative_to(task_workspace).as_posix()
 
     @staticmethod
     def _infer_artifact_type(filename: str) -> str:

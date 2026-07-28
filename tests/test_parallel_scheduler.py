@@ -272,6 +272,68 @@ class TestParallelScheduler:
         assert result.total_tasks == 2
 
     @pytest.mark.asyncio
+    async def test_scheduler_consumes_task_graph_mutations_before_dispatch(self):
+        """A teammate-created task must execute against the new graph version."""
+        from app.multiagent.parallel_scheduler import ParallelTeamScheduler
+        from app.multiagent.task_graph import TaskGraph, TaskNode
+        from app.multiagent.transactional_task_service import TransactionalTaskService
+
+        run_id = "r_dynamic_graph"
+        graph = TaskGraph(root_task_id="seed")
+        graph.add_node(TaskNode(
+            id="seed",
+            title="Seed",
+            objective="create the follow-up",
+            required_capabilities=["default"],
+        ))
+        tasks = TransactionalTaskService()
+        await asyncio.to_thread(tasks.register_initial_graph, run_id, graph)
+        registry = get_agent_registry()
+        registry.create_agent(
+            profile_id="p1",
+            name="Worker",
+            role="worker",
+            team_id="team",
+            run_id=run_id,
+            capabilities=["default"],
+        )
+        observed: list[tuple[str, set[str]]] = []
+
+        class MutatingExecutor:
+            def execute_task(self, dag, task_id, task_input):
+                if task_id == "seed":
+                    tasks.create_task(
+                        run_id,
+                        task_input["agent_id"],
+                        TaskNode(
+                            id="follow_up",
+                            title="Follow-up",
+                            objective="finish the dynamically discovered work",
+                            dependencies=["seed"],
+                            required_capabilities=["default"],
+                        ).model_dump(mode="json"),
+                    )
+                observed.append((task_id, set(dag.nodes)))
+                return type("R", (), {
+                    "success": True,
+                    "artifact_ids": [f"art_{task_id}"],
+                    "error": None,
+                })()
+
+        scheduler = ParallelTeamScheduler(
+            run_id=run_id,
+            max_rounds=4,
+            max_concurrency=1,
+            task_graph=graph,
+        )
+        result = await scheduler.run(MutatingExecutor())
+
+        assert result.status == "completed"
+        assert [task_id for task_id, _ in observed] == ["seed", "follow_up"]
+        assert observed[1][1] == {"seed", "follow_up"}
+        assert scheduler.task_graph.version > graph.version
+
+    @pytest.mark.asyncio
     async def test_scheduler_with_failure(self):
         """Task 失败的场景。"""
         from app.multiagent.parallel_scheduler import ParallelTeamScheduler
@@ -334,3 +396,104 @@ class TestParallelScheduler:
         from app.multiagent.task_graph import TaskNodeStatus
         assert dag.nodes["t1"].status == TaskNodeStatus.SUCCEEDED
         assert "art1" in dag.nodes["t1"].output_artifact_ids
+
+
+def test_online_verification_does_not_block_the_scheduler_event_loop():
+    import threading
+
+    from app.multiagent.parallel_scheduler import ParallelTeamScheduler
+
+    scheduler = ParallelTeamScheduler("run_non_blocking_verification")
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_verify(_task):
+        started.set()
+        assert release.wait(timeout=2)
+        return True
+
+    scheduler._verify_task = blocking_verify
+
+    async def exercise():
+        verification = asyncio.create_task(
+            scheduler._verify_task_async(object())
+        )
+        assert await asyncio.to_thread(started.wait, 1)
+
+        # If verification ran on the event-loop thread this timer could not
+        # complete until ``release`` was set.
+        loop_remained_responsive = False
+
+        async def tick():
+            nonlocal loop_remained_responsive
+            await asyncio.sleep(0.01)
+            loop_remained_responsive = True
+
+        await asyncio.wait_for(tick(), timeout=0.2)
+        assert loop_remained_responsive
+        assert not verification.done()
+        release.set()
+        assert await verification is True
+
+    asyncio.run(exercise())
+
+
+def test_allow_parallel_false_creates_an_exclusive_dispatch_barrier():
+    from app.multiagent.parallel_scheduler import ParallelTeamScheduler
+    from app.multiagent.task_graph import OutputContract, TaskGraph, TaskNode
+
+    run_id = "run_exclusive_barrier"
+    graph = TaskGraph(root_task_id="exclusive")
+    graph.add_node(TaskNode(
+        id="exclusive",
+        title="Exclusive migration",
+        objective="change shared state",
+        required_capabilities=["coding"],
+        output_contract=OutputContract(allow_parallel=False),
+        priority=9,
+    ))
+    graph.add_node(TaskNode(
+        id="parallel_a",
+        title="Parallel A",
+        objective="independent analysis",
+        required_capabilities=["coding"],
+    ))
+    graph.add_node(TaskNode(
+        id="parallel_b",
+        title="Parallel B",
+        objective="independent checks",
+        required_capabilities=["coding"],
+    ))
+    board = TaskBoard()
+    ParallelTeamScheduler.sync_from_task_graph(graph, board, run_id)
+    registry = AgentRegistry()
+    for index in range(3):
+        registry.create_agent(
+            profile_id="coder",
+            name=f"Coder {index}",
+            role="coder",
+            team_id="team",
+            run_id=run_id,
+            capabilities=["coding"],
+        )
+    scheduler = ParallelTeamScheduler(
+        run_id,
+        task_graph=graph,
+        max_concurrency=3,
+    )
+    scheduler.board = board
+    scheduler.registry = registry
+
+    first_wave = scheduler._discover_dispatchable({})
+    assert [task.task_id for task in first_wave] == ["exclusive"]
+
+    # While an exclusive task is in flight, no other work may be admitted.
+    assert scheduler._discover_dispatchable(
+        {object(): "exclusive"}
+    ) == []
+
+    # A normal parallel wave cannot admit the exclusive task until it drains.
+    wave = scheduler._discover_dispatchable(
+        {object(): "parallel_a"}
+    )
+    assert {task.task_id for task in wave} == {"parallel_b"}

@@ -109,6 +109,7 @@ onBeforeUnmount(() => {
       title="点击查看工具参数和返回结果；计时仅包含工具本身，不包含模型思考"
     >
       <span class="tool-icon"><Terminal :size="13" /></span>
+      <span v-if="agentName" class="tool-agent-name">{{ agentName }}</span>
       <code class="tool-name">{{ toolName }}</code>
       <span v-if="argSummary" class="tool-arg-summary">{{ argSummary }}</span>
       <span class="tool-status">

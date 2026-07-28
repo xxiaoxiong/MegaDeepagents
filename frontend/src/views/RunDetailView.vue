@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, toRef, watch } from "vue";
+import { computed, onBeforeUnmount, ref, toRef, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import {
   ArrowLeft,
@@ -52,6 +52,12 @@ const selectedArtifactId = ref<string | null>(null);
 const pendingRefreshScopes = new Set<LiveRefreshScope>();
 const streamRunId = toRef(props, "runId");
 const sequence = computed(() => store.lastSequence);
+const streamReadyRunId = ref("");
+const streamEnabled = computed(
+  () => Boolean(props.runId) && streamReadyRunId.value === props.runId,
+);
+let detailLoadGeneration = 0;
+let liveRefreshInFlight = false;
 const requestedAgentId = computed(() => {
   const value = route.query.agent;
   return typeof value === "string" ? value : null;
@@ -99,18 +105,47 @@ function refreshScopesFor(event: EventEnvelope): LiveRefreshScope[] {
   return [...scopes];
 }
 
+function scheduleLiveRefresh() {
+  if (refreshTimer.value !== null || !pendingRefreshScopes.size) return;
+  refreshTimer.value = window.setTimeout(() => {
+    refreshTimer.value = null;
+    void flushLiveRefresh();
+  }, 350);
+}
+
+async function flushLiveRefresh() {
+  if (liveRefreshInFlight) {
+    scheduleLiveRefresh();
+    return;
+  }
+  const requested = [...pendingRefreshScopes];
+  if (!requested.length) return;
+  pendingRefreshScopes.clear();
+  const runId = props.runId;
+  liveRefreshInFlight = true;
+  try {
+    await store.refreshLiveData(runId, requested);
+  } catch (reason) {
+    if (props.runId === runId) {
+      pageError.value = `实时状态刷新失败：${
+        reason instanceof Error ? reason.message : String(reason)
+      }`;
+    }
+  } finally {
+    liveRefreshInFlight = false;
+    if (pendingRefreshScopes.size && props.runId === runId) {
+      scheduleLiveRefresh();
+    }
+  }
+}
+
 const stream = useRunStream(streamRunId, sequence, (event) => {
   store.applyEvent(event);
   const scopes = refreshScopesFor(event);
   if (!scopes.length) return;
   for (const scope of scopes) pendingRefreshScopes.add(scope);
-  window.clearTimeout(refreshTimer.value ?? undefined);
-  refreshTimer.value = window.setTimeout(async () => {
-    const requested = [...pendingRefreshScopes];
-    pendingRefreshScopes.clear();
-    await store.refreshLiveData(props.runId, requested);
-  }, 600);
-});
+  scheduleLiveRefresh();
+}, streamEnabled);
 
 const progress = computed(() => {
   const total = store.current.tasks.length;
@@ -152,6 +187,37 @@ async function refresh() {
     await store.loadRun(props.runId);
   } catch (reason) {
     pageError.value = reason instanceof Error ? reason.message : String(reason);
+  }
+}
+
+async function activateRun(runId: string) {
+  const generation = ++detailLoadGeneration;
+  streamReadyRunId.value = "";
+  pageError.value = "";
+  actionNotice.value = "";
+  activeTab.value = "artifacts";
+  focusedAgentId.value = null;
+  focusedTaskId.value = null;
+  selectedArtifactId.value = null;
+  pendingRefreshScopes.clear();
+  if (refreshTimer.value !== null) {
+    window.clearTimeout(refreshTimer.value);
+    refreshTimer.value = null;
+  }
+  store.resetCurrent();
+  try {
+    await store.loadRun(runId);
+    if (
+      generation === detailLoadGeneration &&
+      props.runId === runId &&
+      store.current.run?.run_id === runId
+    ) {
+      streamReadyRunId.value = runId;
+    }
+  } catch (reason) {
+    if (generation === detailLoadGeneration && props.runId === runId) {
+      pageError.value = reason instanceof Error ? reason.message : String(reason);
+    }
   }
 }
 
@@ -243,7 +309,13 @@ function openArtifact(artifactId: string, scroll = true) {
   if (scroll) scrollToSection("deliverables");
 }
 
-watch(() => props.runId, refresh);
+watch(
+  () => props.runId,
+  (runId) => {
+    void activateRun(runId);
+  },
+  { immediate: true },
+);
 watch(
   () => route.hash,
   (hash) => {
@@ -252,12 +324,9 @@ watch(
   },
   { immediate: true },
 );
-onMounted(async () => {
-  await refresh();
-  const artifactId = artifactFromHash(route.hash);
-  if (artifactId) openArtifact(artifactId);
-});
 onBeforeUnmount(() => {
+  detailLoadGeneration += 1;
+  streamReadyRunId.value = "";
   store.resetCurrent();
   if (refreshTimer.value) window.clearTimeout(refreshTimer.value);
 });

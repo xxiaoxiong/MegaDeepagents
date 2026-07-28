@@ -344,7 +344,9 @@ class CapabilityRegistry:
                     allowed_tools=["execute", "read_file", "create_file", "list_dir"],
                     deny_all_by_default=True,
                     allow_file_read=True,
-                    allow_file_write=False,  # 不能改业务代码
+                    # The tester runs in an isolated task workspace/worktree
+                    # and must be able to create the tests it is assigned.
+                    allow_file_write=True,
                     allow_shell=True,
                 ),
                 max_concurrency=3,

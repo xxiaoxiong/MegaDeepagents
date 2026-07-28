@@ -244,6 +244,7 @@ class ParallelTeamScheduler:
         running: dict[asyncio.Future, str] = {}
 
         while round_n < self.max_rounds:
+            self._refresh_task_graph()
             run_record = get_agent_run_history().get_team_run(self.run_id)
             if run_record and run_record.get("status") == "paused":
                 await self._cancel_running(running)
@@ -299,7 +300,13 @@ class ParallelTeamScheduler:
             # A finishes.  In run_e8587ea68ac64ff5, T2's retry sat for 10 min
             # behind T1's 900-s run.  Cap the wait at the next deferred retry's
             # due time so the loop wakes up and re-evaluates ``list_pending``.
-            wait_timeout = self._next_retry_delay()
+            retry_wait = self._next_retry_delay()
+            # Always wake periodically to observe run cancellation/pause.
+            # ``None`` used to block until a non-cooperative model call
+            # finished (potentially many minutes), even after the operator
+            # had cancelled the run. One lightweight control-plane read per
+            # second keeps cancellation bounded without redispatching work.
+            wait_timeout = min(retry_wait, 1.0) if retry_wait is not None else 1.0
             done, _ = await asyncio.wait(
                 running.keys(),
                 return_when=asyncio.FIRST_COMPLETED,
@@ -437,6 +444,35 @@ class ParallelTeamScheduler:
                 item[0].task_id,
             ),
         )
+        running_has_exclusive = any(
+            not self._task_allows_parallel(task_id)
+            for task_id in already_running
+        )
+        if running_has_exclusive:
+            return []
+
+        exclusive_ready = [
+            item for item in ordered
+            if not self._task_allows_parallel(item[0].task_id)
+        ]
+        if running:
+            # An exclusive task waits for the current parallel wave to drain.
+            ordered = [
+                item for item in ordered
+                if self._task_allows_parallel(item[0].task_id)
+            ]
+        elif exclusive_ready:
+            # Start one explicit barrier task before admitting another wave.
+            ordered = sorted(
+                exclusive_ready,
+                key=lambda item: (
+                    -int(item[0].priority),
+                    item[0].created_at,
+                    item[0].task_id,
+                ),
+            )[:1]
+            capacity = min(capacity, 1)
+
         for task, _ in ordered:
             candidates = [
                 agent
@@ -460,6 +496,17 @@ class ParallelTeamScheduler:
             if len(selected) >= capacity:
                 break
         return selected
+
+    def _task_allows_parallel(self, task_id: str) -> bool:
+        if self.task_graph is None:
+            return True
+        node = self.task_graph.nodes.get(task_id)
+        if node is None:
+            return True
+        contract = getattr(node, "output_contract", None)
+        return bool(
+            True if contract is None else contract.allow_parallel
+        )
 
     @staticmethod
     def _agent_can_serve(agent: Any, task: BoardTask) -> bool:
@@ -562,6 +609,29 @@ class ParallelTeamScheduler:
                 round_n, status=ScheduleStatus.WAITING_HUMAN.value,
                 error="control_plane_intervention_required",
             )
+
+        # A task-level cancel may race with a worker completion without setting
+        # the run-wide cancel event.  Once every task is terminal, preserve the
+        # authoritative cancellation outcome instead of misclassifying the
+        # run as a scheduler deadlock.
+        terminal_statuses = {
+            BoardTaskStatus.SUCCEEDED,
+            BoardTaskStatus.FAILED,
+            BoardTaskStatus.CANCELLED,
+        }
+        if states and all(status in terminal_statuses for status in states):
+            if BoardTaskStatus.FAILED in states:
+                return self._finalize(
+                    round_n,
+                    status=ScheduleStatus.FAILED.value,
+                    error="one_or_more_tasks_failed",
+                )
+            if BoardTaskStatus.CANCELLED in states:
+                return self._finalize(
+                    round_n,
+                    status=ScheduleStatus.CANCELLED.value,
+                    error="one_or_more_tasks_cancelled",
+                )
 
         # Permanent deadlock: a PENDING task depends on a terminal (FAILED /
         # CANCELLED) task.  FAILED→SUCCEEDED is not a legal transition (see
@@ -941,11 +1011,21 @@ class ParallelTeamScheduler:
                             raise
                     # A worker only produces evidence.  It never marks its
                     # own task succeeded; that transition is verifier-owned.
-                    self.board.mark_produced(
+                    if not self.board.mark_produced(
                         task.task_id, agent.agent_id,
                         artifact_ids=list(result.artifact_ids),
                         run_id=self.run_id,
-                    )
+                    ):
+                        self._record_task_state_conflict(
+                            task=task,
+                            agent_id=agent.agent_id,
+                            task_run_id=task_run_id,
+                            history=history,
+                            transition="mark_produced",
+                            expected_statuses=[BoardTaskStatus.RUNNING],
+                            artifact_ids=list(result.artifact_ids),
+                        )
+                        return
                     await get_lifecycle_hook_engine().emit_async(
                         LifecycleEvent.TASK_PRODUCED,
                         {"run_id": self.run_id, "agent_id": agent.agent_id,
@@ -957,8 +1037,22 @@ class ParallelTeamScheduler:
                         {"run_id": self.run_id, "agent_id": agent.agent_id,
                          "task_id": task.task_id},
                     )
-                    if self._verify_task(task):
-                        self.board.mark_verifying(task.task_id, run_id=self.run_id)
+                    # Verification may call an online judge and local checks.
+                    # Keep it off the scheduler loop so one slow judge cannot
+                    # freeze sibling dispatch, heartbeats, pause/cancel
+                    # observation, or SSE-visible progress.
+                    if not self.board.mark_verifying(task.task_id, run_id=self.run_id):
+                        self._record_task_state_conflict(
+                            task=task,
+                            agent_id=agent.agent_id,
+                            task_run_id=task_run_id,
+                            history=history,
+                            transition="mark_verifying",
+                            expected_statuses=[BoardTaskStatus.PRODUCED],
+                            artifact_ids=list(result.artifact_ids),
+                        )
+                        return
+                    if await self._verify_task_async(task):
                         completed_hook = await get_lifecycle_hook_engine().emit_async(
                             LifecycleEvent.TASK_COMPLETED,
                             {"run_id": self.run_id, "agent_id": agent.agent_id,
@@ -970,7 +1064,19 @@ class ParallelTeamScheduler:
                             if current is not None:
                                 current.metadata["hook_feedback"] = completed_hook.feedback
                                 self.board.add(current)
-                            self.board.mark_repair_required(task.task_id, run_id=self.run_id)
+                            if not self.board.mark_repair_required(
+                                task.task_id, run_id=self.run_id,
+                            ):
+                                self._record_task_state_conflict(
+                                    task=task,
+                                    agent_id=agent.agent_id,
+                                    task_run_id=task_run_id,
+                                    history=history,
+                                    transition="mark_repair_required",
+                                    expected_statuses=[BoardTaskStatus.VERIFYING],
+                                    artifact_ids=list(result.artifact_ids),
+                                )
+                                return
                             history.update_task_run_status(
                                 task_run_id, "failed",
                                 error=completed_hook.feedback or "TaskCompleted hook blocked",
@@ -982,10 +1088,6 @@ class ParallelTeamScheduler:
                                  "feedback": completed_hook.feedback},
                             )
                             return
-                        artifact_store = getattr(self.verifier, "artifact_store", None)
-                        if artifact_store is not None:
-                            for artifact_id in result.artifact_ids:
-                                artifact_store.mark_verified(artifact_id)
                         if commit_sha and self.integration_manager is not None:
                             from app.multiagent.git_workspace import MergeQueueItem
                             integrated = self.integration_manager.integrate(MergeQueueItem(
@@ -1001,9 +1103,64 @@ class ParallelTeamScheduler:
                                 history.update_task_run_status(task_run_id, "failed",
                                                                error="merge_conflict")
                                 return
+                        artifact_store = getattr(self.verifier, "artifact_store", None)
+                        if artifact_store is not None:
+                            try:
+                                for artifact_id in result.artifact_ids:
+                                    if not artifact_store.mark_verified(artifact_id):
+                                        raise RuntimeError(
+                                            f"artifact status row missing: {artifact_id}"
+                                        )
+                            except Exception as exc:
+                                self._reject_artifacts_fail_closed(
+                                    artifact_store, list(result.artifact_ids),
+                                )
+                                if not self.board.mark_repair_required(
+                                    task.task_id, run_id=self.run_id,
+                                ):
+                                    self._record_task_state_conflict(
+                                        task=task,
+                                        agent_id=agent.agent_id,
+                                        task_run_id=task_run_id,
+                                        history=history,
+                                        transition="artifact_verification_rollback",
+                                        expected_statuses=[BoardTaskStatus.VERIFYING],
+                                        artifact_ids=list(result.artifact_ids),
+                                    )
+                                    return
+                                error = f"artifact_verification_commit_failed: {exc}"
+                                history.update_task_run_status(
+                                    task_run_id, "failed", error=error,
+                                )
+                                self._event(
+                                    "ArtifactVerificationCommitFailed",
+                                    agent_id=agent.agent_id,
+                                    task_id=task.task_id,
+                                    payload={
+                                        "task_run_id": task_run_id,
+                                        "artifact_ids": list(result.artifact_ids),
+                                        "error": str(exc),
+                                    },
+                                )
+                                return
                         # Board success is the final transition and therefore
                         # cannot precede governed Git integration.
-                        self.board.mark_verified(task.task_id, run_id=self.run_id)
+                        if not self.board.mark_verified(
+                            task.task_id, run_id=self.run_id,
+                        ):
+                            self._reject_artifacts_fail_closed(
+                                artifact_store, list(result.artifact_ids),
+                            )
+                            self._record_task_state_conflict(
+                                task=task,
+                                agent_id=agent.agent_id,
+                                task_run_id=task_run_id,
+                                history=history,
+                                transition="mark_verified",
+                                expected_statuses=[BoardTaskStatus.VERIFYING],
+                                artifact_ids=list(result.artifact_ids),
+                            )
+                            return
                         history.update_task_run_status(task_run_id, "succeeded")
                         await get_lifecycle_hook_engine().emit_async(
                             LifecycleEvent.VERIFICATION_COMPLETED,
@@ -1011,7 +1168,19 @@ class ParallelTeamScheduler:
                              "task_id": task.task_id, "verdict": "pass"},
                         )
                     else:
-                        self.board.mark_repair_required(task.task_id, run_id=self.run_id)
+                        if not self.board.mark_repair_required(
+                            task.task_id, run_id=self.run_id,
+                        ):
+                            self._record_task_state_conflict(
+                                task=task,
+                                agent_id=agent.agent_id,
+                                task_run_id=task_run_id,
+                                history=history,
+                                transition="mark_repair_required",
+                                expected_statuses=[BoardTaskStatus.VERIFYING],
+                                artifact_ids=list(result.artifact_ids),
+                            )
+                            return
                         history.update_task_run_status(task_run_id, "failed", error="verification_failed")
                         await get_lifecycle_hook_engine().emit_async(
                             LifecycleEvent.VERIFICATION_COMPLETED,
@@ -1101,6 +1270,7 @@ class ParallelTeamScheduler:
                             self.control_plane.team_request_replan(
                                 self.run_id, agent.agent_id,
                                 idle_hook.feedback or "TeammateIdle hook requested replan",
+                                task_id=task.task_id,
                             )
                     except Exception as exc:
                         logger.warning("[ParallelSched] TeammateIdle hook failed: %s", exc)
@@ -1155,6 +1325,92 @@ class ParallelTeamScheduler:
         )
         return decision
 
+    @staticmethod
+    def _reject_artifacts_fail_closed(
+        artifact_store: Any,
+        artifact_ids: list[str],
+        *,
+        protected_ids: set[str] | None = None,
+    ) -> None:
+        """Best-effort rollback for evidence that must not remain verified."""
+        if artifact_store is None:
+            return
+        protected = protected_ids or set()
+        for artifact_id in dict.fromkeys(artifact_ids):
+            if artifact_id in protected:
+                continue
+            try:
+                artifact_store.mark_rejected(artifact_id)
+            except Exception as exc:
+                logger.error(
+                    "[ParallelSched] failed to reject artifact=%s: %s",
+                    artifact_id,
+                    exc,
+                )
+
+    def _record_task_state_conflict(
+        self,
+        *,
+        task: BoardTask,
+        agent_id: str,
+        task_run_id: str,
+        history: Any,
+        transition: str,
+        expected_statuses: list[BoardTaskStatus],
+        artifact_ids: list[str] | None = None,
+    ) -> None:
+        """Stop a stale completion path without overwriting newer authority."""
+        current = self.board.get(task.task_id, run_id=self.run_id)
+        actual_status = current.status if current is not None else None
+        protected_ids = (
+            set(current.produced_artifact_ids)
+            if current is not None and current.status == BoardTaskStatus.SUCCEEDED
+            else set()
+        )
+        self._reject_artifacts_fail_closed(
+            getattr(self.verifier, "artifact_store", None),
+            artifact_ids or [],
+            protected_ids=protected_ids,
+        )
+        expected = [status.value for status in expected_statuses]
+        actual = actual_status.value if actual_status is not None else "missing"
+        error = (
+            f"task_state_conflict:{transition}:"
+            f"expected={','.join(expected)}:actual={actual}"
+        )
+        task_run_status = (
+            "succeeded"
+            if actual_status == BoardTaskStatus.SUCCEEDED
+            else "cancelled"
+            if actual_status == BoardTaskStatus.CANCELLED
+            else "failed"
+        )
+        history.update_task_run_status(
+            task_run_id,
+            task_run_status,
+            error=None if task_run_status == "succeeded" else error,
+        )
+        self._event(
+            "TaskStateConflict",
+            agent_id=agent_id,
+            task_id=task.task_id,
+            payload={
+                "task_run_id": task_run_id,
+                "transition": transition,
+                "expected_statuses": expected,
+                "actual_status": actual,
+                "artifact_ids": list(artifact_ids or []),
+            },
+        )
+        logger.warning(
+            "[ParallelSched] stale completion stopped task=%s transition=%s "
+            "expected=%s actual=%s",
+            task.task_id,
+            transition,
+            expected,
+            actual,
+        )
+
     def _task_graph_from_board(self) -> Any:
         """Compatibility bridge for legacy callers while never passing None."""
         from app.multiagent.task_graph import TaskGraph, TaskNode
@@ -1167,6 +1423,38 @@ class ParallelTeamScheduler:
             ))
         self.task_graph = graph
         return graph
+
+    def _refresh_task_graph(self) -> None:
+        """Consume durable control-plane graph mutations before dispatch.
+
+        Teammates may create tasks while the scheduler is already running.
+        The TaskBoard mutation is durable, but an executor must receive the
+        matching latest TaskGraph as well; otherwise it rejects the new task
+        as ``task not in dag``.  The persisted snapshot is the versioned
+        authority, so refreshing it is safe across both in-process mutations
+        and process recovery.
+        """
+        from app.infrastructure.database.run_store import get_agent_run_history
+        from app.multiagent.task_graph import TaskGraph
+
+        payload = get_agent_run_history().load_task_graph(self.run_id)
+        if payload is None:
+            return
+        latest_version = int(payload.get("version", 0))
+        current_version = int(getattr(self.task_graph, "version", -1))
+        if self.task_graph is not None and latest_version <= current_version:
+            return
+        graph = TaskGraph.model_validate(payload)
+        graph.validate()
+        self.task_graph = graph
+        self._event("TaskGraphReloaded", payload={
+            "previous_version": current_version,
+            "version": latest_version,
+            "task_count": len(graph.nodes),
+        })
+
+    async def _verify_task_async(self, task: BoardTask) -> bool:
+        return await asyncio.to_thread(self._verify_task, task)
 
     def _verify_task(self, task: BoardTask) -> bool:
         """Verifier-owned per-task completion gate.
@@ -1223,37 +1511,65 @@ class ParallelTeamScheduler:
             return False
 
     def _collect_dependency_artifacts(self, task: BoardTask) -> tuple[list[str], list[dict[str, Any]]]:
-        """Resolve only direct, verified, same-run dependency artifacts."""
+        """Resolve verified dependencies plus explicit repair source evidence."""
         store = getattr(self.verifier, "artifact_store", None)
-        if not task.dependencies or store is None:
+        if store is None:
             return [], []
         ids: list[str] = []
         refs: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def append_artifact(
+            artifact_id: str,
+            *,
+            purpose: str,
+            require_verified: bool,
+        ) -> None:
+            if artifact_id in seen:
+                return
+            artifact = store.get(artifact_id)
+            if artifact is None:
+                raise RuntimeError(f"artifact_not_found:{artifact_id}")
+            if artifact.run_id != self.run_id:
+                raise RuntimeError(f"artifact_wrong_run:{artifact_id}")
+            status = getattr(artifact.status, "value", artifact.status)
+            if require_verified and status != "verified":
+                raise RuntimeError(f"artifact_not_verified:{artifact_id}")
+            if not store.verify_integrity(artifact_id):
+                raise RuntimeError(f"artifact_integrity_failed:{artifact_id}")
+            seen.add(artifact_id)
+            ids.append(artifact_id)
+            refs.append({
+                "artifact_id": artifact.id,
+                "task_id": artifact.task_id,
+                "producing_agent_id": artifact.produced_by,
+                "type": artifact.type.value,
+                "path": artifact.path,
+                "content_hash": artifact.content_hash,
+                "version": artifact.version,
+                "commit_sha": artifact.commit_sha or artifact.metadata.get("commit_sha"),
+                "verification_state": status,
+                "purpose": purpose,
+                "created_at": artifact.created_at.isoformat(),
+                "summary": artifact.metadata.get("summary", ""),
+            })
+
         for dependency_id in task.dependencies:
             dependency = self.board.get(dependency_id, run_id=self.run_id)
             if dependency is None or dependency.status != BoardTaskStatus.SUCCEEDED:
                 raise RuntimeError(f"dependency_not_verified:{dependency_id}")
             for artifact_id in dependency.produced_artifact_ids:
-                artifact = store.get(artifact_id)
-                if artifact is None:
-                    raise RuntimeError(f"artifact_not_found:{artifact_id}")
-                if artifact.run_id != self.run_id:
-                    raise RuntimeError(f"artifact_wrong_run:{artifact_id}")
-                if getattr(artifact.status, "value", artifact.status) != "verified":
-                    raise RuntimeError(f"artifact_not_verified:{artifact_id}")
-                if not store.verify_integrity(artifact_id):
-                    raise RuntimeError(f"artifact_integrity_failed:{artifact_id}")
-                ids.append(artifact_id)
-                refs.append({
-                    "artifact_id": artifact.id, "task_id": artifact.task_id,
-                    "producing_agent_id": artifact.produced_by,
-                    "type": artifact.type.value, "path": artifact.path,
-                    "content_hash": artifact.content_hash, "version": artifact.version,
-                    "commit_sha": artifact.commit_sha or artifact.metadata.get("commit_sha"),
-                    "verification_state": artifact.status.value,
-                    "created_at": artifact.created_at.isoformat(),
-                    "summary": artifact.metadata.get("summary", ""),
-                })
+                append_artifact(
+                    artifact_id,
+                    purpose="dependency",
+                    require_verified=True,
+                )
+        for artifact_id in task.metadata.get("source_artifact_ids", []):
+            append_artifact(
+                str(artifact_id),
+                purpose="repair_source",
+                require_verified=False,
+            )
         return ids, refs
 
     # ===== 工具 =====

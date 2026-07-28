@@ -21,6 +21,7 @@ class TaskGraphMutationType(str, Enum):
     ADD_DEPENDENCY = "add_dependency"
     UPDATE_TASK = "update_task"
     REPAIR_TASK = "repair_task"
+    PLAN_REVISION = "plan_revision"
 
 
 class TaskGraphMutation(BaseModel):
@@ -99,9 +100,16 @@ class TransactionalTaskService:
             (run_id,),
         ).fetchone()
         if already_registered:
-            get_task_board().restore_run(run_id)
-            return TaskGraphVersion(run_id=run_id, version=graph.version,
-                                    mutation_id=f"initial:{run_id}", graph=graph)
+            current = self.graph(run_id)
+            if self._plan_signature(current) == self._plan_signature(graph):
+                get_task_board().restore_run(run_id)
+                return TaskGraphVersion(
+                    run_id=run_id,
+                    version=current.version,
+                    mutation_id=f"initial:{run_id}",
+                    graph=current,
+                )
+            return self._replace_plan(run_id, graph, actor_agent_id)
         board_tasks: list[BoardTask] = []
         for node in graph.nodes.values():
             hook = get_lifecycle_hook_engine().emit(
@@ -169,6 +177,200 @@ class TransactionalTaskService:
         get_task_board().restore_run(run_id)
         return TaskGraphVersion(run_id=run_id, version=graph.version,
                                 mutation_id=f"initial:{run_id}", graph=graph)
+
+    @staticmethod
+    def _plan_signature(graph: TaskGraph) -> str:
+        """Compare plan structure without runtime status or graph counters."""
+        nodes = {}
+        for node_id, node in sorted(graph.nodes.items()):
+            nodes[node_id] = {
+                "title": node.title,
+                "objective": node.objective,
+                "description": node.description,
+                "dependencies": sorted(node.dependencies),
+                "required_capabilities": sorted(node.required_capabilities),
+                "preferred_agent_profile": node.preferred_agent_profile,
+                "output_contract": node.output_contract.model_dump(mode="json"),
+                "priority": node.priority,
+                "max_attempts": node.max_attempts,
+                "budget": node.budget.model_dump(mode="json"),
+            }
+        return json.dumps(
+            {"root_task_id": graph.root_task_id, "nodes": nodes},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    def _replace_plan(
+        self,
+        run_id: str,
+        incoming: TaskGraph,
+        actor_agent_id: str,
+    ) -> TaskGraphVersion:
+        """Atomically supersede the old Board projection with a new plan."""
+        incoming = incoming.model_copy(deep=True)
+        incoming.validate()
+        board = get_task_board()
+        old_tasks = board.list_by_run(run_id)
+        occupied_ids = {task.task_id for task in old_tasks}
+        current = self.graph(run_id)
+        revision = max(current.version + 1, incoming.version)
+        id_map = {
+            node_id: (
+                f"plan_v{revision}__{node_id}"
+                if node_id in occupied_ids else node_id
+            )
+            for node_id in incoming.nodes
+        }
+        revised_nodes: dict[str, TaskNode] = {}
+        from app.multiagent.task_graph import TaskNodeStatus
+        for old_id, source in incoming.nodes.items():
+            node = source.model_copy(deep=True)
+            node.id = id_map[old_id]
+            node.dependencies = [id_map[dependency] for dependency in node.dependencies]
+            node.status = TaskNodeStatus.PENDING
+            node.assigned_agent_id = None
+            node.input_artifact_ids = []
+            node.output_artifact_ids = []
+            node.attempts = 0
+            node.error = None
+            node.started_at = None
+            node.completed_at = None
+            node.metadata = {
+                **node.metadata,
+                "plan_revision": revision,
+                "original_task_id": old_id,
+            }
+            hook = get_lifecycle_hook_engine().emit(
+                LifecycleEvent.TASK_CREATED,
+                {
+                    "run_id": run_id,
+                    "agent_id": actor_agent_id,
+                    "task_id": node.id,
+                    "task": node.model_dump(mode="json"),
+                    "plan_revision": revision,
+                },
+            )
+            if hook.block or not hook.allow:
+                raise PermissionError(
+                    hook.feedback or "TaskCreated hook blocked revised plan"
+                )
+            node.metadata.update(hook.mutate_metadata)
+            revised_nodes[node.id] = node
+        revised = TaskGraph(
+            root_task_id=id_map[incoming.root_task_id],
+            nodes=revised_nodes,
+            version=revision,
+        )
+        revised.validate()
+        new_board_tasks = [
+            BoardTask(
+                task_id=node.id,
+                run_id=run_id,
+                title=node.title or node.id,
+                objective=node.objective,
+                dependencies=list(node.dependencies),
+                required_capabilities=list(node.required_capabilities),
+                priority=node.priority,
+                max_attempts=node.max_attempts,
+                metadata={
+                    "graph_version": revised.version,
+                    "plan_revision": revision,
+                },
+            )
+            for node in revised.nodes.values()
+        ]
+        mutation_id = f"plan-revision:{run_id}:{revision}"
+        superseded_tasks: list[BoardTask] = []
+        conn = _get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for task in old_tasks:
+                updated = task.model_copy(deep=True)
+                updated.metadata["superseded_by_plan_revision"] = revision
+                updated.updated_at = datetime.utcnow()
+                superseded_tasks.append(updated)
+                conn.execute(
+                    "UPDATE task_board_tasks SET payload=?, updated_at=? "
+                    "WHERE run_id=? AND task_id=?",
+                    (
+                        json.dumps(updated.model_dump(mode="json")),
+                        updated.updated_at.isoformat(),
+                        run_id,
+                        updated.task_id,
+                    ),
+                )
+            for task in new_board_tasks:
+                conn.execute(
+                    "INSERT INTO task_board_tasks(run_id, task_id, payload, updated_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        run_id,
+                        task.task_id,
+                        json.dumps(task.model_dump(mode="json")),
+                        datetime.utcnow().isoformat(),
+                    ),
+                )
+            conn.execute(
+                "INSERT INTO task_graph_snapshots(run_id, version, graph_json, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET "
+                "version=excluded.version, graph_json=excluded.graph_json, "
+                "updated_at=excluded.updated_at",
+                (
+                    run_id,
+                    revised.version,
+                    json.dumps(revised.model_dump(mode="json")),
+                    datetime.utcnow().isoformat(),
+                ),
+            )
+            conn.execute(
+                "INSERT INTO task_graph_mutations VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    mutation_id,
+                    run_id,
+                    actor_agent_id,
+                    TaskGraphMutationType.PLAN_REVISION.value,
+                    json.dumps({
+                        "previous_version": current.version,
+                        "task_ids": list(revised.nodes),
+                    }),
+                    revised.version,
+                    datetime.utcnow().isoformat(),
+                ),
+            )
+            sequence = int(conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq "
+                "FROM control_plane_outbox WHERE run_id=?",
+                (run_id,),
+            ).fetchone()["seq"])
+            conn.execute(
+                "INSERT INTO control_plane_outbox VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    "evt_" + uuid.uuid4().hex[:16],
+                    run_id,
+                    "TaskGraphReplanned",
+                    sequence,
+                    json.dumps({
+                        "mutation_id": mutation_id,
+                        "previous_version": current.version,
+                        "version": revised.version,
+                        "task_ids": list(revised.nodes),
+                    }),
+                    datetime.utcnow().isoformat(),
+                ),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        for task in [*superseded_tasks, *new_board_tasks]:
+            board.add(task)
+        return TaskGraphVersion(
+            run_id=run_id,
+            version=revised.version,
+            mutation_id=mutation_id,
+            graph=revised,
+        )
 
     def apply(self, mutation: TaskGraphMutation) -> TaskGraphVersion:
         _ensure_schema()

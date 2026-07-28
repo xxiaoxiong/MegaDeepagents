@@ -10,11 +10,43 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.core.logging import logger
+from app.memory.pii_filter import redact
 from app.multiagent.store import _get_conn
+
+
+_SENSITIVE_EVENT_KEYS = frozenset({
+    "api_key",
+    "apikey",
+    "authorization",
+    "cookie",
+    "password",
+    "passwd",
+    "refresh_token",
+    "secret",
+    "set_cookie",
+    "token",
+})
+
+
+def _redact_event_payload(value: Any, key: str | None = None) -> Any:
+    """Remove credentials before an audit event reaches durable storage."""
+    normalized_key = (key or "").strip().lower().replace("-", "_")
+    if normalized_key in _SENSITIVE_EVENT_KEYS:
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        return {
+            str(item_key): _redact_event_payload(item_value, str(item_key))
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_event_payload(item) for item in value]
+    if isinstance(value, str):
+        return redact(value)
+    return value
 
 
 def make_run_event_id() -> str:
@@ -68,6 +100,152 @@ class AgentRunHistory:
                                 (status, datetime.utcnow().isoformat(), run_id))
         self.conn.commit()
         return cur.rowcount > 0
+
+    def acquire_team_run_execution_lease(
+        self,
+        run_id: str,
+        lease_id: str,
+        *,
+        ttl_seconds: float = 60.0,
+        allowed_statuses: set[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically fence checkpoint execution across API workers.
+
+        The lease lives in existing Run metadata to avoid a second control
+        plane.  ``BEGIN IMMEDIATE`` serializes competing claimers; expiration
+        plus heartbeats allows recovery after a process crash.
+        """
+        _ensure_team_runs(self.conn)
+        now = datetime.now(UTC)
+        expires_at = now + timedelta(seconds=max(1.0, ttl_seconds))
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT * FROM team_runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                self.conn.rollback()
+                return None
+            record = _row_to_dict(row)
+            if (
+                allowed_statuses is not None
+                and str(record.get("status")) not in allowed_statuses
+            ):
+                self.conn.rollback()
+                return None
+            metadata = dict(record.get("metadata") or {})
+            existing = metadata.get("execution_lease") or {}
+            existing_id = str(existing.get("lease_id") or "")
+            existing_expiry = self._parse_lease_timestamp(
+                existing.get("expires_at")
+            )
+            if (
+                existing_id
+                and existing_id != lease_id
+                and existing_expiry is not None
+                and existing_expiry > now
+            ):
+                self.conn.rollback()
+                return None
+            metadata["execution_lease"] = {
+                "lease_id": lease_id,
+                "acquired_at": now.isoformat(),
+                "heartbeat_at": now.isoformat(),
+                "expires_at": expires_at.isoformat(),
+            }
+            self.conn.execute(
+                "UPDATE team_runs SET metadata=?, updated_at=? WHERE run_id=?",
+                (json.dumps(metadata), now.isoformat(), run_id),
+            )
+            self.conn.commit()
+            record["metadata"] = metadata
+            return record
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def refresh_team_run_execution_lease(
+        self,
+        run_id: str,
+        lease_id: str,
+        *,
+        ttl_seconds: float = 60.0,
+    ) -> bool:
+        _ensure_team_runs(self.conn)
+        now = datetime.now(UTC)
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT metadata FROM team_runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                self.conn.rollback()
+                return False
+            metadata = json.loads(row["metadata"] or "{}")
+            lease = dict(metadata.get("execution_lease") or {})
+            if str(lease.get("lease_id") or "") != lease_id:
+                self.conn.rollback()
+                return False
+            lease["heartbeat_at"] = now.isoformat()
+            lease["expires_at"] = (
+                now + timedelta(seconds=max(1.0, ttl_seconds))
+            ).isoformat()
+            metadata["execution_lease"] = lease
+            self.conn.execute(
+                "UPDATE team_runs SET metadata=?, updated_at=? WHERE run_id=?",
+                (json.dumps(metadata), now.isoformat(), run_id),
+            )
+            self.conn.commit()
+            return True
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def release_team_run_execution_lease(
+        self,
+        run_id: str,
+        lease_id: str,
+    ) -> bool:
+        _ensure_team_runs(self.conn)
+        now = datetime.now(UTC)
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT metadata FROM team_runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                self.conn.rollback()
+                return False
+            metadata = json.loads(row["metadata"] or "{}")
+            lease = dict(metadata.get("execution_lease") or {})
+            if str(lease.get("lease_id") or "") != lease_id:
+                self.conn.rollback()
+                return False
+            metadata.pop("execution_lease", None)
+            self.conn.execute(
+                "UPDATE team_runs SET metadata=?, updated_at=? WHERE run_id=?",
+                (json.dumps(metadata), now.isoformat(), run_id),
+            )
+            self.conn.commit()
+            return True
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    @staticmethod
+    def _parse_lease_timestamp(value: Any) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
 
     def merge_team_run_metadata(
         self, run_id: str, updates: dict[str, Any]
@@ -374,6 +552,7 @@ class AgentRunHistory:
         payload: dict[str, Any] | None = None,
     ) -> None:
         occurred_at = (timestamp or datetime.utcnow()).isoformat()
+        safe_payload = _redact_event_payload(payload or {})
         conn = self.conn
         conn.execute(
             """CREATE TABLE IF NOT EXISTS event_envelopes (
@@ -391,7 +570,7 @@ class AgentRunHistory:
                     timestamp, trace_id, payload
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (event_id, run_id, event_type, agent_id, task_id, task_run_id,
-                 occurred_at, trace_id, json.dumps(payload or {})),
+                 occurred_at, trace_id, json.dumps(safe_payload)),
             )
             sequence = int(conn.execute(
                 "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM event_envelopes WHERE run_id=?",
@@ -400,7 +579,7 @@ class AgentRunHistory:
             conn.execute(
                 "INSERT INTO event_envelopes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (event_id, run_id, agent_id, task_id, event_type, sequence,
-                 occurred_at, json.dumps(payload or {}), trace_id),
+                 occurred_at, json.dumps(safe_payload), trace_id),
             )
             conn.commit()
         except Exception:
@@ -546,23 +725,40 @@ class AgentRunHistory:
         predecessor_id: str | None = None,
         parent_artifact_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        supersede_parent_id: str | None = None,
     ) -> None:
-        self.conn.execute(
-            """
-            INSERT OR REPLACE INTO artifacts (
-                artifact_id, run_id, task_id, type, relative_path, content_hash,
-                size_bytes, version, produced_by, status, predecessor_id,
-                parent_artifact_id, created_at, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                artifact_id, run_id, task_id, type, relative_path, content_hash,
-                size_bytes, version, produced_by, status, predecessor_id,
-                parent_artifact_id, datetime.utcnow().isoformat(),
-                json.dumps(metadata or {})
+        conn = self.conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO artifacts (
+                    artifact_id, run_id, task_id, type, relative_path, content_hash,
+                    size_bytes, version, produced_by, status, predecessor_id,
+                    parent_artifact_id, created_at, metadata
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    artifact_id, run_id, task_id, type, relative_path, content_hash,
+                    size_bytes, version, produced_by, status, predecessor_id,
+                    parent_artifact_id, datetime.utcnow().isoformat(),
+                    json.dumps(metadata or {})
+                )
             )
-        )
-        self.conn.commit()
+            if supersede_parent_id:
+                updated = conn.execute(
+                    "UPDATE artifacts SET status='superseded' "
+                    "WHERE artifact_id=? AND run_id=?",
+                    (supersede_parent_id, run_id),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError(
+                        f"artifact parent not persisted: {supersede_parent_id}"
+                    )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     def list_artifacts_by_run(self, run_id: str) -> list[dict[str, Any]]:
         rows = self.conn.execute(

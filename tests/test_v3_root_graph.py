@@ -6,7 +6,7 @@ from app.domain.tasks.models import TaskExecutionResult as TaskResult
 from app.multiagent.task_graph import OutputContract, TaskGraph, TaskNode
 from app.multiagent.team_run_context import TeamRunContext, TeamRunMode
 from app.multiagent.verifier import EvidenceRef, ValidationResult, Verdict
-from app.runtime.root_graph.graph import run_governed
+from app.runtime.root_graph.graph import GovernedRunGraph, run_governed
 
 
 class RecordingExecutor:
@@ -62,6 +62,18 @@ class FinalRepairThenPassVerifier(PassVerifier):
             verdict=verdict,
             scores={"evidence": 0.0 if verdict == Verdict.REPAIR else 1.0},
             summary="repair required" if verdict == Verdict.REPAIR else "evidence verified",
+        )
+
+
+class FinalReplanThenPassVerifier(PassVerifier):
+    def validate(self, *, goal, artifacts, checks=None):
+        self.calls += 1
+        assert artifacts
+        verdict = Verdict.REPLAN if self.calls == 2 else Verdict.PASS
+        return ValidationResult(
+            verdict=verdict,
+            scores={"evidence": 0.0 if verdict == Verdict.REPLAN else 1.0},
+            summary="new plan required" if verdict == Verdict.REPLAN else "verified",
         )
 
 
@@ -234,3 +246,147 @@ def test_whole_run_verifier_creates_and_executes_a_real_repair_task(tmp_path):
         task.task_id == repair_ids[0] and task.status.value == "succeeded"
         for task in board
     )
+
+
+def test_replan_atomically_materializes_and_executes_the_revised_graph(tmp_path):
+    from app.multiagent.task_board import get_task_board
+
+    ctx = _context(tmp_path, "Replan when the first approach is insufficient")
+    store = ArtifactStore(ctx.workspace_root)
+    executor = RecordingExecutor(store)
+    verifier = FinalReplanThenPassVerifier(store)
+    planner_calls = 0
+
+    def planner(goal, feedback):
+        nonlocal planner_calls
+        planner_calls += 1
+        task_id = "first_approach" if planner_calls == 1 else "revised_approach"
+        graph = TaskGraph(root_task_id=task_id)
+        graph.add_node(TaskNode(
+            id=task_id,
+            title=task_id,
+            objective=f"{goal}: {task_id}",
+            required_capabilities=["coding"],
+            output_contract=OutputContract(
+                artifact_type="document",
+                description="verified evidence",
+            ),
+        ))
+        return graph
+
+    result = run_governed(
+        goal=ctx.user_goal,
+        requested_mode="team",
+        planner=planner,
+        executor=executor,
+        verifier=verifier,
+        ctx=ctx,
+        max_rounds=10,
+    )
+
+    assert result.status == "completed"
+    assert planner_calls == 2
+    assert executor.calls == ["first_approach", "revised_approach"]
+    board = get_task_board().list_by_run(ctx.run_id)
+    old = next(task for task in board if task.task_id == "first_approach")
+    revised = next(task for task in board if task.task_id == "revised_approach")
+    assert old.metadata["superseded_by_plan_revision"]
+    assert revised.status.value == "succeeded"
+    persisted = get_agent_run_history().load_task_graph(ctx.run_id)
+    assert set(persisted["nodes"]) == {"revised_approach"}
+    assert any(
+        event["event_type"] == "root_graph:replan_requested"
+        for event in get_agent_run_history().list_event_envelopes(ctx.run_id)
+    )
+
+
+def test_incomplete_dispatch_never_reaches_collection_or_verification():
+    graph = object.__new__(GovernedRunGraph)
+
+    assert graph._route_after_dispatch({"dispatch_status": "incomplete"}) == "fail"
+    assert graph._route_after_dispatch({"dispatch_status": "completed"}) == "collect"
+
+
+def test_run_verifier_rejects_incomplete_task_board_before_calling_judge(tmp_path):
+    from app.multiagent.task_board import get_task_board
+
+    ctx = _context(tmp_path, "Do not accept partial completion")
+    task_graph = TaskGraph(root_task_id="unfinished")
+    task_graph.add_node(TaskNode(
+        id="unfinished",
+        title="Unfinished",
+        objective="produce complete evidence",
+        required_capabilities=["coding"],
+    ))
+    get_task_board().create_task(
+        "unfinished",
+        ctx.run_id,
+        "Unfinished",
+        "produce complete evidence",
+        required_capabilities=["coding"],
+    )
+    verifier = PassVerifier(ArtifactStore(ctx.workspace_root))
+    governed = object.__new__(GovernedRunGraph)
+    governed.ctx = ctx
+    governed.verifier = verifier
+
+    result = governed._verify({
+        "goal": ctx.user_goal,
+        "task_graph_json": task_graph.model_dump_json(),
+    })
+
+    assert result["verification_summary"]["verdict"] == "fail"
+    assert result["error"].startswith("tasks_not_succeeded:")
+    assert verifier.calls == 0
+
+
+def test_resume_delivers_the_human_decision_through_langgraph_command():
+    from types import SimpleNamespace
+
+    from langgraph.types import Command
+
+    class CompiledGraph:
+        def __init__(self):
+            self.value = None
+            self.config = None
+
+        def invoke(self, value, *, config):
+            self.value = value
+            self.config = config
+            return {
+                "status": "succeeded",
+                "mode": "team",
+                "task_graph_version": 0,
+                "dispatch_rounds": 0,
+                "verification_summary": {},
+            }
+
+    class Connection:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    compiled = CompiledGraph()
+    connection = Connection()
+    governed = object.__new__(GovernedRunGraph)
+    governed.ctx = SimpleNamespace(
+        run_id="run_resume_command",
+        checkpoint_namespace="team:run_resume_command",
+    )
+    governed._compiled = compiled
+    governed._checkpoint_connection = connection
+    decision = {"decision": "deny", "feedback": "Use a safer approach."}
+
+    result = governed.invoke(
+        goal="resume",
+        requested_mode="team",
+        resume=True,
+        resume_decision=decision,
+    )
+
+    assert result.status == "completed"
+    assert isinstance(compiled.value, Command)
+    assert compiled.value.resume == decision
+    assert compiled.config["configurable"]["thread_id"] == "run_resume_command"
+    assert connection.closed

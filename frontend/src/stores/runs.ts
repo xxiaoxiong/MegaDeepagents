@@ -18,6 +18,21 @@ const emptySnapshot = (): RunSnapshot => ({
   execution: null,
 });
 
+function mergeEvents(
+  snapshotEvents: EventEnvelope[],
+  liveEvents: EventEnvelope[],
+): EventEnvelope[] {
+  const byId = new Map<string, EventEnvelope>();
+  for (const event of [...snapshotEvents, ...liveEvents]) {
+    byId.set(event.event_id, event);
+  }
+  return [...byId.values()].sort(
+    (left, right) =>
+      left.sequence - right.sequence ||
+      left.event_id.localeCompare(right.event_id),
+  );
+}
+
 export type LiveRefreshScope =
   | "run"
   | "tasks"
@@ -36,6 +51,8 @@ export const useRunsStore = defineStore("runs", () => {
   const error = ref("");
   const eventIds = new Set<string>();
   let loadRunGeneration = 0;
+  let liveRefreshGeneration = 0;
+  const keyRefreshGeneration = new Map<keyof RunSnapshot, number>();
   const lastSequence = computed(
     () => current.events.at(-1)?.sequence ?? 0,
   );
@@ -86,14 +103,21 @@ export const useRunsStore = defineStore("runs", () => {
         api.execution(runId).catch(() => null),
       ]);
       if (generation !== loadRunGeneration) return;
+      const liveEvents =
+        current.run?.run_id === runId ||
+        (current.run === null &&
+          current.events.every((event) => event.run_id === runId))
+          ? [...current.events]
+          : [];
+      const mergedEvents = mergeEvents(events, liveEvents);
       eventIds.clear();
-      for (const event of events) eventIds.add(event.event_id);
+      for (const event of mergedEvents) eventIds.add(event.event_id);
       Object.assign(current, {
         run,
         tasks,
         agents,
         artifacts,
-        events,
+        events: mergedEvents,
         permissions,
         plans,
         graph,
@@ -137,6 +161,7 @@ export const useRunsStore = defineStore("runs", () => {
     runId: string,
     scopes?: LiveRefreshScope[],
   ) {
+    const generation = ++liveRefreshGeneration;
     const requested = new Set<LiveRefreshScope>(
       scopes ?? [
         "run",
@@ -156,6 +181,7 @@ export const useRunsStore = defineStore("runs", () => {
       key: K,
       promise: Promise<RunSnapshot[K]>,
     ) => {
+      keyRefreshGeneration.set(key, generation);
       jobs.push(promise.then((value) => {
         updates[key] = value;
       }));
@@ -186,11 +212,19 @@ export const useRunsStore = defineStore("runs", () => {
     }
     await Promise.all(jobs);
     if (current.run?.run_id !== runId) return;
-    Object.assign(current, updates);
+    const accepted: Partial<RunSnapshot> = {};
+    for (const key of Object.keys(updates) as Array<keyof RunSnapshot>) {
+      if (keyRefreshGeneration.get(key) === generation) {
+        Object.assign(accepted, { [key]: updates[key] });
+      }
+    }
+    Object.assign(current, accepted);
   }
 
   function resetCurrent() {
     loadRunGeneration += 1;
+    liveRefreshGeneration += 1;
+    keyRefreshGeneration.clear();
     eventIds.clear();
     Object.assign(current, emptySnapshot());
   }

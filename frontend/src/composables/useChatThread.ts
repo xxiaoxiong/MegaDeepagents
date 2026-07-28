@@ -27,6 +27,7 @@ interface ThreadIndex {
   // 用具体子类型，避免从联合 ChatMessage 取值时的窄化问题
   assistantByMsgId: Map<string, AssistantChatMessage>;
   toolByCallId: Map<string, ToolCallChatMessage>;
+  artifactIds: Set<string>;
   seen: Set<string>;
   // messageId → 最后收到 token 的时间戳，用于超时清除 streaming 光标
   lastTokenAt: Map<string, number>;
@@ -36,6 +37,7 @@ function newIndex(): ThreadIndex {
   return {
     assistantByMsgId: new Map(),
     toolByCallId: new Map(),
+    artifactIds: new Set(),
     seen: new Set(),
     lastTokenAt: new Map(),
   };
@@ -45,6 +47,23 @@ function payloadOf(env: EventEnvelope): Record<string, any> {
   return (env.payload || {}) as Record<string, any>;
 }
 
+function eventKind(eventType: string): string {
+  return eventType
+    .replace(/^root_graph:/i, "")
+    .replace(/[_:\-\s]/g, "")
+    .toLowerCase();
+}
+
+function agentLabel(env: EventEnvelope, payload: Record<string, any>): string {
+  return String(
+    payload.agent_name ??
+      payload.from_agent_name ??
+      payload.agent ??
+      env.agent_id ??
+      "Agent",
+  );
+}
+
 /** 把单个事件应用到 messages（就地变更），并更新索引。已见过的 event_id 跳过。 */
 function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex): void {
   if (idx.seen.has(env.event_id)) return;
@@ -52,8 +71,8 @@ function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex)
 
   const p = payloadOf(env);
 
-  switch (env.event_type) {
-    case "user_message": {
+  switch (eventKind(env.event_type)) {
+    case "usermessage": {
       messages.push({
         id: env.event_id,
         role: "user",
@@ -62,7 +81,7 @@ function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex)
       });
       break;
     }
-    case "assistant_token": {
+    case "assistanttoken": {
       const msgId = String(p.message_id ?? "");
       const delta = String(p.delta ?? "");
       // 空 delta 不创建消息（避免空气泡）
@@ -100,7 +119,7 @@ function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex)
       if (msgId) idx.lastTokenAt.set(msgId, Date.now());
       break;
     }
-    case "assistant_message": {
+    case "assistantmessage": {
       const msgId = String(p.message_id ?? "");
       const content = String(p.content ?? "");
       const existing = msgId ? idx.assistantByMsgId.get(msgId) : undefined;
@@ -138,7 +157,7 @@ function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex)
       }
       break;
     }
-    case "tool_call_started": {
+    case "toolcallstarted": {
       const tcId = String(p.tool_call_id ?? "");
       const created: ToolCallChatMessage = {
         id: env.event_id,
@@ -147,7 +166,10 @@ function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex)
         toolName: String(p.tool_name ?? "tool"),
         args: (p.arguments as Record<string, unknown>) ?? {},
         status: "running",
-        agentName: (p.agent_name as string | null) ?? null,
+        agentName:
+          (p.agent_name as string | null) ??
+          (env.agent_id as string | null) ??
+          null,
         createdAt: env.timestamp,
       };
       messages.push(created);
@@ -159,7 +181,7 @@ function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex)
       }
       break;
     }
-    case "tool_call_result": {
+    case "toolcallresult": {
       const tcId = String(p.tool_call_id ?? "");
       const existing = tcId ? idx.toolByCallId.get(tcId) : undefined;
       const status: "ok" | "error" = p.status === "error" ? "error" : "ok";
@@ -167,6 +189,11 @@ function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex)
         existing.status = status;
         existing.resultPreview = String(p.result_preview ?? "");
         existing.durationMs = (p.duration_ms as number | null) ?? null;
+        existing.agentName =
+          (p.agent_name as string | null) ??
+          existing.agentName ??
+          (env.agent_id as string | null) ??
+          null;
       } else {
         const created: ToolCallChatMessage = {
           id: env.event_id,
@@ -177,6 +204,10 @@ function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex)
           status,
           resultPreview: String(p.result_preview ?? ""),
           durationMs: (p.duration_ms as number | null) ?? null,
+          agentName:
+            (p.agent_name as string | null) ??
+            (env.agent_id as string | null) ??
+            null,
           createdAt: env.timestamp,
         };
         messages.push(created);
@@ -189,11 +220,14 @@ function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex)
       }
       break;
     }
-    case "artifact_created": {
+    case "artifactcreated": {
+      const artifactId = String(p.artifact_id ?? p.id ?? env.task_id ?? "");
+      if (!artifactId || idx.artifactIds.has(artifactId)) break;
+      idx.artifactIds.add(artifactId);
       messages.push({
         id: env.event_id,
         type: "artifact",
-        artifactId: String(p.artifact_id ?? p.id ?? env.task_id ?? ""),
+        artifactId,
         taskId:
           (env.task_id as string | null) ??
           (p.task_id as string | null) ??
@@ -201,24 +235,192 @@ function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex)
         producedBy:
           (p.produced_by as string | null) ??
           (p.agent as string | null) ??
+          (env.agent_id as string | null) ??
           null,
         createdAt: env.timestamp,
       });
       break;
     }
-    case "task_started": {
+    case "taskstarted": {
+      const owner = agentLabel(env, p);
+      const taskId = env.task_id ?? p.task_id;
       messages.push({
         id: env.event_id,
         type: "status",
         tone: "running",
         text: p.goal
           ? `开始执行：${String(p.goal).slice(0, 80)}`
-          : "任务已启动",
+          : `${owner} 开始执行${taskId ? ` · ${String(taskId)}` : ""}`,
         createdAt: env.timestamp,
       });
       break;
     }
-    case "task_terminated": {
+    case "taskproduced": {
+      const artifactIds = Array.isArray(p.artifact_ids)
+        ? p.artifact_ids.map(String).filter(Boolean)
+        : [];
+      if (!artifactIds.length) {
+        messages.push({
+          id: env.event_id,
+          type: "status",
+          tone: "running",
+          text: `${agentLabel(env, p)} 已提交任务产出，等待验证`,
+          createdAt: env.timestamp,
+        });
+        break;
+      }
+      for (const artifactId of artifactIds) {
+        if (idx.artifactIds.has(artifactId)) continue;
+        idx.artifactIds.add(artifactId);
+        messages.push({
+          id: `${env.event_id}:artifact:${artifactId}`,
+          type: "artifact",
+          artifactId,
+          taskId:
+            (env.task_id as string | null) ??
+            (p.task_id as string | null) ??
+            null,
+          producedBy: agentLabel(env, p),
+          createdAt: env.timestamp,
+        });
+      }
+      break;
+    }
+    case "taskcompleted": {
+      const taskId = env.task_id ?? p.task_id;
+      messages.push({
+        id: env.event_id,
+        type: "status",
+        tone: "ok",
+        text: `${agentLabel(env, p)} 的任务已验证通过${taskId ? ` · ${String(taskId)}` : ""}`,
+        createdAt: env.timestamp,
+      });
+      break;
+    }
+    case "taskfailed": {
+      const taskId = env.task_id ?? p.task_id;
+      const error = String(p.error ?? p.last_error ?? p.reason ?? "").trim();
+      messages.push({
+        id: env.event_id,
+        type: "status",
+        tone: "error",
+        text: `${agentLabel(env, p)} 的任务执行失败${taskId ? ` · ${String(taskId)}` : ""}${error ? `：${error}` : ""}`,
+        createdAt: env.timestamp,
+      });
+      break;
+    }
+    case "taskbudgetexceeded": {
+      const taskId = env.task_id ?? p.task_id;
+      const used = p.used ?? "?";
+      const limit = p.limit ?? "?";
+      messages.push({
+        id: env.event_id,
+        type: "status",
+        tone: "error",
+        text: `${agentLabel(env, p)} 的任务已达到工具调用上限 ${used}/${limit}${taskId ? ` · ${String(taskId)}` : ""}，已停止继续调用`,
+        createdAt: env.timestamp,
+      });
+      break;
+    }
+    case "replanrequested": {
+      const taskId = env.task_id ?? p.task_id;
+      const reason = String(p.reason ?? "").trim();
+      messages.push({
+        id: env.event_id,
+        type: "status",
+        tone: "warn",
+        text: `${agentLabel(env, p)} 请求重新规划${taskId ? ` · ${String(taskId)}` : ""}${reason ? `：${reason}` : ""}`,
+        createdAt: env.timestamp,
+      });
+      break;
+    }
+    case "taskstateconflict": {
+      const taskId = env.task_id ?? p.task_id;
+      messages.push({
+        id: env.event_id,
+        type: "status",
+        tone: "error",
+        text: `已阻止过期执行结果${taskId ? ` · ${String(taskId)}` : ""}（${String(p.transition ?? "state transition")}：${String(p.actual_status ?? "unknown")}）`,
+        createdAt: env.timestamp,
+      });
+      break;
+    }
+    case "artifactverificationcommitfailed": {
+      const taskId = env.task_id ?? p.task_id;
+      messages.push({
+        id: env.event_id,
+        type: "status",
+        tone: "error",
+        text: `产物验证提交失败${taskId ? ` · ${String(taskId)}` : ""}：${String(p.error ?? "unknown error")}`,
+        createdAt: env.timestamp,
+      });
+      break;
+    }
+    case "permissionrequested": {
+      messages.push({
+        id: env.event_id,
+        type: "approval",
+        kind: "permission",
+        requestId: String(p.request_id ?? ""),
+        operation: String(p.operation ?? p.kind ?? "受治理操作"),
+        title: p.title ? String(p.title) : undefined,
+        summary: p.summary ? String(p.summary) : undefined,
+        reason: p.reason ? String(p.reason) : undefined,
+        target: p.target
+          ? String(p.target)
+          : p.parameters
+            ? JSON.stringify(p.parameters)
+            : undefined,
+        status: String(p.status ?? "pending"),
+        createdAt: env.timestamp,
+      });
+      break;
+    }
+    case "agentmessage": {
+      messages.push({
+        id: env.event_id,
+        type: "collaboration",
+        fromAgent: agentLabel(env, p),
+        toAgent: String(
+          p.to_agent_name ?? p.to_agent ?? p.to_agent_id ?? "团队",
+        ),
+        title: p.title ? String(p.title) : null,
+        content: String(
+          p.content ??
+            p.message ??
+            p.summary ??
+            "Agent 已发送一条协作消息",
+        ),
+        taskId:
+          (env.task_id as string | null) ??
+          (p.task_id as string | null) ??
+          null,
+        createdAt: env.timestamp,
+      });
+      break;
+    }
+    case "runcompleted": {
+      messages.push({
+        id: env.event_id,
+        type: "status",
+        tone: "ok",
+        text: String(p.summary ?? p.message ?? "运行已完成"),
+        createdAt: env.timestamp,
+      });
+      break;
+    }
+    case "runfailed": {
+      const error = String(p.error ?? p.reason ?? p.message ?? "").trim();
+      messages.push({
+        id: env.event_id,
+        type: "status",
+        tone: "error",
+        text: error ? `运行失败：${error}` : "运行失败",
+        createdAt: env.timestamp,
+      });
+      break;
+    }
+    case "taskterminated": {
       const status = String(p.status ?? "");
       const tone: "ok" | "warn" | "error" =
         status === "completed" ? "ok" : status === "cancelled" ? "warn" : "error";
@@ -233,7 +435,7 @@ function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex)
       });
       break;
     }
-    case "speaker_selected": {
+    case "speakerselected": {
       // speaker_selected 是噪声事件（每轮都发射），不进入对话流。
       // 用户关心的是工具调用和助手消息，不是谁在发言。
       break;
@@ -286,7 +488,10 @@ export function useChatThread(runId: Ref<string>) {
       for (const env of [...events].sort((a, b) => a.sequence - b.sequence)) {
         applyOne(messages.value, env, idx);
       }
-      afterSequence.value = events.at(-1)?.sequence ?? 0;
+      afterSequence.value = events.reduce(
+        (maximum, event) => Math.max(maximum, event.sequence),
+        0,
+      );
     } catch (e) {
       if (generation !== loadGeneration || runId.value !== id) return;
       error.value = e instanceof Error ? e.message : String(e);

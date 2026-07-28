@@ -199,6 +199,37 @@ def test_verifier_fail_when_no_artifacts():
     assert result.verdict == Verdict.FAIL
 
 
+def test_online_rubric_cannot_pass_without_eligible_artifacts():
+    class AlwaysPassOnlineRubric(LLMRubricVerifier):
+        def __init__(self):
+            super().__init__(model_available=True)
+            self.calls = 0
+
+        def _call_rubric_llm(self, prompt, goal, artifacts):
+            self.calls += 1
+            return ValidationResult(verdict=Verdict.PASS, summary="hallucinated pass")
+
+    rubric = AlwaysPassOnlineRubric()
+    verifier = Verifier(llm_rubric=rubric)
+
+    missing = verifier.validate(goal="claim success", artifacts={})
+    retired = verifier.validate(
+        goal="claim success",
+        artifacts={
+            "artifact:old": {
+                "artifact_id": "old",
+                "status": "superseded",
+                "content": "stale output",
+            }
+        },
+    )
+
+    assert missing.verdict == Verdict.FAIL
+    assert retired.verdict == Verdict.FAIL
+    assert rubric.calls == 0
+    assert missing.failed_criteria[0].criterion == "no_artifacts"
+
+
 def test_verifier_merges_scores():
     verifier = Verifier(
         llm_rubric=LLMRubricVerifier(model_available=False),

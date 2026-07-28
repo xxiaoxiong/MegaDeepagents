@@ -6,6 +6,7 @@ import type {
   ArtifactChatMessage,
   AssistantChatMessage,
   ChatMessage,
+  CollaborationChatMessage,
   StatusChatMessage,
   ToolCallChatMessage,
   UserChatMessage,
@@ -14,6 +15,7 @@ import MarkdownMessage from "./MarkdownMessage.vue";
 import ToolCallCard from "./ToolCallCard.vue";
 import ArtifactCard from "./ArtifactCard.vue";
 import ApprovalCard from "./ApprovalCard.vue";
+import CollaborationCard from "./CollaborationCard.vue";
 import StatusPill from "./StatusPill.vue";
 
 const props = defineProps<{
@@ -41,6 +43,9 @@ function isApproval(m: ChatMessage): m is ApprovalChatMessage {
 function isStatus(m: ChatMessage): m is StatusChatMessage {
   return "type" in m && m.type === "status";
 }
+function isCollaboration(m: ChatMessage): m is CollaborationChatMessage {
+  return "type" in m && m.type === "collaboration";
+}
 
 const userMsg = computed(() =>
   isUser(props.message) ? props.message : null,
@@ -60,6 +65,9 @@ const approvalMsg = computed(() =>
 const statusMsg = computed(() =>
   isStatus(props.message) ? props.message : null,
 );
+const collaborationMsg = computed(() =>
+  isCollaboration(props.message) ? props.message : null,
+);
 </script>
 
 <template>
@@ -75,21 +83,29 @@ const statusMsg = computed(() =>
     v-else-if="assistantMsg && (assistantMsg.content.trim() || assistantMsg.streaming)"
     class="msg-row assistant"
   >
-    <div class="msg-avatar" :title="assistantMsg.agentName ?? 'Agent'">
+    <div
+      class="msg-avatar"
+      :title="assistantMsg.agentName || assistantMsg.agentId || 'Agent'"
+    >
       <Bot :size="16" />
     </div>
-    <div class="msg-bubble assistant-bubble">
-      <span
-        v-if="!assistantMsg.content.trim() && assistantMsg.streaming"
-        class="thinking-dots"
-      >
-        正在思考
+    <div class="assistant-message-stack">
+      <span class="assistant-agent-name">
+        {{ assistantMsg.agentName || assistantMsg.agentId || "Agent" }}
       </span>
-      <MarkdownMessage
-        v-else
-        :content="assistantMsg.content"
-        :streaming="assistantMsg.streaming"
-      />
+      <div class="msg-bubble assistant-bubble">
+        <span
+          v-if="!assistantMsg.content.trim() && assistantMsg.streaming"
+          class="thinking-dots"
+        >
+          正在思考
+        </span>
+        <MarkdownMessage
+          v-else
+          :content="assistantMsg.content"
+          :streaming="assistantMsg.streaming"
+        />
+      </div>
     </div>
   </div>
 
@@ -128,6 +144,16 @@ const statusMsg = computed(() =>
       :reason="approvalMsg.reason"
       :target="approvalMsg.target"
       :status="approvalMsg.status"
+    />
+  </div>
+
+  <div v-else-if="collaborationMsg" class="msg-row inline">
+    <CollaborationCard
+      :from-agent="collaborationMsg.fromAgent"
+      :to-agent="collaborationMsg.toAgent"
+      :title="collaborationMsg.title"
+      :content="collaborationMsg.content"
+      :task-id="collaborationMsg.taskId"
     />
   </div>
 

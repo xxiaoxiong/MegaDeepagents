@@ -141,10 +141,74 @@ class TeamControlPlaneService:
         self._audit("mark_blocked", run_id, agent_id, {"task_id": task_id, "reason": reason})
         return True
 
-    def team_request_replan(self, run_id: str, agent_id: str, reason: str) -> bool:
-        self._caller(run_id, agent_id)
-        self._audit("request_replan", run_id, agent_id, {"reason": reason})
-        return True
+    def team_request_replan(
+        self,
+        run_id: str,
+        agent_id: str,
+        reason: str,
+        task_id: str | None = None,
+    ) -> bool:
+        caller = self._caller(run_id, agent_id)
+        target_task_id = task_id or getattr(caller, "current_task_id", None)
+        tasks = self.board.list_by_run(run_id)
+        if not target_task_id:
+            owned = [
+                task for task in tasks
+                if task.claimed_by == agent_id
+                and task.status not in {
+                    BoardTaskStatus.CANCELLED,
+                    BoardTaskStatus.SUCCEEDED,
+                    BoardTaskStatus.FAILED,
+                }
+            ]
+            if owned:
+                target_task_id = max(
+                    owned,
+                    key=lambda task: (task.updated_at, task.priority),
+                ).task_id
+        if not target_task_id:
+            graph = get_agent_run_history().load_task_graph(run_id)
+            root_task_id = graph.get("root_task_id") if graph else None
+            if root_task_id and self.board.get(root_task_id, run_id=run_id):
+                target_task_id = root_task_id
+        if not target_task_id and tasks:
+            # An idle hook may discover a plan defect immediately after its
+            # task completed.  Fence the most recently touched task so the
+            # root graph routes through its durable replan branch.
+            target_task_id = max(tasks, key=lambda task: task.updated_at).task_id
+
+        previous = (
+            self.board.get(target_task_id, run_id=run_id)
+            if target_task_id
+            else None
+        )
+        previous_status = previous.status.value if previous is not None else None
+        ok = bool(
+            target_task_id
+            and self.board.request_replan(
+                target_task_id,
+                reason,
+                requested_by=agent_id,
+                run_id=run_id,
+            )
+        )
+        payload = {
+            "reason": reason,
+            "task_id": target_task_id,
+            "previous_status": previous_status,
+            "accepted": ok,
+        }
+        self._audit("request_replan", run_id, agent_id, payload)
+        if ok:
+            get_agent_run_history().record_event(
+                event_id=make_run_event_id(),
+                run_id=run_id,
+                event_type="ReplanRequested",
+                agent_id=agent_id,
+                task_id=target_task_id,
+                payload=payload,
+            )
+        return ok
 
     def team_send_message(self, run_id: str, agent_id: str, to_agent_id: str,
                           content: str, title: str = "team_message") -> bool:
@@ -165,8 +229,13 @@ class TeamControlPlaneService:
                     TeammateCommandType.MESSAGE.value, message.model_dump(mode="json"))
             get_lifecycle_hook_engine().emit(LifecycleEvent.AGENT_MESSAGE,
                                              {"run_id": run_id, "agent_id": agent_id,
+                                              "from_agent_id": agent_id,
+                                              "from_agent_name": getattr(sender, "name", agent_id),
                                               "to_agent_id": to_agent_id,
-                                              "message_id": message.message_id})
+                                              "to_agent_name": getattr(target, "name", to_agent_id),
+                                              "message_id": message.message_id,
+                                              "title": title,
+                                              "content": content[:2_000]})
         self._audit("send_message", run_id, agent_id,
                     {"to_agent_id": to_agent_id, "ok": ok, "message_id": message.message_id})
         return ok

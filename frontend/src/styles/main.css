@@ -3998,6 +3998,24 @@ select:focus-visible {
   box-shadow: var(--shadow-sm);
 }
 
+.assistant-message-stack {
+  display: grid;
+  min-width: 0;
+  max-width: calc(100% - 44px);
+  gap: 4px;
+}
+
+.assistant-message-stack .assistant-bubble {
+  max-width: 100%;
+}
+
+.assistant-agent-name {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.01em;
+}
+
 /* "正在思考..." 指示器（streaming 但内容为空时显示，替代空气泡） */
 .thinking-dots {
   display: inline-flex;
@@ -4219,6 +4237,16 @@ select:focus-visible {
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   font-size: 10.5px;
   font-weight: 700;
+  white-space: nowrap;
+}
+
+.tool-agent-name {
+  max-width: 120px;
+  overflow: hidden;
+  color: var(--primary-deep);
+  font-size: 9px;
+  font-weight: 750;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -4486,6 +4514,72 @@ select:focus-visible {
   justify-content: flex-end !important;
   color: var(--muted);
   font-size: 10px;
+}
+
+/* Agent 间协作消息 */
+.collaboration-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+  width: 100%;
+  padding: 9px 11px;
+  color: var(--ink-soft);
+  background: linear-gradient(90deg, rgba(245, 242, 255, 0.92), rgba(244, 251, 249, 0.92));
+  border: 1px solid #ddd9ef;
+  border-radius: 10px;
+}
+
+.collaboration-icon {
+  display: grid;
+  place-items: center;
+  width: 25px;
+  height: 25px;
+  color: var(--primary);
+  background: white;
+  border-radius: 7px;
+}
+
+.collaboration-copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.collaboration-route {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  font-size: 9.5px;
+}
+
+.collaboration-route strong {
+  overflow: hidden;
+  color: var(--primary-deep);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.collaboration-route small {
+  margin-left: auto;
+  color: var(--muted-light);
+  white-space: nowrap;
+}
+
+.collaboration-title {
+  color: var(--ink);
+  font-size: 10.5px;
+  font-weight: 700;
+}
+
+.collaboration-content {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* 状态药丸 */

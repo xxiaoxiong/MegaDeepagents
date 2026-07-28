@@ -282,6 +282,17 @@ export interface ApprovalChatMessage {
   createdAt: string;
 }
 
+export interface CollaborationChatMessage {
+  id: string;
+  type: "collaboration";
+  fromAgent?: string | null;
+  toAgent?: string | null;
+  title?: string | null;
+  content: string;
+  taskId?: string | null;
+  createdAt: string;
+}
+
 export interface StatusChatMessage {
   id: string;
   type: "status";
@@ -296,4 +307,5 @@ export type ChatMessage =
   | ToolCallChatMessage
   | ArtifactChatMessage
   | ApprovalChatMessage
+  | CollaborationChatMessage
   | StatusChatMessage;

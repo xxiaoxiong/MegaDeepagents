@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 
 
 def test_cancelling_an_active_task_never_verifies_it_as_succeeded():
@@ -49,6 +50,251 @@ def test_cancelling_an_active_task_never_verifies_it_as_succeeded():
     assert task.status == BoardTaskStatus.CANCELLED
     assert task.status != BoardTaskStatus.SUCCEEDED
     assert agent.current_task_id is None
+
+
+def test_cancellation_racing_with_produced_transition_rejects_late_artifacts():
+    """A cancel between result receipt and PRODUCED must win the state fence."""
+    from types import SimpleNamespace
+
+    from app.infrastructure.database.run_store import get_agent_run_history
+    from app.multiagent.agent_registry import AgentRegistry
+    from app.multiagent.parallel_scheduler import ParallelTeamScheduler
+    from app.multiagent.task_board import TaskBoard, BoardTaskStatus
+    from app.multiagent.task_graph import TaskGraph, TaskNode
+
+    run_id = "run_cancel_produced_race"
+    board = TaskBoard()
+    registry = AgentRegistry()
+    registry.create_agent(
+        profile_id="coder",
+        name="Coder",
+        role="coder",
+        team_id="team",
+        run_id=run_id,
+        capabilities=["coding"],
+        workspace_root=".",
+    )
+    graph = TaskGraph(root_task_id="write")
+    graph.add_node(TaskNode(
+        id="write",
+        title="write",
+        objective="write a module",
+        required_capabilities=["coding"],
+    ))
+    ParallelTeamScheduler.sync_from_task_graph(graph, board, run_id)
+
+    rejected: list[str] = []
+
+    class EvidenceStore:
+        def mark_rejected(self, artifact_id):
+            rejected.append(artifact_id)
+            return True
+
+    class Worker:
+        def execute_task(self, _dag, task_id, _task_input):
+            return SimpleNamespace(
+                task_id=task_id,
+                success=True,
+                artifact_ids=["artifact_late"],
+                error=None,
+            )
+
+    original_mark_produced = board.mark_produced
+
+    def cancel_before_produced(task_id, agent_id, artifact_ids, run_id=None):
+        assert board.cancel(task_id, "operator_cancelled", run_id=run_id)
+        return original_mark_produced(
+            task_id,
+            agent_id,
+            artifact_ids,
+            run_id=run_id,
+        )
+
+    board.mark_produced = cancel_before_produced
+    scheduler = ParallelTeamScheduler(
+        run_id,
+        task_graph=graph,
+        max_rounds=3,
+        verifier=SimpleNamespace(artifact_store=EvidenceStore()),
+    )
+    scheduler.board = board
+    scheduler.registry = registry
+
+    result = asyncio.run(scheduler.run(Worker()))
+
+    assert result.status == "cancelled"
+    assert board.get("write", run_id=run_id).status == BoardTaskStatus.CANCELLED
+    assert rejected == ["artifact_late"]
+    conflicts = get_agent_run_history().list_events(
+        run_id,
+        event_type="TaskStateConflict",
+    )
+    assert len(conflicts) == 1
+    assert conflicts[0]["payload"]["transition"] == "mark_produced"
+    assert conflicts[0]["payload"]["actual_status"] == "cancelled"
+
+
+def test_cancelling_non_cooperative_worker_returns_without_waiting_for_model():
+    """Scheduler control polling bounds cancel latency for a stuck model call."""
+    from app.multiagent.agent_registry import AgentRegistry
+    from app.multiagent.parallel_scheduler import ParallelTeamScheduler
+    from app.multiagent.task_board import TaskBoard, BoardTaskStatus
+    from app.multiagent.task_graph import TaskGraph, TaskNode
+
+    board = TaskBoard()
+    registry = AgentRegistry()
+    registry.create_agent(
+        profile_id="coder",
+        name="Coder",
+        role="coder",
+        team_id="team",
+        run_id="run_cancel_stuck",
+        capabilities=["coding"],
+        workspace_root=".",
+    )
+    graph = TaskGraph(root_task_id="write")
+    graph.add_node(TaskNode(
+        id="write",
+        title="write",
+        objective="write a module",
+        required_capabilities=["coding"],
+    ))
+    ParallelTeamScheduler.sync_from_task_graph(graph, board, "run_cancel_stuck")
+    cancelled = threading.Event()
+    worker_started = threading.Event()
+
+    class StuckWorker:
+        def execute_task(self, _dag, task_id, _task_input):
+            worker_started.set()
+            time.sleep(3)
+            from app.domain.tasks.models import TaskExecutionResult as TaskResult
+            return TaskResult(task_id=task_id, success=True)
+
+    scheduler = ParallelTeamScheduler(
+        "run_cancel_stuck",
+        task_graph=graph,
+        max_rounds=3,
+        cancel_event=cancelled,
+        task_execution_timeout_seconds=10,
+    )
+    scheduler.board = board
+    scheduler.registry = registry
+
+    async def run_and_cancel():
+        task = asyncio.create_task(scheduler.run(StuckWorker()))
+        await asyncio.to_thread(worker_started.wait, 1)
+        started = time.monotonic()
+        cancelled.set()
+        result = await task
+        return result, time.monotonic() - started
+
+    result, elapsed = asyncio.run(run_and_cancel())
+    assert result.status == "cancelled"
+    assert elapsed < 1.5
+    assert (
+        board.get("write", run_id="run_cancel_stuck").status
+        == BoardTaskStatus.CANCELLED
+    )
+
+
+def test_late_non_cooperative_writes_stay_in_a_disposable_attempt_workspace(
+    tmp_path,
+):
+    """A timed-out thread must never mutate the canonical task workspace."""
+    from pathlib import Path
+
+    from app.multiagent.agent_registry import AgentRegistry
+    from app.multiagent.agent_runtime_manager import get_agent_runtime_manager
+    from app.multiagent.parallel_scheduler import ParallelTeamScheduler
+    from app.multiagent.task_board import TaskBoard, BoardTaskStatus
+    from app.multiagent.task_graph import TaskGraph, TaskNode
+
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    board = TaskBoard()
+    registry = AgentRegistry()
+    registry.create_agent(
+        profile_id="coder",
+        name="Coder",
+        role="coder",
+        team_id="team",
+        run_id="run_quarantine_late_write",
+        capabilities=["coding"],
+        workspace_root=str(run_root),
+    )
+    graph = TaskGraph(root_task_id="write")
+    graph.add_node(TaskNode(
+        id="write",
+        title="write",
+        objective="write a module",
+        required_capabilities=["coding"],
+    ))
+    ParallelTeamScheduler.sync_from_task_graph(
+        graph,
+        board,
+        "run_quarantine_late_write",
+    )
+    cancelled = threading.Event()
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    worker_finished = threading.Event()
+    observed_workspace: list[Path] = []
+
+    class LateWritingWorker:
+        def execute_task(self, _dag, task_id, task_input):
+            workspace = Path(task_input["workspace_root"])
+            observed_workspace.append(workspace)
+            worker_started.set()
+            assert release_worker.wait(timeout=2)
+            target = workspace / "tasks" / task_id / "late.txt"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("stale output", encoding="utf-8")
+            worker_finished.set()
+            from app.domain.tasks.models import (
+                TaskExecutionResult as TaskResult,
+            )
+            return TaskResult(task_id=task_id, success=True)
+
+    scheduler = ParallelTeamScheduler(
+        "run_quarantine_late_write",
+        task_graph=graph,
+        max_rounds=3,
+        cancel_event=cancelled,
+        task_execution_timeout_seconds=10,
+    )
+    scheduler.board = board
+    scheduler.registry = registry
+
+    async def exercise():
+        running = asyncio.create_task(scheduler.run(LateWritingWorker()))
+        assert await asyncio.to_thread(worker_started.wait, 1)
+        cancelled.set()
+        result = await running
+        assert result.status == "cancelled"
+        assert not (run_root / "tasks" / "write" / "late.txt").exists()
+
+        # The underlying thread is still tracked and cancellable until it
+        # genuinely exits, even though the scheduler already returned.
+        active = get_agent_runtime_manager().active_assignments(
+            "run_quarantine_late_write"
+        )
+        assert len(active) == 1
+        assert active[0].lease_id.startswith("lease_")
+
+        release_worker.set()
+        assert await asyncio.to_thread(worker_finished.wait, 1)
+        await asyncio.sleep(0.05)
+
+    asyncio.run(exercise())
+
+    assert observed_workspace
+    assert ".attempts" in observed_workspace[0].parts
+    assert not (run_root / "tasks" / "write" / "late.txt").exists()
+    assert not observed_workspace[0].exists()
+    assert (
+        board.get("write", run_id="run_quarantine_late_write").status
+        == BoardTaskStatus.CANCELLED
+    )
 
 
 def test_mailbox_waiter_is_woken_by_a_different_thread():

@@ -206,18 +206,21 @@ class ArtifactStore:
         """
         artifact_type = type if isinstance(type, ArtifactType) else ArtifactType(type)
         self._safe_path(relative_path)  # validate before persisting metadata
-        content_hash = compute_content_hash(content)
-        size = len(content.encode("utf-8") if isinstance(content, str) else content)
+        # Persist one canonical byte representation on every platform.  Text
+        # mode rewrites ``\n`` to ``\r\n`` on Windows, which made the stored
+        # hash disagree with the actual artifact bytes after publication.
+        content_bytes = content.encode("utf-8") if isinstance(content, str) else content
+        content_hash = compute_content_hash(content_bytes)
+        size = len(content_bytes)
 
         # 确定版本：若存在 parent_artifact_id（修复场景），版本 = parent.version + 1
         version = 1
         predecessor_id = None
+        parent: Artifact | None = None
         if parent_artifact_id and parent_artifact_id in self._registry:
             parent = self._registry[parent_artifact_id]
             version = parent.version + 1
             predecessor_id = parent.id
-            # parent 标 SUPERSEDED（保留以审计，不再消费）
-            parent.status = ArtifactStatus.SUPERSEDED
 
         artifact_id = make_artifact_id()
         artifact = Artifact(
@@ -237,36 +240,33 @@ class ArtifactStore:
         )
 
         # 写入磁盘
-        self._write_to_disk(artifact, content)
+        self._write_to_disk(artifact, content_bytes)
 
-        # 注册到内存
+        # Persist before publishing to the in-process registry.  A Board task
+        # must never succeed with an artifact ID that disappears on restart.
+        from app.infrastructure.database.run_store import get_agent_run_history
+        get_agent_run_history().insert_artifact(
+            artifact_id=artifact.id,
+            run_id=run_id,
+            task_id=task_id,
+            type=artifact_type.value,
+            relative_path=relative_path,
+            content_hash=content_hash,
+            size_bytes=size,
+            version=version,
+            produced_by=produced_by,
+            status="published",
+            predecessor_id=predecessor_id,
+            parent_artifact_id=parent_artifact_id,
+            metadata=metadata,
+            supersede_parent_id=parent.id if parent is not None else None,
+        )
+
+        if parent is not None:
+            parent.status = ArtifactStatus.SUPERSEDED
         self._registry[artifact.id] = artifact
         self._by_task.setdefault(task_id, []).append(artifact.id)
         self._by_run.setdefault(run_id, []).append(artifact.id)
-
-        # 同步写入 SQLite，供跨进程恢复。
-        try:
-            from app.infrastructure.database.run_store import get_agent_run_history
-            from app.multiagent.store import _get_conn
-            # 确保 sqlite 连接存在可写
-            h = get_agent_run_history()
-            h.insert_artifact(
-                artifact_id=artifact.id,
-                run_id=run_id,
-                task_id=task_id,
-                type=artifact_type.value,
-                relative_path=relative_path,
-                content_hash=content_hash,
-                size_bytes=size,
-                version=version,
-                produced_by=produced_by,
-                status="published",
-                predecessor_id=predecessor_id,
-                parent_artifact_id=parent_artifact_id,
-                metadata=metadata,
-            )
-        except Exception as exc:
-            logger.warning(f"[ArtifactStore] SQLite persist failed for {artifact.id}: {exc}")
 
         logger.debug(
             f"[ArtifactStore] create id={artifact.id} type={artifact_type.value} "
@@ -334,10 +334,11 @@ class ArtifactStore:
         fd, temp_name = tempfile.mkstemp(prefix=f".{abs_path.name}.", suffix=".tmp",
                                          dir=abs_path.parent)
         try:
-            mode = "w" if isinstance(content, str) else "wb"
-            kwargs = {"encoding": "utf-8"} if isinstance(content, str) else {}
-            with os.fdopen(fd, mode, **kwargs) as handle:
-                handle.write(content)
+            content_bytes = (
+                content.encode("utf-8") if isinstance(content, str) else content
+            )
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(content_bytes)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp_name, abs_path)
@@ -361,18 +362,22 @@ class ArtifactStore:
         return candidate
 
     # ---- 读取 ----
-    def read(self, artifact_id: str) -> str | None:
-        """读 Artifact 内容；root_path 未启用或文件不存在则返回 None。"""
+    def read_bytes(self, artifact_id: str) -> bytes | None:
+        """Read the exact persisted bytes without assuming a text encoding."""
         artifact = self._registry.get(artifact_id)
-        if artifact is None:
-            return None
-        if not self._root_path:
+        if artifact is None or not self._root_path:
             return None
         abs_path = self._safe_path(artifact.path)
         if not abs_path.is_file():
             return None
-        with abs_path.open("r", encoding="utf-8") as f:
-            return f.read()
+        return abs_path.read_bytes()
+
+    def read(self, artifact_id: str) -> str | None:
+        """Read a safe text preview while preserving binary artifact support."""
+        content = self.read_bytes(artifact_id)
+        if content is None:
+            return None
+        return content.decode("utf-8", errors="replace")
 
     def get(self, artifact_id: str) -> Artifact | None:
         return self._registry.get(artifact_id)
@@ -407,7 +412,7 @@ class ArtifactStore:
         artifact = self._registry.get(artifact_id)
         if artifact is None:
             return False
-        content = self.read(artifact_id)
+        content = self.read_bytes(artifact_id)
         if content is None:
             return False
         return compute_content_hash(content) == artifact.content_hash
@@ -417,24 +422,39 @@ class ArtifactStore:
         a = self._registry.get(artifact_id)
         if a is None:
             return False
+        previous = a.status
         a.status = ArtifactStatus.VERIFIED
-        self._persist_status(a)
+        try:
+            self._persist_status(a)
+        except Exception:
+            a.status = previous
+            raise
         return True
 
     def mark_rejected(self, artifact_id: str) -> bool:
         a = self._registry.get(artifact_id)
         if a is None:
             return False
+        previous = a.status
         a.status = ArtifactStatus.REJECTED
-        self._persist_status(a)
+        try:
+            self._persist_status(a)
+        except Exception:
+            a.status = previous
+            raise
         return True
 
     def supersede(self, artifact_id: str) -> bool:
         a = self._registry.get(artifact_id)
         if a is None:
             return False
+        previous = a.status
         a.status = ArtifactStatus.SUPERSEDED
-        self._persist_status(a)
+        try:
+            self._persist_status(a)
+        except Exception:
+            a.status = previous
+            raise
         return True
 
     def bind_commit(self, artifact_ids: list[str], commit_sha: str) -> int:
@@ -452,16 +472,20 @@ class ArtifactStore:
 
     @staticmethod
     def _persist_status(artifact: Artifact) -> None:
+        from app.multiagent.store import _get_conn
+        import json
+        conn = _get_conn()
         try:
-            from app.multiagent.store import _get_conn
-            import json
-            _get_conn().execute(
+            updated = conn.execute(
                 "UPDATE artifacts SET status=?, metadata=? WHERE artifact_id=?",
                 (artifact.status.value, json.dumps(artifact.metadata), artifact.id),
             )
-            _get_conn().commit()
-        except Exception as exc:
-            logger.warning("[ArtifactStore] persist status failed artifact=%s: %s", artifact.id, exc)
+            if updated.rowcount != 1:
+                raise RuntimeError(f"artifact status row missing: {artifact.id}")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     # ---- 跨 Run 隔离 ----
     def is_in_run(self, artifact_id: str, run_id: str) -> bool:

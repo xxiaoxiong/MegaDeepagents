@@ -86,6 +86,41 @@ class ValidationResult:
     summary: str = ""
 
 
+def _no_artifacts_result() -> ValidationResult:
+    """Return the non-overridable completion failure for missing evidence."""
+    return ValidationResult(
+        verdict=Verdict.FAIL,
+        scores={
+            "completeness": 0.0,
+            "correctness": 0.0,
+            "consistency": 0.0,
+            "evidence": 0.0,
+        },
+        failed_criteria=[
+            CriterionFailure(
+                "no_artifacts",
+                "No eligible durable artifacts are available for verification",
+                severity="high",
+            )
+        ],
+        summary="No eligible artifacts; verification failed closed",
+    )
+
+
+def _eligible_artifacts(
+    artifacts: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Exclude evidence that the artifact lifecycle has already retired."""
+    eligible: dict[str, dict[str, Any]] = {}
+    for key, info in artifacts.items():
+        status = info.get("status")
+        status_value = getattr(status, "value", status)
+        if status_value in {"rejected", "superseded"}:
+            continue
+        eligible[key] = info
+    return eligible
+
+
 @dataclass
 class VerificationCommand:
     kind: str
@@ -339,6 +374,9 @@ class LLMRubricVerifier:
         Returns:
             ValidationResult
         """
+        artifacts = _eligible_artifacts(artifacts)
+        if not artifacts:
+            return _no_artifacts_result()
         if not self._model_available:
             return self._fallback_verify(goal, artifacts)
 
@@ -594,6 +632,11 @@ class Verifier:
         """
         # 接入 ArtifactStore 读取真实文件和元数据。
         artifacts = self._enrich_with_artifact_store(artifacts)
+        artifacts = _eligible_artifacts(artifacts)
+        # Durable evidence is a completion invariant, not a rubric.  A model
+        # verdict or a passing command can never promote an evidence-free task.
+        if not artifacts:
+            return _no_artifacts_result()
         all_results: list[ValidationResult] = []
 
         # 1. 程序化验证

@@ -12,6 +12,7 @@ import pytest
 from app.multiagent.agent_profile import get_capability_registry
 from app.multiagent.agent_registry import get_agent_registry
 from app.multiagent.artifact import ArtifactStatus, ArtifactStore, ArtifactType
+from app.multiagent.control_plane import TeamControlPlaneService
 from app.multiagent.dynamic_team import DynamicTeamManager, TeamBudget
 from app.multiagent.git_workspace import (
     AgentWorktreeManager,
@@ -400,6 +401,108 @@ def test_event_envelopes_are_monotonic_replayable_and_structured():
     assert all_events[0]["payload"] == {"index": 0}
     assert [event["sequence"] for event in
             history.list_event_envelopes("run_events", after_sequence=1)] == [2, 3]
+
+
+def test_team_message_event_is_observable_and_redacted():
+    registry = get_agent_registry()
+    sender = registry.create_agent(
+        profile_id="coder", name="Coder", role="coder", team_id="team",
+        run_id="run_message_event", capabilities=["coding"],
+        workspace_root="/tmp/workspace-v2",
+    )
+    receiver = registry.create_agent(
+        profile_id="tester", name="Tester", role="tester", team_id="team",
+        run_id="run_message_event", capabilities=["testing"],
+        workspace_root="/tmp/workspace-v2",
+    )
+
+    assert TeamControlPlaneService().team_send_message(
+        "run_message_event",
+        sender.agent_id,
+        receiver.agent_id,
+        "Review this result; api_key=abcdefghijk123456",
+        "implementation handoff",
+    )
+
+    event = get_agent_run_history().list_events(
+        "run_message_event", event_type="AgentMessage",
+    )[0]
+    payload = event["payload"]
+    assert payload["from_agent_name"] == "Coder"
+    assert payload["to_agent_name"] == "Tester"
+    assert payload["title"] == "implementation handoff"
+    assert "[REDACTED]" in payload["content"]
+    assert "abcdefghijk123456" not in payload["content"]
+
+
+def test_team_replan_request_is_a_durable_scheduler_fence():
+    run_id = "run_team_replan_control"
+    agent = _agent(run_id=run_id)
+    board = get_task_board()
+    board.create_task(
+        task_id="implementation",
+        run_id=run_id,
+        title="Implementation",
+        objective="implement the original plan",
+        required_capabilities=["coding"],
+    )
+    registry = get_agent_registry()
+    reserved = registry.reserve_idle_agent(
+        run_id,
+        {"coding"},
+        "implementation",
+        preferred_agent_id=agent.agent_id,
+    )
+    assert reserved is not None
+    assert board.claim(
+        "implementation",
+        agent.agent_id,
+        run_id=run_id,
+    ).success
+    assert board.start("implementation", agent.agent_id, run_id=run_id)
+
+    assert TeamControlPlaneService().team_request_replan(
+        run_id,
+        agent.agent_id,
+        "The dependency assumptions are invalid",
+    )
+
+    task = board.get("implementation", run_id=run_id)
+    assert task.status == BoardTaskStatus.REPLAN_REQUIRED
+    assert task.last_error == "The dependency assumptions are invalid"
+    assert task.metadata["replan_requests"][-1]["requested_by"] == agent.agent_id
+    event = get_agent_run_history().list_events(
+        run_id,
+        event_type="ReplanRequested",
+    )[0]
+    assert event["task_id"] == "implementation"
+    assert event["payload"]["previous_status"] == "running"
+    assert event["payload"]["accepted"] is True
+
+
+def test_event_payload_redaction_is_recursive():
+    history = get_agent_run_history()
+    history.record_event(
+        event_id=make_run_event_id(),
+        run_id="run_redaction",
+        event_type="BeforeToolUse",
+        payload={
+            "arguments": {
+                "authorization": "Bearer top-secret",
+                "nested": [{"password": "hunter2"}],
+                "command": "curl '?token=abcdefghijk123456'",
+            },
+            "token_usage": {"input": 42},
+        },
+    )
+
+    payload = history.list_event_envelopes("run_redaction")[0]["payload"]
+    serialized = str(payload)
+    assert "top-secret" not in serialized
+    assert "hunter2" not in serialized
+    assert "abcdefghijk123456" not in serialized
+    assert payload["arguments"]["authorization"] == "[REDACTED]"
+    assert payload["token_usage"] == {"input": 42}
 
 
 def test_tool_side_effect_recovery_never_replays_ambiguous_write():

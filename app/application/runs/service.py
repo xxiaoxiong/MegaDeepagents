@@ -6,7 +6,7 @@ import asyncio
 from typing import Any, Coroutine
 
 from app.core.logging import logger
-from app.domain.runs.models import RunMode
+from app.domain.runs.models import RunMode, RunStatus
 from app.infrastructure.database.run_store import (
     get_agent_run_history,
     make_run_event_id,
@@ -72,15 +72,45 @@ class RunApplicationService:
         ]
 
     async def pause(self, run_id: str) -> bool:
+        run = self.get(run_id)
+        if run is None or run["status"] != RunStatus.RUNNING.value:
+            return False
         return await get_team_runtime().pause_run(run_id)
 
     async def cancel(self, run_id: str) -> bool:
+        run = self.get(run_id)
+        if run is None or run["status"] not in {
+            RunStatus.CREATED.value,
+            RunStatus.RUNNING.value,
+            RunStatus.PAUSED.value,
+            RunStatus.WAITING_HUMAN.value,
+        }:
+            return False
         return await get_team_runtime().cancel_run(run_id)
 
-    async def resume(self, run_id: str) -> bool:
-        if self.get(run_id) is None:
+    async def resume(
+        self,
+        run_id: str,
+        *,
+        decision: str = "continue",
+        feedback: str = "",
+    ) -> bool:
+        run = self.get(run_id)
+        if run is None or run["status"] not in {
+            RunStatus.PAUSED.value,
+            RunStatus.WAITING_HUMAN.value,
+        }:
             return False
-        self._spawn(get_team_runtime().resume_run(run_id), run_id=run_id)
+        self._spawn(
+            get_team_runtime().resume_run(
+                run_id,
+                resume_decision={
+                    "decision": "deny" if decision == "deny" else "approve",
+                    "feedback": feedback,
+                },
+            ),
+            run_id=run_id,
+        )
         return True
 
     async def retry(
@@ -180,9 +210,10 @@ class RunApplicationService:
         return await get_team_runtime().stop_agent(run_id, agent_id)
 
     def recover_incomplete(self) -> int:
-        recoverable = {
-            "created", "running", "waiting_human",
-        }
+        # A waiting_human checkpoint must only continue after an explicit user
+        # decision.  Automatically recovering it would silently approve the
+        # suspended LangGraph interrupt.
+        recoverable = {"created", "running"}
         count = 0
         for record in get_agent_run_history().list_team_runs(500):
             if record.get("status") in recoverable:
