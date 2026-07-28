@@ -49,13 +49,30 @@ class TeamBuilder:
                     "file_read", "file_write", "shell_execute",
                     "web_research", "mcp_access", "default",
                 }
-                stripped = {c for c in caps if c not in TOOL_CAPS}
+                PRIMARY_CAPS = {
+                    "planning", "research", "coding", "testing",
+                    "reviewing", "summarization",
+                }
+                # 二次降级：剥离工具能力 + 未知能力标签（如 LLM 误把
+                # output_artifact_type 的 "config" 当作能力声明），仅保留主角色。
+                stripped = {c for c in caps if c in PRIMARY_CAPS}
                 if stripped and stripped != caps:
                     profile = profiles.find_best_worker(stripped)
                     logger.warning(
                         f"[TeamBuilder] task={node.id} 原始能力{caps}无匹配 Worker，"
-                        f"剥离工具能力后以{stripped}重新匹配到profile={profile.id if profile else None}"
+                        f"剥离非主角色能力后以{stripped}重新匹配到"
+                        f"profile={profile.id if profile else None}"
                     )
+                elif stripped != caps:
+                    # 只有工具/未知能力，没有任何主角色 —— 走原始剥离路径
+                    stripped_tools = {c for c in caps if c not in TOOL_CAPS}
+                    if stripped_tools and stripped_tools != caps:
+                        profile = profiles.find_best_worker(stripped_tools)
+                        logger.warning(
+                            f"[TeamBuilder] task={node.id} 原始能力{caps}无匹配 Worker，"
+                            f"剥离工具能力后以{stripped_tools}重新匹配到"
+                            f"profile={profile.id if profile else None}"
+                        )
             if profile is None:
                 raise RuntimeError(
                     f"no_matching_worker for task={node.id} capabilities={node.required_capabilities}"

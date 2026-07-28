@@ -863,6 +863,20 @@ class DeepAgentExecutor:
         profile = registry.get_profile(task_input.get("profile_id", ""))
         if profile is None:
             profile = registry.find_best_worker(set(node.required_capabilities))
+        if profile is None:
+            # Fallback: strip tool / unknown capabilities, keep only primary role.
+            PRIMARY_CAPS = {
+                "planning", "research", "coding", "testing",
+                "reviewing", "summarization",
+            }
+            stripped = {c for c in node.required_capabilities if c in PRIMARY_CAPS}
+            if stripped and stripped != set(node.required_capabilities):
+                profile = registry.find_best_worker(stripped)
+                logger.warning(
+                    f"[Executor] task={task_id} 原始能力{node.required_capabilities}"
+                    f"无匹配 Worker，剥离非主角色后以{stripped}重新匹配到"
+                    f"profile={profile.id if profile else None}"
+                )
         if profile is None or not set(node.required_capabilities).issubset(profile.capabilities):
             return TaskExecutionResult(
                 task_id=task_id, success=False, artifact_ids=[],

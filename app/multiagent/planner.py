@@ -98,6 +98,8 @@ def _llm_plan_to_taskgraph(json_output: dict | str, goal: str) -> TaskGraph:
         # 同时具备这些角色的 worker。这里只保留**第一个主角色**，再加
         # 上其它"工具能力"（file_read/file_write/shell_execute/web_research/
         # mcp_access），把任务规格收敛到 team 中真实可分配的形态。
+        # 同时过滤掉 LLM 偶尔混入的未知标签（如把 output_artifact_type
+        # 的 "config" 误当作能力声明），避免匹配不到任何 worker。
         PRIMARY_CAPS = {
             "planning", "research", "coding", "testing",
             "reviewing", "summarization",
@@ -106,8 +108,14 @@ def _llm_plan_to_taskgraph(json_output: dict | str, goal: str) -> TaskGraph:
             "file_read", "file_write", "shell_execute",
             "web_research", "mcp_access", "default",
         }
+        KNOWN_CAPS = PRIMARY_CAPS | TOOL_CAPS
         primary_caps = [c for c in caps if c in PRIMARY_CAPS]
         tool_caps = [c for c in caps if c in TOOL_CAPS]
+        unknown_caps = [c for c in caps if c not in KNOWN_CAPS]
+        if unknown_caps:
+            logger.warning(
+                f"[Planner] task {t.get('id')} 声明了未知能力 {unknown_caps}，已过滤。"
+            )
         if len(primary_caps) > 1:
             keep_primary = primary_caps[0]
             logger.warning(

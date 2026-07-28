@@ -145,15 +145,16 @@ class AgentRegistry:
         """
         with self._lock:
             # LLM 偶尔在 task.required_capabilities 里同时声明主角色能力
-            # （planning/coding/...）和工具能力（file_write/...)。Worker
-            # 注册时只声明主角色能力，导致 subset 永远不成立、调度卡死。
-            # 这里在主匹配失败后剥离工具能力再试一遍，与 TeamBuilder 的
+            # （planning/coding/...）和工具能力（file_write/...) 或混入未知
+            # 标签（如 output_artifact_type 的 "config"）。Worker 注册时只声
+            # 明主角色能力，导致 subset 永远不成立、调度卡死。这里在主匹配
+            # 失败后剥离工具 + 未知能力再试一遍，与 TeamBuilder/Executor 的
             # fallback 一致。
-            TOOL_CAPS = {
-                "file_read", "file_write", "shell_execute",
-                "web_research", "mcp_access", "default",
+            PRIMARY_CAPS = {
+                "planning", "research", "coding", "testing",
+                "reviewing", "summarization",
             }
-            stripped = {c for c in required_capabilities if c not in TOOL_CAPS}
+            stripped = {c for c in required_capabilities if c in PRIMARY_CAPS}
             use_caps_list = [required_capabilities]
             if stripped and stripped != required_capabilities:
                 use_caps_list.append(stripped)
