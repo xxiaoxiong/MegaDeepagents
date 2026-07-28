@@ -1,6 +1,7 @@
 """Production invariants for the TASK_TEAM v2 runtime."""
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import threading
@@ -203,6 +204,7 @@ def test_shell_argv_blocks_injection_and_supports_cancellation(tmp_path):
 def test_shell_policy_has_explicit_unix_cmd_and_powershell_boundaries():
     policy = ShellPolicyEngine()
     assert policy.classify(["ls", "-la"]) == CommandCategory.READ_ONLY
+    assert policy.classify(["npm.cmd", "test"]) == CommandCategory.BUILD_TEST
     assert policy.classify(["cmd.exe", "/c", "dir"]) == CommandCategory.READ_ONLY
     assert policy.classify(["cmd.exe", "/c", "dir & del x"]) == CommandCategory.UNKNOWN
     assert policy.classify(
@@ -287,6 +289,66 @@ def test_worktrees_are_isolated_integrate_commits_and_survive_restart(tmp_path):
     assert restarted.get("run_git", "agent_a").worktree_path == a.worktree_path
     with pytest.raises(PermissionError, match="protected branch"):
         integration.push("main", run_id="run_git", agent_id="agent_a")
+
+
+def test_integration_verification_is_discovered_from_repository_manifests(
+    tmp_path,
+    monkeypatch,
+):
+    source = _repository(tmp_path)
+    (source / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\ntestpaths = ['tests']\n",
+        encoding="utf-8",
+    )
+    (source / "tests").mkdir()
+    (source / "tests" / "test_smoke.py").write_text(
+        "def test_smoke():\n    assert True\n",
+        encoding="utf-8",
+    )
+    (source / "frontend").mkdir()
+    (source / "frontend" / "package.json").write_text(
+        json.dumps({
+            "scripts": {
+                "test": "vitest run",
+                "build": "vite build",
+            },
+        }),
+        encoding="utf-8",
+    )
+    (source / "frontend" / "node_modules").mkdir()
+    _git(
+        source,
+        "add",
+        "pyproject.toml",
+        "tests/test_smoke.py",
+        "frontend/package.json",
+    )
+    _git(source, "commit", "-m", "add verification manifests")
+    monkeypatch.setattr(
+        "app.multiagent.git_workspace.shutil.which",
+        lambda executable: f"/runtime/{executable}",
+    )
+
+    repository = RepositoryWorkspaceManager(
+        str(source),
+        str(tmp_path / "run-detect"),
+    )
+    integration = GitIntegrationManager(repository)
+    plan = integration.discover_verification_plan()
+
+    assert plan.missing_requirements == ()
+    assert [check.label for check in plan.checks] == [
+        "Python test suite",
+        "frontend npm test",
+        "frontend npm build",
+    ]
+    assert plan.checks[1].cwd_relative == "frontend"
+    assert plan.checks[1].dependency_source == str(
+        (source / "frontend" / "node_modules").resolve()
+    )
+    python_result = integration.verify_check(plan.checks[0])
+    assert python_result.returncode == 0
+    assert "1 passed" in python_result.stdout
 
 
 def test_worktree_environment_copy_is_explicit_gitignored_and_secret_safe(tmp_path):

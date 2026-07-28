@@ -16,8 +16,8 @@ npm --prefix frontend run build
 - SQLite：旧 Artifact 表迁移、恢复、并发认领和 event sequence。
 - API：创建、边界校验、事件、Artifact 路径安全、脱敏设置。
 - 取消：迟到结果、停止 Agent、冷取消和冷恢复。
-- Git：worktree 隔离、commit/integration 门禁。
-- 前端：API 序列化与错误、SSE reducer 去重排序、状态渲染、生产构建。
+- Git：worktree 隔离、commit/integration 门禁、仓库清单自动发现、验证命令白名单与环境缺失恢复。
+- 前端：API 序列化与错误、SSE reducer 去重排序、流式消息、集成验证状态渲染、生产构建。
 
 `live_model` 和 `real_langsmith` 需要外部凭证，默认跳过。测试专用 Executor 只能通过依赖
 注入进入 Root Graph；生产代码没有 FakeExecutor fallback。

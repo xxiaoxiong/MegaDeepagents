@@ -232,6 +232,7 @@ class GovernedRunGraph:
                 acceptance_criteria=[],
             ),
         ))
+        self._apply_integration_verification_metadata(graph)
         return {
             "phase": "planned",
             "task_graph_json": graph.model_dump_json(),
@@ -269,6 +270,7 @@ class GovernedRunGraph:
                     "status": "failed",
                     "error": f"planner_failed: {last_error}",
                 }
+        self._apply_integration_verification_metadata(graph)
         self._event("planning_completed", {"task_count": len(graph.nodes)})
         return {
             "phase": "planned",
@@ -737,6 +739,19 @@ class GovernedRunGraph:
                     "status": node.status.value,
                 }
         return artifacts
+
+    def _apply_integration_verification_metadata(self, graph: TaskGraph) -> None:
+        """Carry run-level repository checks into the durable root contract."""
+        root = graph.nodes.get(graph.root_task_id)
+        if root is None:
+            return
+        repository = self.ctx.metadata.get("repository") or {}
+        for key in ("integration_test_argv", "integration_test_commands"):
+            value = self.ctx.metadata.get(key)
+            if value is None and isinstance(repository, dict):
+                value = repository.get(key)
+            if value is not None:
+                root.metadata[key] = value
 
     def _workspace_components(self) -> dict[str, Any]:
         repository_meta = self.ctx.metadata.get("repository") or {}

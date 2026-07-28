@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+import math
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from app.core.config import settings
@@ -1627,15 +1629,186 @@ class ParallelTeamScheduler:
                                   "unresolved_merge_conflicts")
         if self.integration_manager is not None:
             root = self.task_graph.nodes.get(self.task_graph.root_task_id) if self.task_graph else None
-            argv = (root.metadata.get("integration_test_argv") if root else None)
-            if not argv:
-                return self._finalize(rounds, ScheduleStatus.FAILED.value,
-                                      "integration_verification_missing")
-            result = self.integration_manager.verify_integration(list(argv))
-            if result.returncode != 0 or result.cancelled or result.timed_out:
-                return self._finalize(rounds, ScheduleStatus.FAILED.value,
-                                      "integration_verification_failed")
+            plan = self._integration_verification_plan(root)
+            for check in plan.checks:
+                payload = check.observable_payload()
+                self._event("IntegrationVerificationStarted", payload=payload)
+                try:
+                    result = self.integration_manager.verify_check(check)
+                except Exception as exc:
+                    self._event("IntegrationVerificationUnavailable", payload={
+                        **payload,
+                        "error": str(exc),
+                    })
+                    return self._finalize(
+                        rounds,
+                        ScheduleStatus.WAITING_HUMAN.value,
+                        "integration_verification_unavailable",
+                    )
+                self._event("IntegrationVerificationCompleted", payload={
+                    **payload,
+                    "returncode": result.returncode,
+                    "cancelled": result.cancelled,
+                    "timed_out": result.timed_out,
+                    "duration_seconds": result.duration_seconds,
+                    "stdout_preview": result.stdout[-2_000:],
+                    "stderr_preview": result.stderr[-2_000:],
+                })
+                if result.returncode != 0 or result.cancelled or result.timed_out:
+                    return self._finalize(
+                        rounds,
+                        ScheduleStatus.FAILED.value,
+                        f"integration_verification_failed:{check.label}",
+                    )
+            if plan.missing_requirements:
+                self._event("IntegrationVerificationUnavailable", payload={
+                    "missing_requirements": list(plan.missing_requirements),
+                    "source": plan.source,
+                })
+                return self._finalize(
+                    rounds,
+                    ScheduleStatus.WAITING_HUMAN.value,
+                    "integration_verification_requirements_missing",
+                )
         return self._finalize(rounds, ScheduleStatus.COMPLETED.value)
+
+    def _integration_verification_plan(self, root: Any) -> Any:
+        from app.multiagent.git_workspace import (
+            IntegrationVerificationCheck,
+            IntegrationVerificationPlan,
+        )
+
+        metadata = root.metadata if root is not None else {}
+        configured = metadata.get("integration_test_commands")
+        if configured is None and metadata.get("integration_test_argv"):
+            configured = [metadata["integration_test_argv"]]
+        if configured is None:
+            return self.integration_manager.discover_verification_plan()
+        if not isinstance(configured, list):
+            return IntegrationVerificationPlan(
+                missing_requirements=("invalid_integration_test_commands",),
+                source="configured",
+            )
+        checks: list[IntegrationVerificationCheck] = []
+        missing: list[str] = []
+        for index, item in enumerate(configured):
+            if isinstance(item, list):
+                argv = item
+                label = f"Configured check {index + 1}"
+                cwd = "."
+                timeout = 300.0
+            elif isinstance(item, dict):
+                argv = item.get("argv")
+                label = str(item.get("label") or f"Configured check {index + 1}")
+                cwd = str(item.get("cwd") or ".")
+                try:
+                    timeout = float(item.get("timeout_seconds") or 300.0)
+                except (TypeError, ValueError):
+                    missing.append(
+                        f"configured_check_{index + 1}:invalid_timeout"
+                    )
+                    continue
+            else:
+                missing.append(f"configured_check_{index + 1}:invalid_shape")
+                continue
+            relative_cwd = Path(cwd.replace("\\", "/"))
+            if (
+                len(cwd) > 512
+                or relative_cwd.is_absolute()
+                or ".." in relative_cwd.parts
+                or (
+                    relative_cwd.parts
+                    and ":" in relative_cwd.parts[0]
+                )
+            ):
+                missing.append(f"configured_check_{index + 1}:unsafe_cwd")
+                continue
+            if not math.isfinite(timeout):
+                missing.append(f"configured_check_{index + 1}:invalid_timeout")
+                continue
+            if (
+                not isinstance(argv, list)
+                or not argv
+                or not all(isinstance(part, str) and part for part in argv)
+            ):
+                missing.append(f"configured_check_{index + 1}:invalid_argv")
+                continue
+            if not self._safe_integration_argv(argv):
+                missing.append(f"configured_check_{index + 1}:unsafe_argv")
+                continue
+            dependency_source = None
+            executable = self._integration_executable(argv[0])
+            dependency_resolver = getattr(
+                self.integration_manager,
+                "node_dependency_source",
+                None,
+            )
+            if (
+                executable in {"npm", "pnpm", "yarn"}
+                and callable(dependency_resolver)
+            ):
+                dependency_source = dependency_resolver(
+                    relative_cwd.as_posix()
+                )
+                if dependency_source is None:
+                    missing.append(
+                        f"configured_check_{index + 1}:"
+                        "node_dependencies_missing"
+                    )
+                    continue
+            checks.append(IntegrationVerificationCheck(
+                label=label,
+                argv=tuple(argv),
+                cwd_relative=relative_cwd.as_posix(),
+                timeout_seconds=max(1.0, min(timeout, 3_600.0)),
+                dependency_source=(
+                    str(dependency_source)
+                    if dependency_source is not None
+                    else None
+                ),
+            ))
+        if not checks and not missing:
+            missing.append("configured_integration_checks_empty")
+        return IntegrationVerificationPlan(
+            checks=tuple(checks),
+            missing_requirements=tuple(missing),
+            source="configured",
+        )
+
+    @staticmethod
+    def _integration_executable(value: str) -> str:
+        executable = value.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        for suffix in (".exe", ".cmd", ".bat"):
+            executable = executable.removesuffix(suffix)
+        return executable
+
+    @classmethod
+    def _safe_integration_argv(cls, argv: list[str]) -> bool:
+        executable = cls._integration_executable(argv[0])
+        args = [part.lower() for part in argv[1:]]
+        if executable in {"pytest"}:
+            return True
+        if executable in {"python", "python3"}:
+            return len(args) >= 2 and args[0] == "-m" and args[1] in {
+                "pytest",
+                "unittest",
+                "compileall",
+            }
+        if executable in {"npm", "pnpm", "yarn"}:
+            scripts = {"test", "build", "lint", "typecheck", "check"}
+            return bool(args) and (
+                args[0] in scripts
+                or len(args) >= 2 and args[0] == "run" and args[1] in scripts
+            )
+        if executable == "cargo":
+            return bool(args) and args[0] in {"test", "check", "clippy"}
+        if executable == "go":
+            return bool(args) and args[0] == "test"
+        if executable in {"mvn", "gradle", "gradlew"}:
+            return any(arg in {"test", "check", "verify"} for arg in args)
+        if executable == "make":
+            return bool(args) and args[0] in {"test", "check", "verify", "lint"}
+        return False
 
     # ===== 任务板与 DAG 同步 =====
 

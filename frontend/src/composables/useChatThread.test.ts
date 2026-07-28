@@ -233,6 +233,35 @@ describe("mapEventsToMessages", () => {
     expect((messages[2] as { text: string }).text).toContain("cancelled");
   });
 
+  it("surfaces repository integration verification progress and recovery", () => {
+    resetSeq();
+    const messages = mapEventsToMessages([
+      env("IntegrationVerificationStarted", {
+        label: "frontend npm test",
+      }),
+      env("IntegrationVerificationCompleted", {
+        label: "frontend npm test",
+        returncode: 0,
+        duration_seconds: 2.4,
+      }),
+      env("IntegrationVerificationUnavailable", {
+        missing_requirements: ["frontend:npm_runtime_unavailable"],
+      }),
+    ]);
+
+    expect(messages).toHaveLength(3);
+    expect(messages[0]).toMatchObject({ type: "status", tone: "running" });
+    expect((messages[0] as { text: string }).text).toContain(
+      "frontend npm test",
+    );
+    expect(messages[1]).toMatchObject({ type: "status", tone: "ok" });
+    expect((messages[1] as { text: string }).text).toContain("2.4");
+    expect(messages[2]).toMatchObject({ type: "status", tone: "warn" });
+    expect((messages[2] as { text: string }).text).toContain(
+      "npm_runtime_unavailable",
+    );
+  });
+
   it("sorts out-of-order events by sequence", () => {
     resetSeq();
     const e1 = env("user_message", { content: "first" });

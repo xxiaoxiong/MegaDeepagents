@@ -307,6 +307,32 @@ def test_incomplete_dispatch_never_reaches_collection_or_verification():
     assert graph._route_after_dispatch({"dispatch_status": "completed"}) == "collect"
 
 
+def test_repository_integration_checks_are_persisted_on_the_root_task(tmp_path):
+    ctx = _context(tmp_path, "Verify the repository after integration")
+    ctx.metadata["repository"] = {
+        "integration_test_commands": [
+            {
+                "label": "Backend",
+                "argv": ["python", "-m", "pytest", "-q"],
+            },
+        ],
+    }
+    task_graph = TaskGraph(root_task_id="implement")
+    task_graph.add_node(TaskNode(
+        id="implement",
+        title="Implement",
+        objective=ctx.user_goal,
+    ))
+    governed = object.__new__(GovernedRunGraph)
+    governed.ctx = ctx
+
+    governed._apply_integration_verification_metadata(task_graph)
+
+    assert task_graph.nodes["implement"].metadata[
+        "integration_test_commands"
+    ] == ctx.metadata["repository"]["integration_test_commands"]
+
+
 def test_run_verifier_rejects_incomplete_task_board_before_calling_judge(tmp_path):
     from app.multiagent.task_board import get_task_board
 

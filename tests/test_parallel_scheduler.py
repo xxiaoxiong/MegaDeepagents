@@ -8,8 +8,10 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import time
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -497,3 +499,90 @@ def test_allow_parallel_false_creates_an_exclusive_dispatch_barrier():
         {object(): "parallel_a"}
     )
     assert {task.task_id for task in wave} == {"parallel_b"}
+
+
+def test_configured_integration_checks_are_allowlisted_and_normalized():
+    from app.multiagent.parallel_scheduler import ParallelTeamScheduler
+
+    scheduler = ParallelTeamScheduler("run_configured_integration")
+    scheduler.integration_manager = SimpleNamespace()
+    root = SimpleNamespace(metadata={
+        "integration_test_commands": [
+            {
+                "label": "Backend",
+                "argv": [sys.executable, "-m", "pytest", "-q"],
+                "cwd": ".",
+                "timeout_seconds": 90,
+            },
+            ["npm.cmd", "run", "build"],
+            ["python", "-c", "raise SystemExit('unsafe')"],
+            {
+                "argv": ["python", "-m", "pytest"],
+                "cwd": "../outside",
+            },
+            {
+                "argv": ["python", "-m", "pytest"],
+                "timeout_seconds": "never",
+            },
+        ],
+    })
+
+    plan = scheduler._integration_verification_plan(root)
+
+    assert plan.source == "configured"
+    assert [check.label for check in plan.checks] == [
+        "Backend",
+        "Configured check 2",
+    ]
+    assert plan.checks[0].timeout_seconds == 90
+    assert plan.missing_requirements == (
+        "configured_check_3:unsafe_argv",
+        "configured_check_4:unsafe_cwd",
+        "configured_check_5:invalid_timeout",
+    )
+
+
+def test_missing_integration_runtime_is_recoverable_and_observable():
+    from app.multiagent.git_workspace import IntegrationVerificationPlan
+    from app.multiagent.parallel_scheduler import ParallelTeamScheduler
+    from app.multiagent.task_graph import TaskGraph, TaskNode
+
+    class MissingRuntimeIntegration:
+        def discover_verification_plan(self):
+            return IntegrationVerificationPlan(
+                missing_requirements=(
+                    "frontend:npm_runtime_unavailable",
+                ),
+            )
+
+        def verify_check(self, _check):
+            raise AssertionError("no unavailable check should execute")
+
+    graph = TaskGraph(root_task_id="root")
+    graph.add_node(TaskNode(
+        id="root",
+        title="Root",
+        objective="verify the integrated repository",
+    ))
+    scheduler = ParallelTeamScheduler(
+        "run_missing_integration",
+        task_graph=graph,
+        integration_manager=MissingRuntimeIntegration(),
+        permission_broker=SimpleNamespace(list_pending=lambda _run_id: []),
+    )
+    events: list[tuple[str, dict[str, Any]]] = []
+    scheduler._event = lambda event_type, **kwargs: events.append(
+        (event_type, kwargs.get("payload", {}))
+    )
+
+    result = scheduler._finalize_verified_run(rounds=2)
+
+    assert result.status == "waiting_human"
+    assert result.error == "integration_verification_requirements_missing"
+    assert any(
+        event_type == "IntegrationVerificationUnavailable"
+        and payload["missing_requirements"] == [
+            "frontend:npm_runtime_unavailable"
+        ]
+        for event_type, payload in events
+    )

@@ -356,6 +356,41 @@ function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex)
       });
       break;
     }
+    case "integrationverificationstarted": {
+      messages.push({
+        id: env.event_id,
+        type: "status",
+        tone: "running",
+        text: `开始仓库级验证：${String(p.label ?? "integration check")}`,
+        createdAt: env.timestamp,
+      });
+      break;
+    }
+    case "integrationverificationcompleted": {
+      const failed =
+        Number(p.returncode ?? 0) !== 0 || p.cancelled === true || p.timed_out === true;
+      messages.push({
+        id: env.event_id,
+        type: "status",
+        tone: failed ? "error" : "ok",
+        text: `${failed ? "仓库级验证失败" : "仓库级验证通过"}：${String(p.label ?? "integration check")}${p.duration_seconds != null ? ` · ${Number(p.duration_seconds).toFixed(1)}s` : ""}`,
+        createdAt: env.timestamp,
+      });
+      break;
+    }
+    case "integrationverificationunavailable": {
+      const missing = Array.isArray(p.missing_requirements)
+        ? p.missing_requirements.map(String).join("、")
+        : String(p.error ?? "缺少验证运行环境");
+      messages.push({
+        id: env.event_id,
+        type: "status",
+        tone: "warn",
+        text: `仓库级验证等待处理：${missing}`,
+        createdAt: env.timestamp,
+      });
+      break;
+    }
     case "permissionrequested": {
       messages.push({
         id: env.event_id,
