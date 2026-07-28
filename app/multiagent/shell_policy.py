@@ -77,7 +77,8 @@ class ShellPolicyEngine:
         # Windows resolves Python and other build tools through ``*.exe``.
         # Classify the basename consistently whether callers pass ``python``
         # or an absolute interpreter path such as ``C:\...\python.exe``.
-        executable = executable.removesuffix(".exe")
+        for suffix in (".exe", ".cmd", ".bat"):
+            executable = executable.removesuffix(suffix)
         if executable in {"powershell", "pwsh"}:
             return self._classify_powershell(argv)
         if executable == "cmd":

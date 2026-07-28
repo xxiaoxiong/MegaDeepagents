@@ -54,6 +54,11 @@ class PlanDecisionBody(BaseModel):
     feedback: str = ""
 
 
+class ResumeRunBody(BaseModel):
+    decision: Literal["continue", "deny"] = "continue"
+    feedback: str = Field(default="", max_length=2_000)
+
+
 class AgentMessageBody(BaseModel):
     content: str = Field(min_length=1, max_length=20_000)
 

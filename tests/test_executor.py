@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from unittest.mock import patch
 
 import pytest
@@ -16,6 +17,7 @@ from app.multiagent.agent_profile import (
     AgentProfile,
     ModelPolicy,
     ToolPolicy,
+    get_capability_registry,
 )
 from app.multiagent.executor import (
     AgentExecutionResult,
@@ -23,10 +25,12 @@ from app.multiagent.executor import (
     ExecutionContext,
     ModelDecisionExecutor,
     TaskAssignment,
+    _TaskToolBudgetGuard,
     _build_boundary_prompt,
     _build_restricted_tools,
     create_executor,
 )
+from app.multiagent.task_graph import OutputContract, TaskGraph, TaskNode
 
 
 # ===== Data classes =====
@@ -36,6 +40,7 @@ def test_task_assignment_defaults():
     a = TaskAssignment(task_id="t1", objective="写一个 API", description="实现 /hello")
     assert a.input_artifact_ids == []
     assert a.max_attempts == 2
+    assert a.output_contract == {}
     assert a.metadata == {}
 
 
@@ -43,6 +48,43 @@ def test_execution_context_defaults():
     ctx = ExecutionContext(run_id="r1", workspace_root="/tmp/ws")
     assert ctx.task_dag is None
     assert ctx.langsmith_trace_id is None
+
+
+def test_tool_budget_is_hard_and_survives_retry_reconstruction():
+    from app.infrastructure.database.run_store import get_agent_run_history
+
+    run_id = f"run_tool_budget_{uuid.uuid4().hex}"
+    first = _TaskToolBudgetGuard(
+        run_id=run_id,
+        task_id="task",
+        agent_id="agent",
+        max_tool_calls=2,
+        safety_point=None,
+    )
+    first.checkpoint()
+    first.checkpoint()
+    with pytest.raises(RuntimeError, match="tool_call_budget_exceeded:2"):
+        first.checkpoint()
+
+    retry = _TaskToolBudgetGuard(
+        run_id=run_id,
+        task_id="task",
+        agent_id="agent",
+        max_tool_calls=2,
+        safety_point=None,
+    )
+    with pytest.raises(RuntimeError, match="tool_call_budget_exceeded:2"):
+        retry.checkpoint()
+
+    consumed = get_agent_run_history().list_events(
+        run_id,
+        event_type="TaskToolBudgetConsumed",
+    )
+    assert [event["payload"]["used"] for event in consumed] == [1, 2]
+    assert get_agent_run_history().list_events(
+        run_id,
+        event_type="TaskBudgetExceeded",
+    )
 
 
 def test_execution_result_default_fields():
@@ -391,6 +433,106 @@ def test_deep_agent_executor_mock_invoke_callback():
     assert result.success is True
     assert result.output_summary == "mocked"
     assert captured == {"task_id": "tX", "profile_id": "c1", "run_id": "rX"}
+
+
+def test_execute_task_passes_delivery_contract_to_worker(tmp_path):
+    executor = DeepAgentExecutor(workspace_root=str(tmp_path))
+    captured = {}
+
+    def mock_invoke(assignment, _profile, _context):
+        captured["contract"] = assignment.output_contract
+        captured["budget"] = assignment.metadata["budget"]
+        return AgentExecutionResult(success=True)
+
+    executor._mock_invoke = mock_invoke
+    registry = get_capability_registry()
+    registry.register(AgentProfile(
+        id="contract-coder",
+        name="Contract Coder",
+        role="coder",
+        capabilities={"coding"},
+        tool_policy=ToolPolicy(
+            allowed_tools=["create_file"],
+            allow_file_write=True,
+        ),
+    ))
+    graph = TaskGraph(root_task_id="root")
+    graph.add_node(TaskNode(
+        id="deliver",
+        title="deliver",
+        objective="implement the deliverable",
+        required_capabilities=["coding"],
+        output_contract=OutputContract(
+            artifact_type="code",
+            description="implementation module",
+            required_artifacts=["src/deliverable.py"],
+            acceptance_criteria=["test: pytest -q"],
+        ),
+    ))
+
+    result = executor.execute_task(
+        graph,
+        "deliver",
+        {"profile_id": "contract-coder", "run_id": "run-contract"},
+    )
+
+    assert result.success is True
+    assert captured["contract"] == {
+        "artifact_type": "code",
+        "description": "implementation module",
+        "acceptance_criteria": ["test: pytest -q"],
+        "required_artifacts": ["src/deliverable.py"],
+        "allow_parallel": True,
+    }
+    assert captured["budget"]["max_seconds"] == 0.0
+
+
+def test_deep_agent_prompt_contains_delivery_contract(monkeypatch, tmp_path):
+    captured = {}
+
+    class LocalAgent:
+        def invoke(self, payload, config=None):
+            captured["payload"] = payload
+            return {"messages": [type("Message", (), {"content": "done"})()]}
+
+    def fake_create_deep_agent(**kwargs):
+        captured["system_prompt"] = kwargs["system_prompt"]
+        return LocalAgent()
+
+    monkeypatch.setattr("deepagents.create_deep_agent", fake_create_deep_agent)
+    monkeypatch.setattr("app.llm_factory.build_model_for_policy", lambda _policy: object())
+    profile = AgentProfile(
+        id="coder",
+        name="Coder",
+        role="coder",
+        tool_policy=ToolPolicy(
+            allowed_tools=["create_file"],
+            allow_file_write=True,
+        ),
+    )
+    assignment = TaskAssignment(
+        task_id="deliver",
+        objective="implement",
+        description="write the module",
+        output_contract={
+            "artifact_type": "code",
+            "description": "implementation module",
+            "required_artifacts": ["src/deliverable.py"],
+            "acceptance_criteria": ["test: pytest -q"],
+        },
+    )
+
+    result = DeepAgentExecutor(workspace_root=str(tmp_path)).execute(
+        assignment,
+        profile,
+        ExecutionContext(run_id="run-contract", workspace_root=str(tmp_path)),
+    )
+
+    assert result.success is True
+    assert "交付契约（必须满足）" in captured["system_prompt"]
+    assert "src/deliverable.py" in captured["system_prompt"]
+    assert "test: pytest -q" in captured["system_prompt"]
+    assert "逐项满足系统消息中的交付契约" in captured["payload"]["messages"][0][1]
 
 
 # ===== AgentExecutor 协议结构兼容性 =====

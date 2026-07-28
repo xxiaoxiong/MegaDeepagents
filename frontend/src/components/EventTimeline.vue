@@ -46,6 +46,13 @@ const showNoise = ref(false);
 const displayLimit = ref(500);
 
 const labels: Record<string, string> = {
+  TaskBudgetExceeded: "任务工具预算已耗尽",
+  TaskStateConflict: "已阻止过期执行结果",
+  ReplanRequested: "Agent 请求重新规划",
+  ArtifactVerificationCommitFailed: "产物验证提交失败",
+  IntegrationVerificationStarted: "开始仓库级验证",
+  IntegrationVerificationCompleted: "仓库级验证完成",
+  IntegrationVerificationUnavailable: "仓库级验证等待处理",
   RunCreated: "运行已创建",
   RunStarted: "运行已启动",
   RunCompleted: "运行已完成",
@@ -120,6 +127,7 @@ const isNoise = (event: EventEnvelope) => {
     "schedulerroundstarted",
     "toolcallstarted",
     "toolcallresult",
+    "tasktoolbudgetconsumed",
   ].includes(type);
 };
 

@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -264,6 +265,32 @@ class MergeQueueItem:
     created_at: datetime = field(default_factory=datetime.utcnow)
 
 
+@dataclass(frozen=True)
+class IntegrationVerificationCheck:
+    """One shell-free verification command against the merged worktree."""
+
+    label: str
+    argv: tuple[str, ...]
+    cwd_relative: str = "."
+    timeout_seconds: float = 300.0
+    dependency_source: str | None = None
+
+    def observable_payload(self) -> dict[str, Any]:
+        return {
+            "label": self.label,
+            "argv": [Path(self.argv[0]).name, *self.argv[1:]],
+            "cwd": self.cwd_relative,
+            "timeout_seconds": self.timeout_seconds,
+        }
+
+
+@dataclass(frozen=True)
+class IntegrationVerificationPlan:
+    checks: tuple[IntegrationVerificationCheck, ...] = ()
+    missing_requirements: tuple[str, ...] = ()
+    source: str = "detected"
+
+
 class MergeQueue:
     def enqueue(self, item: MergeQueueItem) -> None:
         _ensure_schema()
@@ -342,9 +369,206 @@ class GitIntegrationManager:
             item.status = "integrated"
         return item
 
+    def discover_verification_plan(self) -> IntegrationVerificationPlan:
+        """Detect deterministic repository checks without installing packages."""
+        integration_root = Path(self.ensure_integration_worktree()).resolve()
+        checks: list[IntegrationVerificationCheck] = []
+        missing: list[str] = []
+
+        python_markers = {
+            "pyproject.toml",
+            "pytest.ini",
+            "setup.cfg",
+            "tox.ini",
+        }
+        if (
+            (integration_root / "tests").is_dir()
+            or any((integration_root / marker).is_file() for marker in python_markers)
+        ):
+            checks.append(IntegrationVerificationCheck(
+                label="Python test suite",
+                argv=(sys.executable, "-m", "pytest", "-q"),
+                timeout_seconds=600.0,
+            ))
+
+        package_files = [
+            path
+            for path in integration_root.rglob("package.json")
+            if "node_modules" not in path.parts
+            and ".git" not in path.parts
+            and len(path.relative_to(integration_root).parts) <= 3
+        ]
+        for package_file in sorted(package_files):
+            relative_root = package_file.parent.relative_to(integration_root)
+            relative_label = (
+                relative_root.as_posix() if relative_root.parts else "."
+            )
+            try:
+                package = json.loads(package_file.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                missing.append(f"{relative_label}:invalid_package_json:{type(exc).__name__}")
+                continue
+            scripts = package.get("scripts") if isinstance(package, dict) else {}
+            if not isinstance(scripts, dict):
+                scripts = {}
+            script_names: list[str] = []
+            test_script = str(scripts.get("test") or "").strip()
+            if test_script and "no test specified" not in test_script.lower():
+                script_names.append("test")
+            if str(scripts.get("build") or "").strip():
+                script_names.append("build")
+            if not script_names:
+                continue
+
+            manager = self._package_manager_for(package_file.parent, package)
+            executable = shutil.which(manager)
+            if executable is None:
+                missing.append(f"{relative_label}:{manager}_runtime_unavailable")
+                continue
+            dependency_source = self._node_dependency_source(relative_root)
+            if dependency_source is None:
+                missing.append(f"{relative_label}:node_dependencies_missing")
+                continue
+            for script_name in script_names:
+                argv = (
+                    (executable, script_name)
+                    if manager == "npm"
+                    else (executable, "run", script_name)
+                )
+                if manager == "npm" and script_name == "build":
+                    argv = (executable, "run", "build")
+                checks.append(IntegrationVerificationCheck(
+                    label=f"{relative_label} {manager} {script_name}",
+                    argv=argv,
+                    cwd_relative=relative_label,
+                    timeout_seconds=600.0,
+                    dependency_source=str(dependency_source),
+                ))
+
+        cargo = shutil.which("cargo")
+        if (integration_root / "Cargo.toml").is_file():
+            if cargo:
+                checks.append(IntegrationVerificationCheck(
+                    label="Rust test suite",
+                    argv=(cargo, "test"),
+                    timeout_seconds=900.0,
+                ))
+            else:
+                missing.append(".:cargo_runtime_unavailable")
+
+        go = shutil.which("go")
+        if (integration_root / "go.mod").is_file():
+            if go:
+                checks.append(IntegrationVerificationCheck(
+                    label="Go test suite",
+                    argv=(go, "test", "./..."),
+                    timeout_seconds=600.0,
+                ))
+            else:
+                missing.append(".:go_runtime_unavailable")
+
+        if not checks and not missing:
+            missing.append("no_supported_integration_check")
+        return IntegrationVerificationPlan(
+            checks=tuple(checks),
+            missing_requirements=tuple(missing),
+        )
+
+    def _package_manager_for(
+        self,
+        package_root: Path,
+        package: dict[str, Any] | None = None,
+    ) -> str:
+        declared = str((package or {}).get("packageManager") or "")
+        declared_name = declared.split("@", 1)[0].lower()
+        if declared_name in {"npm", "pnpm", "yarn"}:
+            return declared_name
+        integration_root = Path(self.integration_path).resolve()
+        current = package_root.resolve()
+        while current.is_relative_to(integration_root):
+            if (current / "pnpm-lock.yaml").is_file():
+                return "pnpm"
+            if (current / "yarn.lock").is_file():
+                return "yarn"
+            if current == integration_root:
+                break
+            current = current.parent
+        return "npm"
+
+    def _node_dependency_source(self, relative_root: Path) -> Path | None:
+        relative_candidates = [relative_root, *relative_root.parents]
+        for base in (
+            Path(self.integration_path),
+            Path(self.repository.source_repository),
+        ):
+            for relative in relative_candidates:
+                candidate = base / relative / "node_modules"
+                if candidate.is_dir():
+                    return candidate.resolve()
+        worktrees = Path(self.repository.run_workspace) / "worktrees"
+        if worktrees.is_dir():
+            candidates = sorted(
+                (
+                    path / relative / "node_modules"
+                    for path in worktrees.iterdir()
+                    for relative in relative_candidates
+                    if (path / relative / "node_modules").is_dir()
+                ),
+                key=lambda path: path.parent.stat().st_mtime,
+                reverse=True,
+            )
+            if candidates:
+                return candidates[0].resolve()
+        return None
+
+    def node_dependency_source(self, cwd_relative: str) -> Path | None:
+        """Resolve retained Node dependencies without copying or installing."""
+        relative = Path(cwd_relative.replace("\\", "/"))
+        if relative.is_absolute() or ".." in relative.parts:
+            return None
+        return self._node_dependency_source(relative)
+
+    def _verification_cwd(self, relative: str) -> Path:
+        root = Path(self.ensure_integration_worktree()).resolve()
+        candidate = (root / relative).resolve()
+        if not candidate.is_relative_to(root) or not candidate.is_dir():
+            raise ValueError(f"unsafe integration verification cwd: {relative}")
+        return candidate
+
+    def verify_check(self, check: IntegrationVerificationCheck) -> Any:
+        cwd = self._verification_cwd(check.cwd_relative)
+        overlay = cwd / "node_modules"
+        created_overlay = False
+        if check.dependency_source and not overlay.exists():
+            source = Path(check.dependency_source).resolve()
+            if not source.is_dir():
+                raise RuntimeError(
+                    f"integration_dependencies_unavailable:{check.cwd_relative}"
+                )
+            try:
+                overlay.symlink_to(source, target_is_directory=True)
+                created_overlay = True
+            except OSError as exc:
+                raise RuntimeError(
+                    f"integration_dependency_overlay_unavailable:"
+                    f"{check.cwd_relative}:{type(exc).__name__}"
+                ) from exc
+        try:
+            return ShellCommandRunner().run(
+                list(check.argv),
+                cwd=str(cwd),
+                timeout=check.timeout_seconds,
+            )
+        finally:
+            if created_overlay:
+                overlay.unlink(missing_ok=True)
+
     def verify_integration(self, argv: list[str], timeout: float = 300) -> Any:
-        path = self.ensure_integration_worktree()
-        return ShellCommandRunner().run(argv, cwd=path, timeout=timeout)
+        return self.verify_check(IntegrationVerificationCheck(
+            label="Configured integration check",
+            argv=tuple(argv),
+            timeout_seconds=timeout,
+        ))
 
     def push(self, branch: str, *, run_id: str, agent_id: str,
              remote: str = "origin") -> None:

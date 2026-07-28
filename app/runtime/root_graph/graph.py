@@ -11,7 +11,7 @@ from typing import Any
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
-from langgraph.types import interrupt
+from langgraph.types import Command, interrupt
 
 from app.core.config import settings
 from app.core.logging import logger
@@ -135,7 +135,14 @@ class GovernedRunGraph:
         builder.add_edge("fail", END)
         return builder.compile(checkpointer=SqliteSaver(self._checkpoint_connection))
 
-    def invoke(self, *, goal: str, requested_mode: str, resume: bool = False) -> OrchestrationResult:
+    def invoke(
+        self,
+        *,
+        goal: str,
+        requested_mode: str,
+        resume: bool = False,
+        resume_decision: dict[str, Any] | None = None,
+    ) -> OrchestrationResult:
         config = {
             "configurable": {
                 "thread_id": self.ctx.run_id,
@@ -145,7 +152,12 @@ class GovernedRunGraph:
         }
         try:
             if resume:
-                final = self._compiled.invoke(None, config=config)
+                continuation: Any = (
+                    Command(resume=resume_decision)
+                    if resume_decision is not None
+                    else None
+                )
+                final = self._compiled.invoke(continuation, config=config)
             else:
                 initial: AgentRunState = {
                 "run_id": self.ctx.run_id,
@@ -220,7 +232,7 @@ class GovernedRunGraph:
                 acceptance_criteria=[],
             ),
         ))
-        self._persist_graph(graph)
+        self._apply_integration_verification_metadata(graph)
         return {
             "phase": "planned",
             "task_graph_json": graph.model_dump_json(),
@@ -258,7 +270,7 @@ class GovernedRunGraph:
                     "status": "failed",
                     "error": f"planner_failed: {last_error}",
                 }
-        self._persist_graph(graph)
+        self._apply_integration_verification_metadata(graph)
         self._event("planning_completed", {"task_count": len(graph.nodes)})
         return {
             "phase": "planned",
@@ -308,7 +320,10 @@ class GovernedRunGraph:
             from app.multiagent.parallel_scheduler import ParallelTeamScheduler
             from app.multiagent.transactional_task_service import TransactionalTaskService
 
-            TransactionalTaskService().register_initial_graph(self.ctx.run_id, graph)
+            registration = TransactionalTaskService().register_initial_graph(
+                self.ctx.run_id, graph,
+            )
+            graph = registration.graph
             scheduler = ParallelTeamScheduler(
                 run_id=self.ctx.run_id,
                 task_graph=graph,
@@ -319,6 +334,7 @@ class GovernedRunGraph:
                 **self._workspace_components(),
             )
             result = asyncio.run(scheduler.run(self.executor))
+            graph = scheduler.task_graph or graph
             self._sync_board_to_graph(graph)
             self._persist_graph(graph)
             self._event("dispatch_completed", result.to_dict())
@@ -349,9 +365,12 @@ class GovernedRunGraph:
             "active_task_ids": [
                 task.task_id for task in tasks
                 if task.status in (BoardTaskStatus.CLAIMED, BoardTaskStatus.RUNNING)
+                and not task.metadata.get("superseded_by_plan_revision")
             ],
             "completed_task_ids": [
-                task.task_id for task in tasks if task.status == BoardTaskStatus.SUCCEEDED
+                task.task_id for task in tasks
+                if task.status == BoardTaskStatus.SUCCEEDED
+                and not task.metadata.get("superseded_by_plan_revision")
             ],
             "blocked_task_ids": [
                 task.task_id for task in tasks
@@ -360,6 +379,7 @@ class GovernedRunGraph:
                     BoardTaskStatus.REPAIR_REQUIRED,
                     BoardTaskStatus.REPLAN_REQUIRED,
                 )
+                and not task.metadata.get("superseded_by_plan_revision")
             ],
             "task_graph_json": graph.model_dump_json(),
         }
@@ -372,6 +392,49 @@ class GovernedRunGraph:
 
     def _verify(self, state: AgentRunState) -> dict[str, Any]:
         graph = self._load_graph(state)
+        from app.multiagent.task_board import BoardTaskStatus, get_task_board
+
+        board_tasks = get_task_board().list_by_run(self.ctx.run_id)
+        incomplete_tasks = [
+            task
+            for task in board_tasks
+            if not task.metadata.get("superseded_by_repair")
+            and not task.metadata.get("superseded_by_plan_revision")
+            and task.status != BoardTaskStatus.SUCCEEDED
+        ]
+        if not board_tasks or incomplete_tasks:
+            failed_task_ids = [task.task_id for task in incomplete_tasks]
+            reason = (
+                "task_board_empty"
+                if not board_tasks
+                else f"tasks_not_succeeded:{failed_task_ids}"
+            )
+            summary = {
+                "verdict": "fail",
+                "summary": (
+                    "Run-level verification is blocked until every current "
+                    "non-superseded TaskBoard task is SUCCEEDED"
+                ),
+                "scores": {"task_completion": 0.0},
+                "failed_criteria": [
+                    {
+                        "criterion": "task_board_completion",
+                        "detail": reason,
+                        "severity": "high",
+                    }
+                ],
+                "proposed_tasks": [],
+            }
+            self._event("verification_precondition_failed", {
+                "reason": reason,
+                "task_count": len(board_tasks),
+                "failed_task_ids": failed_task_ids,
+            })
+            return {
+                "phase": "verification_failed",
+                "verification_summary": summary,
+                "error": reason,
+            }
         artifacts = self._verification_artifacts(graph)
         try:
             result = self.verifier.validate(goal=state["goal"], artifacts=artifacts)
@@ -425,6 +488,7 @@ class GovernedRunGraph:
             task for task in board.list_by_run(self.ctx.run_id)
             if task.status == BoardTaskStatus.REPAIR_REQUIRED
             and not task.metadata.get("superseded_by_repair")
+            and not task.metadata.get("superseded_by_plan_revision")
         ]
         if not candidates:
             # Whole-run verification happens after every worker task passed.
@@ -440,6 +504,7 @@ class GovernedRunGraph:
                 if task.status == BoardTaskStatus.SUCCEEDED
                 and task.task_id not in depended_on
                 and not task.metadata.get("superseded_by_repair")
+                and not task.metadata.get("superseded_by_plan_revision")
             ]
         for task in candidates:
             before = set(graph.nodes)
@@ -453,6 +518,13 @@ class GovernedRunGraph:
             )
             graph = mutation.graph
             created.extend(sorted(set(graph.nodes) - before))
+            artifact_store = getattr(self.verifier, "artifact_store", None)
+            if artifact_store is not None:
+                for artifact_id in task.produced_artifact_ids:
+                    # Failed evidence remains readable through the explicit
+                    # repair contract, but it must not be eligible for the
+                    # next whole-run PASS decision.
+                    artifact_store.mark_rejected(artifact_id)
         if not created:
             return {"status": "failed", "error": "repair_requested_without_repairable_tasks"}
         self._persist_graph(graph)
@@ -470,6 +542,11 @@ class GovernedRunGraph:
         }
 
     def _replan(self, state: AgentRunState) -> dict[str, Any]:
+        artifact_store = getattr(self.verifier, "artifact_store", None)
+        if artifact_store is not None:
+            for artifact in artifact_store.list_by_run(self.ctx.run_id):
+                if artifact.status.value in {"published", "verified"}:
+                    artifact_store.mark_rejected(artifact.id)
         self._event("replan_requested", {
             "repair_round": int(state.get("repair_round", 0)) + 1,
             "verification": state.get("verification_summary", {}),
@@ -512,9 +589,17 @@ class GovernedRunGraph:
 
         board = get_task_board()
         for task in board.list_by_run(self.ctx.run_id):
-            if task.status in (BoardTaskStatus.PRODUCED, BoardTaskStatus.VERIFYING):
-                board.mark_verifying(task.task_id, run_id=self.ctx.run_id)
-                board.mark_verified(task.task_id, run_id=self.ctx.run_id)
+            if task.status == BoardTaskStatus.PRODUCED:
+                if not board.mark_verifying(task.task_id, run_id=self.ctx.run_id):
+                    raise RuntimeError(
+                        f"finalize_state_conflict:{task.task_id}:mark_verifying"
+                    )
+            current = board.get(task.task_id, run_id=self.ctx.run_id)
+            if current is not None and current.status == BoardTaskStatus.VERIFYING:
+                if not board.mark_verified(task.task_id, run_id=self.ctx.run_id):
+                    raise RuntimeError(
+                        f"finalize_state_conflict:{task.task_id}:mark_verified"
+                    )
         self._sync_board_to_graph(graph)
         self._persist_graph(graph)
         summary = state.get("verification_summary", {}).get("summary") or (
@@ -548,7 +633,7 @@ class GovernedRunGraph:
             return "human"
         if status == "paused":
             return "human"
-        if status in {"completed", "incomplete"}:
+        if status == "completed":
             return "collect"
         return "fail"
 
@@ -655,6 +740,19 @@ class GovernedRunGraph:
                 }
         return artifacts
 
+    def _apply_integration_verification_metadata(self, graph: TaskGraph) -> None:
+        """Carry run-level repository checks into the durable root contract."""
+        root = graph.nodes.get(graph.root_task_id)
+        if root is None:
+            return
+        repository = self.ctx.metadata.get("repository") or {}
+        for key in ("integration_test_argv", "integration_test_commands"):
+            value = self.ctx.metadata.get(key)
+            if value is None and isinstance(repository, dict):
+                value = repository.get(key)
+            if value is not None:
+                root.metadata[key] = value
+
     def _workspace_components(self) -> dict[str, Any]:
         repository_meta = self.ctx.metadata.get("repository") or {}
         source = repository_meta.get("source_repository_path")
@@ -727,6 +825,7 @@ def run_governed(
     cancel_event: Any | None = None,
     task_graph: TaskGraph | None = None,
     resume: bool = False,
+    resume_decision: dict[str, Any] | None = None,
     max_rounds: int = 30,
 ) -> OrchestrationResult:
     return GovernedRunGraph(
@@ -737,4 +836,9 @@ def run_governed(
         cancel_event=cancel_event,
         task_graph=task_graph,
         max_rounds=max_rounds,
-    ).invoke(goal=goal, requested_mode=requested_mode, resume=resume)
+    ).invoke(
+        goal=goal,
+        requested_mode=requested_mode,
+        resume=resume,
+        resume_decision=resume_decision,
+    )

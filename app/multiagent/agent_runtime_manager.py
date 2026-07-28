@@ -8,19 +8,25 @@ cooperative cancellation signal to the Facade and executor tools.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
+import re
+import shutil
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any
 
 
 @dataclass(frozen=True)
 class ActiveAssignment:
+    lease_id: str
     run_id: str
     task_id: str
     agent_id: str
     session_id: str
     thread_id: str
+    workspace_root: str
 
 
 class CancellationToken:
@@ -67,7 +73,9 @@ class AgentRuntimeManager:
     """
 
     def __init__(self) -> None:
-        self._active: dict[tuple[str, str], tuple[ActiveAssignment, CancellationToken, Any]] = {}
+        self._active: dict[
+            str, tuple[ActiveAssignment, CancellationToken, Any]
+        ] = {}
         self._lock = threading.RLock()
 
     async def execute_assignment(
@@ -80,10 +88,20 @@ class AgentRuntimeManager:
         cancel_event: Any,
         agent_registry: Any,
     ) -> Any:
+        lease_id = "lease_" + uuid.uuid4().hex
+        attempt_workspace = self._prepare_attempt_workspace(
+            task_input,
+            lease_id=lease_id,
+            task_id=task_id,
+        )
         assignment = ActiveAssignment(
+            lease_id=lease_id,
             run_id=task_input["run_id"], task_id=task_id,
             agent_id=task_input["agent_id"], session_id=task_input["session_id"],
             thread_id=task_input["thread_id"],
+            workspace_root=str(
+                attempt_workspace or task_input.get("workspace_root") or ""
+            ),
         )
         # The assignment token reaches tools and is controlled separately for
         # run cancellation and a single teammate stop.  Mutate the caller's
@@ -91,14 +109,74 @@ class AgentRuntimeManager:
         # after the worker returns before it can verify any result.
         token = CancellationToken(cancel_event)
         task_input["cancel_event"] = token
-        key = (assignment.run_id, assignment.task_id)
+        task_input["assignment_lease_id"] = lease_id
         with self._lock:
-            self._active[key] = (assignment, token, agent_registry)
-        try:
-            return await asyncio.to_thread(executor.execute_task, task_graph, task_id, task_input)
-        finally:
-            with self._lock:
-                self._active.pop(key, None)
+            self._active[lease_id] = (assignment, token, agent_registry)
+
+        def execute_in_lease() -> Any:
+            try:
+                return executor.execute_task(task_graph, task_id, task_input)
+            finally:
+                # Coroutine cancellation cannot stop a Python worker thread.
+                # Ownership and cleanup therefore live in the worker wrapper,
+                # which runs only after the underlying executor truly exits.
+                with self._lock:
+                    self._active.pop(lease_id, None)
+                self._cleanup_attempt_workspace(attempt_workspace)
+
+        return await asyncio.to_thread(execute_in_lease)
+
+    @staticmethod
+    def _safe_segment(value: str) -> str:
+        normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", value).strip("._")
+        return normalized[:96] or "task"
+
+    def _prepare_attempt_workspace(
+        self,
+        task_input: dict[str, Any],
+        *,
+        lease_id: str,
+        task_id: str,
+    ) -> Path | None:
+        """Fence non-git workers inside one disposable attempt root.
+
+        Git-backed assignments already execute in an isolated worktree and
+        are fenced by the merge queue, so changing their root would break git
+        semantics.  Normal workspace assignments use an attempt root while
+        ArtifactStore remains rooted at the canonical Run workspace.
+        """
+        if task_input.get("worktree_mode"):
+            return None
+        raw_root = str(task_input.get("workspace_root") or "").strip()
+        if not raw_root:
+            return None
+        canonical_root = Path(raw_root).resolve()
+        attempts_root = (canonical_root / ".attempts").resolve()
+        attempt_workspace = (
+            attempts_root
+            / self._safe_segment(task_id)
+            / self._safe_segment(lease_id)
+        ).resolve()
+        if not attempt_workspace.is_relative_to(attempts_root):
+            raise ValueError("attempt workspace escapes the run workspace")
+        attempt_workspace.mkdir(parents=True, exist_ok=False)
+        task_input["canonical_workspace_root"] = str(canonical_root)
+        task_input["workspace_root"] = str(attempt_workspace)
+        return attempt_workspace
+
+    @staticmethod
+    def _cleanup_attempt_workspace(attempt_workspace: Path | None) -> None:
+        if attempt_workspace is None:
+            return
+        attempts_root = attempt_workspace.parent.parent.resolve()
+        resolved = attempt_workspace.resolve()
+        if (
+            resolved == attempts_root
+            or not resolved.is_relative_to(attempts_root)
+            or attempts_root.name != ".attempts"
+        ):
+            return
+        shutil.rmtree(resolved, ignore_errors=True)
 
     def active_assignments(self, run_id: str | None = None) -> list[ActiveAssignment]:
         with self._lock:
@@ -110,7 +188,11 @@ class AgentRuntimeManager:
     def cancel_run(self, run_id: str) -> int:
         """Signal all live assignments in a run without crossing event loops."""
         with self._lock:
-            matching = [event for assignment, event, _ in self._active.values() if assignment.run_id == run_id]
+            matching = [
+                event
+                for assignment, event, _ in self._active.values()
+                if assignment.run_id == run_id
+            ]
         for event in matching:
             event.set()
         return len(matching)

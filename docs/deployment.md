@@ -49,8 +49,10 @@ API 地址、模型密钥或运行时环境变量。
 
 ## 自托管运行时
 
-`Dockerfile` 会先构建 Vue，再把 `frontend/dist` 复制到 Python 镜像。访问后端根路径即可
-打开运行控制台，API 使用同源地址。公共官网和运行控制台刻意分离。
+`Dockerfile` 会先构建 Vue，再把 `frontend/dist` 复制到 Python 镜像。运行镜像同时包含
+Git、Node 和 npm，供 Agent 和仓库级门禁验证常见 Python/Node 项目；pnpm、yarn、Rust、
+Go 等运行时需要在派生镜像中显式安装。访问后端根路径即可打开运行控制台，API 使用同源
+地址。公共官网和运行控制台刻意分离。
 
 ## 健康检查
 

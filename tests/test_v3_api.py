@@ -114,3 +114,150 @@ async def test_background_failure_is_persisted(monkeypatch):
     event = next(item for kind, item in recorded if kind == "event")
     assert event["event_type"] == "RunFailed"
     assert event["payload"]["error_type"] == "RuntimeError"
+
+
+@pytest.mark.asyncio
+async def test_run_controls_reject_illegal_or_duplicate_transitions(monkeypatch):
+    """Public controls cannot regress terminal state or start a second runner."""
+    calls: list[tuple[str, str]] = []
+
+    class Runtime:
+        async def pause_run(self, run_id):
+            calls.append(("pause", run_id))
+            return True
+
+        async def cancel_run(self, run_id):
+            calls.append(("cancel", run_id))
+            return True
+
+        async def resume_run(self, run_id, *, resume_decision=None):
+            calls.append(("resume", run_id))
+            return True
+
+    monkeypatch.setattr(
+        "app.application.runs.service.get_team_runtime",
+        lambda: Runtime(),
+    )
+    service = RunApplicationService()
+    spawned: list[str] = []
+
+    def capture_spawn(coroutine, *, run_id):
+        spawned.append(run_id)
+        coroutine.close()
+
+    monkeypatch.setattr(service, "_spawn", capture_spawn)
+
+    monkeypatch.setattr(service, "get", lambda _run_id: {"status": "succeeded"})
+    assert await service.pause("run_terminal") is False
+    assert await service.cancel("run_terminal") is False
+    assert await service.resume("run_terminal") is False
+
+    monkeypatch.setattr(service, "get", lambda _run_id: {"status": "running"})
+    assert await service.resume("run_live") is False
+    assert await service.pause("run_live") is True
+
+    monkeypatch.setattr(service, "get", lambda _run_id: {"status": "paused"})
+    assert await service.pause("run_paused") is False
+    assert await service.resume("run_paused") is True
+    assert await service.cancel("run_paused") is True
+
+    assert calls == [("pause", "run_live"), ("cancel", "run_paused")]
+    assert spawned == ["run_paused"]
+
+
+@pytest.mark.asyncio
+async def test_resume_forwards_an_explicit_human_decision(monkeypatch):
+    calls: list[tuple[str, dict[str, str] | None]] = []
+
+    class Runtime:
+        async def resume_run(self, run_id, *, resume_decision=None):
+            calls.append((run_id, resume_decision))
+            return True
+
+    monkeypatch.setattr(
+        "app.application.runs.service.get_team_runtime",
+        lambda: Runtime(),
+    )
+    service = RunApplicationService()
+    monkeypatch.setattr(
+        service,
+        "get",
+        lambda _run_id: {"status": "waiting_human"},
+    )
+    spawned = []
+
+    def capture_spawn(coroutine, *, run_id):
+        spawned.append((run_id, coroutine))
+
+    monkeypatch.setattr(service, "_spawn", capture_spawn)
+
+    assert await service.resume(
+        "run_waiting",
+        decision="deny",
+        feedback="The proposed plan is unsafe.",
+    )
+    assert spawned[0][0] == "run_waiting"
+    await spawned[0][1]
+    assert calls == [(
+        "run_waiting",
+        {
+            "decision": "deny",
+            "feedback": "The proposed plan is unsafe.",
+        },
+    )]
+
+
+def test_resume_api_accepts_decision_payload(monkeypatch):
+    calls: list[tuple[str, str, str]] = []
+
+    async def resume(run_id, *, decision="continue", feedback=""):
+        calls.append((run_id, decision, feedback))
+        return True
+
+    service = get_run_service()
+    monkeypatch.setattr(service, "get", lambda _run_id: {"run_id": "run_waiting"})
+    monkeypatch.setattr(service, "resume", resume)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/runs/run_waiting/resume",
+            json={"decision": "deny", "feedback": "Revise the plan."},
+        )
+
+    assert response.status_code == 202
+    assert calls == [("run_waiting", "deny", "Revise the plan.")]
+
+
+def test_startup_recovery_never_auto_approves_waiting_human(monkeypatch):
+    class History:
+        def list_team_runs(self, _limit):
+            return [
+                {"run_id": "run_created", "status": "created"},
+                {"run_id": "run_running", "status": "running"},
+                {"run_id": "run_waiting", "status": "waiting_human"},
+                {"run_id": "run_paused", "status": "paused"},
+            ]
+
+    class Runtime:
+        async def resume_run(self, run_id):
+            return run_id
+
+    monkeypatch.setattr(
+        "app.application.runs.service.get_agent_run_history",
+        lambda: History(),
+    )
+    monkeypatch.setattr(
+        "app.application.runs.service.get_team_runtime",
+        lambda: Runtime(),
+    )
+    service = RunApplicationService()
+    spawned: list[str] = []
+
+    def capture_spawn(coroutine, *, run_id):
+        spawned.append(run_id)
+        coroutine.close()
+
+    monkeypatch.setattr(service, "_spawn", capture_spawn)
+
+    assert service.recover_incomplete() == 2
+    assert spawned == ["run_created", "run_running"]

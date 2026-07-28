@@ -131,5 +131,6 @@ LangGraph、SQLite 或本地 worktree。自托管 Docker 镜像同时提供持�
 - [部署](docs/deployment.md)
 - [数据库](docs/database.md)
 - [可观测性与恢复](docs/observability.md)
+- [仓库级集成验证](docs/repository-verification.md)
 - [V3 迁移](docs/migration-v3.md)
 - [重构审计](docs/refactor-v3/00-current-runtime-audit.md)

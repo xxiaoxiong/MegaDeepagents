@@ -1,6 +1,7 @@
 """Production invariants for the TASK_TEAM v2 runtime."""
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import threading
@@ -12,6 +13,7 @@ import pytest
 from app.multiagent.agent_profile import get_capability_registry
 from app.multiagent.agent_registry import get_agent_registry
 from app.multiagent.artifact import ArtifactStatus, ArtifactStore, ArtifactType
+from app.multiagent.control_plane import TeamControlPlaneService
 from app.multiagent.dynamic_team import DynamicTeamManager, TeamBudget
 from app.multiagent.git_workspace import (
     AgentWorktreeManager,
@@ -202,6 +204,7 @@ def test_shell_argv_blocks_injection_and_supports_cancellation(tmp_path):
 def test_shell_policy_has_explicit_unix_cmd_and_powershell_boundaries():
     policy = ShellPolicyEngine()
     assert policy.classify(["ls", "-la"]) == CommandCategory.READ_ONLY
+    assert policy.classify(["npm.cmd", "test"]) == CommandCategory.BUILD_TEST
     assert policy.classify(["cmd.exe", "/c", "dir"]) == CommandCategory.READ_ONLY
     assert policy.classify(["cmd.exe", "/c", "dir & del x"]) == CommandCategory.UNKNOWN
     assert policy.classify(
@@ -286,6 +289,66 @@ def test_worktrees_are_isolated_integrate_commits_and_survive_restart(tmp_path):
     assert restarted.get("run_git", "agent_a").worktree_path == a.worktree_path
     with pytest.raises(PermissionError, match="protected branch"):
         integration.push("main", run_id="run_git", agent_id="agent_a")
+
+
+def test_integration_verification_is_discovered_from_repository_manifests(
+    tmp_path,
+    monkeypatch,
+):
+    source = _repository(tmp_path)
+    (source / "pyproject.toml").write_text(
+        "[tool.pytest.ini_options]\ntestpaths = ['tests']\n",
+        encoding="utf-8",
+    )
+    (source / "tests").mkdir()
+    (source / "tests" / "test_smoke.py").write_text(
+        "def test_smoke():\n    assert True\n",
+        encoding="utf-8",
+    )
+    (source / "frontend").mkdir()
+    (source / "frontend" / "package.json").write_text(
+        json.dumps({
+            "scripts": {
+                "test": "vitest run",
+                "build": "vite build",
+            },
+        }),
+        encoding="utf-8",
+    )
+    (source / "frontend" / "node_modules").mkdir()
+    _git(
+        source,
+        "add",
+        "pyproject.toml",
+        "tests/test_smoke.py",
+        "frontend/package.json",
+    )
+    _git(source, "commit", "-m", "add verification manifests")
+    monkeypatch.setattr(
+        "app.multiagent.git_workspace.shutil.which",
+        lambda executable: f"/runtime/{executable}",
+    )
+
+    repository = RepositoryWorkspaceManager(
+        str(source),
+        str(tmp_path / "run-detect"),
+    )
+    integration = GitIntegrationManager(repository)
+    plan = integration.discover_verification_plan()
+
+    assert plan.missing_requirements == ()
+    assert [check.label for check in plan.checks] == [
+        "Python test suite",
+        "frontend npm test",
+        "frontend npm build",
+    ]
+    assert plan.checks[1].cwd_relative == "frontend"
+    assert plan.checks[1].dependency_source == str(
+        (source / "frontend" / "node_modules").resolve()
+    )
+    python_result = integration.verify_check(plan.checks[0])
+    assert python_result.returncode == 0
+    assert "1 passed" in python_result.stdout
 
 
 def test_worktree_environment_copy_is_explicit_gitignored_and_secret_safe(tmp_path):
@@ -400,6 +463,108 @@ def test_event_envelopes_are_monotonic_replayable_and_structured():
     assert all_events[0]["payload"] == {"index": 0}
     assert [event["sequence"] for event in
             history.list_event_envelopes("run_events", after_sequence=1)] == [2, 3]
+
+
+def test_team_message_event_is_observable_and_redacted():
+    registry = get_agent_registry()
+    sender = registry.create_agent(
+        profile_id="coder", name="Coder", role="coder", team_id="team",
+        run_id="run_message_event", capabilities=["coding"],
+        workspace_root="/tmp/workspace-v2",
+    )
+    receiver = registry.create_agent(
+        profile_id="tester", name="Tester", role="tester", team_id="team",
+        run_id="run_message_event", capabilities=["testing"],
+        workspace_root="/tmp/workspace-v2",
+    )
+
+    assert TeamControlPlaneService().team_send_message(
+        "run_message_event",
+        sender.agent_id,
+        receiver.agent_id,
+        "Review this result; api_key=abcdefghijk123456",
+        "implementation handoff",
+    )
+
+    event = get_agent_run_history().list_events(
+        "run_message_event", event_type="AgentMessage",
+    )[0]
+    payload = event["payload"]
+    assert payload["from_agent_name"] == "Coder"
+    assert payload["to_agent_name"] == "Tester"
+    assert payload["title"] == "implementation handoff"
+    assert "[REDACTED]" in payload["content"]
+    assert "abcdefghijk123456" not in payload["content"]
+
+
+def test_team_replan_request_is_a_durable_scheduler_fence():
+    run_id = "run_team_replan_control"
+    agent = _agent(run_id=run_id)
+    board = get_task_board()
+    board.create_task(
+        task_id="implementation",
+        run_id=run_id,
+        title="Implementation",
+        objective="implement the original plan",
+        required_capabilities=["coding"],
+    )
+    registry = get_agent_registry()
+    reserved = registry.reserve_idle_agent(
+        run_id,
+        {"coding"},
+        "implementation",
+        preferred_agent_id=agent.agent_id,
+    )
+    assert reserved is not None
+    assert board.claim(
+        "implementation",
+        agent.agent_id,
+        run_id=run_id,
+    ).success
+    assert board.start("implementation", agent.agent_id, run_id=run_id)
+
+    assert TeamControlPlaneService().team_request_replan(
+        run_id,
+        agent.agent_id,
+        "The dependency assumptions are invalid",
+    )
+
+    task = board.get("implementation", run_id=run_id)
+    assert task.status == BoardTaskStatus.REPLAN_REQUIRED
+    assert task.last_error == "The dependency assumptions are invalid"
+    assert task.metadata["replan_requests"][-1]["requested_by"] == agent.agent_id
+    event = get_agent_run_history().list_events(
+        run_id,
+        event_type="ReplanRequested",
+    )[0]
+    assert event["task_id"] == "implementation"
+    assert event["payload"]["previous_status"] == "running"
+    assert event["payload"]["accepted"] is True
+
+
+def test_event_payload_redaction_is_recursive():
+    history = get_agent_run_history()
+    history.record_event(
+        event_id=make_run_event_id(),
+        run_id="run_redaction",
+        event_type="BeforeToolUse",
+        payload={
+            "arguments": {
+                "authorization": "Bearer top-secret",
+                "nested": [{"password": "hunter2"}],
+                "command": "curl '?token=abcdefghijk123456'",
+            },
+            "token_usage": {"input": 42},
+        },
+    )
+
+    payload = history.list_event_envelopes("run_redaction")[0]["payload"]
+    serialized = str(payload)
+    assert "top-secret" not in serialized
+    assert "hunter2" not in serialized
+    assert "abcdefghijk123456" not in serialized
+    assert payload["arguments"]["authorization"] == "[REDACTED]"
+    assert payload["token_usage"] == {"input": 42}
 
 
 def test_tool_side_effect_recovery_never_replays_ambiguous_write():

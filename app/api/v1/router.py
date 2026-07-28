@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -23,6 +24,7 @@ from app.api.v1.schemas import (
     FlexibleResponse,
     PermissionDecisionBody,
     PlanDecisionBody,
+    ResumeRunBody,
     RetryResponse,
     RetryRunBody,
     RunMessageBody,
@@ -37,6 +39,7 @@ from app.infrastructure.database.run_store import get_agent_run_history
 
 
 router = APIRouter(prefix="/api/v1")
+_stream_sleep = asyncio.sleep
 
 
 def _require_run(run_id: str) -> dict:
@@ -106,9 +109,13 @@ async def pause_run(run_id: str):
 @router.post(
     "/runs/{run_id}/resume", status_code=202, response_model=ControlResponse
 )
-async def resume_run(run_id: str):
+async def resume_run(run_id: str, body: ResumeRunBody | None = None):
     _require_run(run_id)
-    if not await get_run_service().resume(run_id):
+    if not await get_run_service().resume(
+        run_id,
+        decision=body.decision if body is not None else "continue",
+        feedback=body.feedback if body is not None else "",
+    ):
         raise HTTPException(status_code=409, detail="Run cannot be resumed")
     return {"run_id": run_id, "status": "running"}
 
@@ -177,7 +184,7 @@ async def send_run_message(run_id: str, body: RunMessageBody):
 def stream_events(run_id: str, after_sequence: int = Query(0, ge=0)):
     _require_run(run_id)
 
-    def generate():
+    async def generate():
         cursor = after_sequence
         idle_deadline = time.monotonic() + 300
         next_keepalive = 0.0
@@ -202,7 +209,7 @@ def stream_events(run_id: str, after_sequence: int = Query(0, ge=0)):
                 # arrive in visible bursts.  Five lightweight reads per
                 # second keeps perceived latency low while keepalives remain
                 # sparse enough for proxies and browser tooling.
-                time.sleep(0.2)
+                await _stream_sleep(0.2)
 
     return StreamingResponse(
         generate(),

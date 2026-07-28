@@ -6,6 +6,8 @@ RUN npm ci --no-audit --no-fund
 COPY frontend/ ./
 RUN npm run build
 
+FROM docker.m.daocloud.io/node:22-bookworm-slim AS node-runtime
+
 FROM docker.m.daocloud.io/python:3.12-slim AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -27,9 +29,13 @@ RUN set -eux; \
 WORKDIR /app
 COPY pyproject.toml README.md AGENTS.md ./
 COPY app ./app
-RUN python -m pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple .
+RUN python -m pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple ".[dev]"
 
 COPY --from=frontend-build /build/frontend/dist ./frontend/dist
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
 
 RUN mkdir -p /data/workspaces /data/logs /data/memory /data/skills
 VOLUME ["/data"]

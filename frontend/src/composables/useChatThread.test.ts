@@ -204,6 +204,64 @@ describe("mapEventsToMessages", () => {
     expect(failed[0]).toMatchObject({ type: "status", tone: "error" });
   });
 
+  it("surfaces budget, replan, and stale-result control events", () => {
+    resetSeq();
+    const messages = mapEventsToMessages([
+      env(
+        "TaskBudgetExceeded",
+        { used: 8, limit: 8 },
+        { agent_id: "Coder", task_id: "task_code" },
+      ),
+      env(
+        "ReplanRequested",
+        { reason: "dependency changed" },
+        { agent_id: "Reviewer", task_id: "task_review" },
+      ),
+      env(
+        "TaskStateConflict",
+        { transition: "mark_produced", actual_status: "cancelled" },
+        { task_id: "task_late" },
+      ),
+    ]);
+
+    expect(messages).toHaveLength(3);
+    expect(messages[0]).toMatchObject({ type: "status", tone: "error" });
+    expect((messages[0] as { text: string }).text).toContain("8/8");
+    expect(messages[1]).toMatchObject({ type: "status", tone: "warn" });
+    expect((messages[1] as { text: string }).text).toContain("dependency changed");
+    expect(messages[2]).toMatchObject({ type: "status", tone: "error" });
+    expect((messages[2] as { text: string }).text).toContain("cancelled");
+  });
+
+  it("surfaces repository integration verification progress and recovery", () => {
+    resetSeq();
+    const messages = mapEventsToMessages([
+      env("IntegrationVerificationStarted", {
+        label: "frontend npm test",
+      }),
+      env("IntegrationVerificationCompleted", {
+        label: "frontend npm test",
+        returncode: 0,
+        duration_seconds: 2.4,
+      }),
+      env("IntegrationVerificationUnavailable", {
+        missing_requirements: ["frontend:npm_runtime_unavailable"],
+      }),
+    ]);
+
+    expect(messages).toHaveLength(3);
+    expect(messages[0]).toMatchObject({ type: "status", tone: "running" });
+    expect((messages[0] as { text: string }).text).toContain(
+      "frontend npm test",
+    );
+    expect(messages[1]).toMatchObject({ type: "status", tone: "ok" });
+    expect((messages[1] as { text: string }).text).toContain("2.4");
+    expect(messages[2]).toMatchObject({ type: "status", tone: "warn" });
+    expect((messages[2] as { text: string }).text).toContain(
+      "npm_runtime_unavailable",
+    );
+  });
+
   it("sorts out-of-order events by sequence", () => {
     resetSeq();
     const e1 = env("user_message", { content: "first" });
@@ -277,6 +335,112 @@ describe("mapEventsToMessages", () => {
       role: "assistant",
       content: "README 已读取，这是 MegaDeepagents 项目。",
       streaming: false,
+    });
+  });
+
+  it("projects a canonical V3 team trace into tasks, artifacts, approvals, collaboration and terminal states", () => {
+    resetSeq();
+    const events = [
+      env(
+        "TaskStarted",
+        {},
+        { agent_id: "agent_coder", task_id: "task_code" },
+      ),
+      env(
+        "TaskProduced",
+        { artifact_ids: ["artifact_patch", "artifact_tests"] },
+        { agent_id: "agent_coder", task_id: "task_code" },
+      ),
+      // A mixed-version deployment may also replay the legacy artifact event;
+      // the projection must not show the same deliverable twice.
+      env("artifact_created", {
+        artifact_id: "artifact_patch",
+        produced_by: "Coder",
+      }),
+      env(
+        "TaskCompleted",
+        {},
+        { agent_id: "agent_coder", task_id: "task_code" },
+      ),
+      env(
+        "PermissionRequested",
+        {
+          request_id: "permission_1",
+          operation: "shell",
+          status: "pending",
+          reason: "需要运行测试",
+          parameters: { command: "npm test" },
+        },
+        { agent_id: "agent_coder", task_id: "task_code" },
+      ),
+      env(
+        "AgentMessage",
+        {
+          from_agent_name: "Coder",
+          to_agent_name: "Reviewer",
+          title: "请求复核",
+          content: "补丁和测试已经就绪。",
+        },
+        { agent_id: "agent_coder", task_id: "task_code" },
+      ),
+      env("root_graph:RunCompleted", { summary: "全部任务验证通过" }),
+      env(
+        "TaskFailed",
+        { error: "lint failed" },
+        { agent_id: "agent_reviewer", task_id: "task_review" },
+      ),
+      env("RunFailed", { error: "verification budget exhausted" }),
+    ];
+
+    const messages = mapEventsToMessages(events);
+    expect(messages.map((message) => (
+      "role" in message ? message.role : message.type
+    ))).toEqual([
+      "status",
+      "artifact",
+      "artifact",
+      "status",
+      "approval",
+      "collaboration",
+      "status",
+      "status",
+      "status",
+    ]);
+    expect(messages[0]).toMatchObject({
+      type: "status",
+      tone: "running",
+      text: "agent_coder 开始执行 · task_code",
+    });
+    expect(messages[1]).toMatchObject({
+      type: "artifact",
+      artifactId: "artifact_patch",
+      producedBy: "agent_coder",
+    });
+    expect(messages[4]).toMatchObject({
+      type: "approval",
+      requestId: "permission_1",
+      operation: "shell",
+      status: "pending",
+    });
+    expect(messages[5]).toMatchObject({
+      type: "collaboration",
+      fromAgent: "Coder",
+      toAgent: "Reviewer",
+      content: "补丁和测试已经就绪。",
+    });
+    expect(messages[6]).toMatchObject({
+      type: "status",
+      tone: "ok",
+      text: "全部任务验证通过",
+    });
+    expect(messages[7]).toMatchObject({
+      type: "status",
+      tone: "error",
+    });
+    expect(messages[8]).toMatchObject({
+      type: "status",
+      tone: "error",
+      text: "运行失败：verification budget exhausted",
     });
   });
 

@@ -217,6 +217,14 @@ def test_default_reviewer_readonly():
     assert "file_read" in reviewer.capabilities
 
 
+def test_default_tester_can_create_tests_inside_its_isolated_workspace():
+    reset_capability_registry()
+    tester = get_capability_registry().get_profile("tester")
+    assert tester is not None
+    assert tester.tool_policy.allow_file_write is True
+    assert "create_file" in tester.tool_policy.allowed_tools
+
+
 def test_default_finalizer_capabilities():
     reset_capability_registry()
     reg = get_capability_registry()
@@ -242,3 +250,73 @@ def test_re_registration_updates_cap_index():
     reg.register(p2)
     assert len(reg.find_workers({"coding"})) == 0
     assert len(reg.find_workers({"testing"})) == 1
+
+
+def test_team_builder_rejects_capabilities_outside_the_selected_team(tmp_path):
+    from app.multiagent.agent_registry import AgentRegistry
+    from app.multiagent.default_teams import RESEARCH_TEAM
+    from app.multiagent.task_graph import TaskGraph, TaskNode
+    from app.multiagent.team_builder import TeamBuilder
+    from app.multiagent.team_run_context import TeamRunContext
+
+    ctx = TeamRunContext.create(
+        goal="implement a service",
+        team_name="research_team",
+        workspace_root=str(tmp_path / "workspace"),
+    )
+    graph = TaskGraph(root_task_id="implement")
+    graph.add_node(TaskNode(
+        id="implement",
+        title="Implement",
+        objective="write production code",
+        required_capabilities=["coding"],
+    ))
+
+    with _pytest.raises(RuntimeError, match="no_matching_worker"):
+        TeamBuilder(AgentRegistry()).build_team_sync(ctx, RESEARCH_TEAM, graph)
+
+
+def test_team_builder_keeps_existing_agents_and_adds_new_capabilities(tmp_path):
+    from app.multiagent.agent_registry import AgentRegistry
+    from app.multiagent.default_teams import SOFTWARE_DEV_TEAM
+    from app.multiagent.task_graph import TaskGraph, TaskNode
+    from app.multiagent.team_builder import TeamBuilder
+    from app.multiagent.team_run_context import TeamRunContext
+
+    ctx = TeamRunContext.create(
+        goal="implement and test a service",
+        team_name="software_dev_team",
+        workspace_root=str(tmp_path / "workspace"),
+    )
+    registry = AgentRegistry()
+    builder = TeamBuilder(registry)
+    coding_graph = TaskGraph(root_task_id="implement")
+    coding_graph.add_node(TaskNode(
+        id="implement",
+        title="Implement",
+        objective="write production code",
+        required_capabilities=["coding"],
+    ))
+
+    first_team = builder.build_team_sync(ctx, SOFTWARE_DEV_TEAM, coding_graph)
+    coder = next(agent for agent in first_team if agent.profile_id == "coder")
+
+    expanded_graph = TaskGraph(root_task_id="implement")
+    expanded_graph.add_node(coding_graph.nodes["implement"].model_copy(deep=True))
+    expanded_graph.add_node(TaskNode(
+        id="test",
+        title="Test",
+        objective="write and execute regression tests",
+        dependencies=["implement"],
+        required_capabilities=["testing"],
+    ))
+    expanded_team = builder.build_team_sync(
+        ctx,
+        SOFTWARE_DEV_TEAM,
+        expanded_graph,
+    )
+
+    assert {agent.profile_id for agent in expanded_team} == {"coder", "tester"}
+    assert next(
+        agent for agent in expanded_team if agent.profile_id == "coder"
+    ).agent_id == coder.agent_id

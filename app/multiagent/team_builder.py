@@ -28,17 +28,33 @@ class TeamBuilder:
 
     def build_team_sync(self, ctx: TeamRunContext, team_spec: Any, task_graph: Any) -> list[AgentInstance]:
         existing = self.registry.list_by_run(ctx.run_id)
-        if existing:
-            return existing
         team_spec = team_spec or get_team(ctx.team_id)
         if team_spec is None:
             raise ValueError(f"unknown team: {ctx.team_id}")
 
         profiles = get_capability_registry()
+        allowed_roles = {
+            str(agent.role).strip().lower()
+            for agent in team_spec.agents
+        }
+
+        def find_allowed(required: set[str]):
+            candidates = [
+                profile
+                for profile in profiles.find_workers(required)
+                if profile.role.strip().lower() in allowed_roles
+            ]
+            if not candidates:
+                return None
+            return max(
+                candidates,
+                key=lambda profile: (profiles.score_worker(profile), profile.id),
+            )
+
         required_profile_ids: set[str] = set()
         for node in task_graph.nodes.values():
             caps = set(node.required_capabilities)
-            profile = profiles.find_best_worker(caps)
+            profile = find_allowed(caps)
             if profile is None:
                 # Fallback: LLM 偶尔会在 task 的 required_capabilities 里附带
                 # 工具能力（file_read/file_write/shell_execute/web_research/
@@ -57,7 +73,7 @@ class TeamBuilder:
                 # output_artifact_type 的 "config" 当作能力声明），仅保留主角色。
                 stripped = {c for c in caps if c in PRIMARY_CAPS}
                 if stripped and stripped != caps:
-                    profile = profiles.find_best_worker(stripped)
+                    profile = find_allowed(stripped)
                     logger.warning(
                         f"[TeamBuilder] task={node.id} 原始能力{caps}无匹配 Worker，"
                         f"剥离非主角色能力后以{stripped}重新匹配到"
@@ -67,7 +83,7 @@ class TeamBuilder:
                     # 只有工具/未知能力，没有任何主角色 —— 走原始剥离路径
                     stripped_tools = {c for c in caps if c not in TOOL_CAPS}
                     if stripped_tools and stripped_tools != caps:
-                        profile = profiles.find_best_worker(stripped_tools)
+                        profile = find_allowed(stripped_tools)
                         logger.warning(
                             f"[TeamBuilder] task={node.id} 原始能力{caps}无匹配 Worker，"
                             f"剥离工具能力后以{stripped_tools}重新匹配到"
@@ -86,7 +102,20 @@ class TeamBuilder:
         # registered profile) when a plan required both Researcher and
         # Finalizer, deadlocking every ``summarization`` task (T14/T15 in
         # run_2a438328372441d8) with ``no_eligible_worker``.
-        selected = [p for p in profiles.list_profiles() if p.id in required_profile_ids]
+        live_profile_ids = {
+            agent.profile_id
+            for agent in existing
+            if getattr(agent.status, "value", agent.status)
+            not in {"stopped", "failed"}
+        }
+        selected = [
+            profile
+            for profile in profiles.list_profiles()
+            if profile.id in required_profile_ids
+            and profile.id not in live_profile_ids
+        ]
+        if not selected and required_profile_ids.issubset(live_profile_ids):
+            return existing
         if not selected:
             raise RuntimeError("no_executable_teammates")
 
@@ -114,4 +143,4 @@ class TeamBuilder:
             )
             created.append(agent)
         logger.info("[TeamBuilder] run=%s spawned=%s", ctx.run_id, len(created))
-        return created
+        return [*existing, *created]

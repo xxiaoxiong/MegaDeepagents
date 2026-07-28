@@ -330,6 +330,66 @@ def test_verify_integrity_detects_tamper(tmp_path):
     assert store.verify_integrity(art.id) is False
 
 
+def test_binary_artifact_integrity_and_safe_preview(tmp_path):
+    store = ArtifactStore(root_path=str(tmp_path))
+    content = b"\x89PNG\r\n\x1a\n\x00\xff\x10"
+    art = store.create(
+        run_id="r",
+        task_id="image",
+        type="data",
+        relative_path="image.png",
+        content=content,
+        produced_by="A",
+    )
+
+    assert store.read_bytes(art.id) == content
+    assert isinstance(store.read(art.id), str)
+    assert store.verify_integrity(art.id) is True
+
+
+def test_artifact_persistence_failure_never_publishes_ghost_id(monkeypatch, tmp_path):
+    store = ArtifactStore(root_path=str(tmp_path))
+
+    def fail_insert(*_args, **_kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(
+        "app.infrastructure.database.run_store.AgentRunHistory.insert_artifact",
+        fail_insert,
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        store.create(
+            run_id="r",
+            task_id="t",
+            type="code",
+            relative_path="ghost.py",
+            content="x = 1",
+            produced_by="A",
+        )
+    assert store.list_by_run("r") == []
+
+
+def test_status_persistence_failure_rolls_back_memory(monkeypatch, tmp_path):
+    store = ArtifactStore(root_path=str(tmp_path))
+    art = store.create(
+        run_id="r",
+        task_id="t",
+        type="code",
+        relative_path="status.py",
+        content="x = 1",
+        produced_by="A",
+    )
+
+    def fail_status(_artifact):
+        raise RuntimeError("status unavailable")
+
+    monkeypatch.setattr(store, "_persist_status", fail_status)
+    with pytest.raises(RuntimeError, match="status unavailable"):
+        store.mark_verified(art.id)
+    assert store.get(art.id).status == ArtifactStatus.PUBLISHED
+
+
 # ===== 跨 Run 隔离 =====
 
 
