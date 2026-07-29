@@ -18,7 +18,7 @@ Replace `dict[str, Any]` action protocol（actions.py §十一）。
 from __future__ import annotations
 
 import copy as _copy
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Annotated, Any, Literal
 
@@ -66,7 +66,7 @@ class SendMessageAction(BaseModel):
 
     # 审计
     produced_by: str = ""
-    produced_at: datetime = Field(default_factory=datetime.utcnow)
+    produced_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     idempotency_key: str = ""
 
 
@@ -82,7 +82,7 @@ class CreateArtifactAction(BaseModel):
     artifact_refs: list[ArtifactRef] = Field(default_factory=list)
 
     produced_by: str = ""
-    produced_at: datetime = Field(default_factory=datetime.utcnow)
+    produced_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     idempotency_key: str = ""
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -94,7 +94,7 @@ class UpdateStateAction(BaseModel):
     patch: dict[str, Any] = Field(default_factory=dict)
 
     produced_by: str = ""
-    produced_at: datetime = Field(default_factory=datetime.utcnow)
+    produced_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     idempotency_key: str = ""
 
 
@@ -107,7 +107,7 @@ class RequestReviewAction(BaseModel):
     artifact_refs: list[ArtifactRef] = Field(default_factory=list)
 
     produced_by: str = ""
-    produced_at: datetime = Field(default_factory=datetime.utcnow)
+    produced_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     idempotency_key: str = ""
 
 
@@ -121,7 +121,7 @@ class RespondCritiqueAction(BaseModel):
     issue_status: str | None = None
 
     produced_by: str = ""
-    produced_at: datetime = Field(default_factory=datetime.utcnow)
+    produced_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     idempotency_key: str = ""
 
 
@@ -133,7 +133,7 @@ class HandoffAction(BaseModel):
     content: str = ""
 
     produced_by: str = ""
-    produced_at: datetime = Field(default_factory=datetime.utcnow)
+    produced_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     idempotency_key: str = ""
 
 
@@ -145,7 +145,7 @@ class MarkDoneAction(BaseModel):
     final_output: str = ""
 
     produced_by: str = ""
-    produced_at: datetime = Field(default_factory=datetime.utcnow)
+    produced_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     idempotency_key: str = ""
 
 
@@ -159,7 +159,7 @@ class NoOpAction(BaseModel):
     rejected_action: dict[str, Any] | None = None
 
     produced_by: str = ""
-    produced_at: datetime = Field(default_factory=datetime.utcnow)
+    produced_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     idempotency_key: str = ""
 
 

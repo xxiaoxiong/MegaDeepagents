@@ -11,6 +11,11 @@ runtime/db
 runtime/logs
 runtime/workspace
 runtime/workspaces
+# deploy/data carries ~80MB of SQLite + WAL + per-run workspaces from local
+# runs.  It never belongs in the image (Dockerfile does not COPY it) but
+# without this entry it enters the build context and slows every
+# ``docker build`` context upload.
+deploy/data
 *.egg-info
 dist
 build

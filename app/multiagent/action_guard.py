@@ -1,6 +1,26 @@
 """Agent action 权限护栏：运行时强制隔离每个角色能产出的 action 类型与能调用的工具。
 
-设计目标：
+.. legacy:: DISCUSSION / TeamRunner 运行时
+
+    本模块**仅服务于冻结的 DISCUSSION / round-chat 运行时**（经由
+    ``runtime_adapter.py`` 与 ``round_executor.py`` 调用，对应 AGENTS.md 中
+    "DISCUSSION/TeamRunner is frozen compatibility code"）。**V3 Canonical
+    Runtime（RunApplicationService → TeamRuntimeFacade → root_graph →
+    ParallelTeamScheduler → DeepAgentExecutor）不经过本模块。**
+
+    V3 用三层护栏等价覆盖了本模块的职责，不要在 V3 路径引入 action_guard：
+
+    * 工具级：``AgentProfile.tool_policy``（``allowed_tools`` / ``deny_all_by_default``
+      / ``allow_team_tools``）在 ``_build_restricted_tools`` 中过滤 LLM 可见工具；
+    * 操作级：``PermissionBroker`` 守卫 ``team_create_task`` / ``team_spawn_teammate``
+      等变更型 team 工具，且 ``team_update_task`` 拒绝 agent 直接改任务状态；
+    * 命令级：``shell_policy`` 分类并拦截危险命令。
+
+    V3 中 "Coder 自评 mark_done" 这类越权在结构上已不可能：任务终态由 Verifier
+    判定，agent 无法自行设置 SUCCEEDED。因此本模块的 action 白名单在 V3 中是
+    冗余的，新增 V3 角色边界请扩展 ``AgentProfile.tool_policy`` 而非此模块。
+
+设计目标（legacy）：
 1. 阻止 Reviewer Agent 越权改代码（不能 create_artifact）
 2. 阻止 Coder 自评通过（不能产出 review_result / mark_done）
 3. 阻止 Planner 直接进入 finalizing（不能 mark_done）
@@ -74,9 +94,11 @@ DEFAULT_ROLE_ALLOWED_ACTIONS: dict[str, list[str]] = {
 }
 
 # 允许的合法工具名（用于按 allowed_tools 过滤 ToolRegistry 注册的工具）
+# 注：实际记忆工具名为 ``session_search``（见 app/memory/tools.py），早期版本
+# 误写为 memory_search/memory_write，二者从未存在，会让依赖该集合的校验形同虚设。
 KNOWN_TOOL_NAMES: set[str] = {
     "search", "fetch_url", "read_file", "list_dir", "create_file",
-    "edit_file", "execute", "memory_search", "memory_write",
+    "edit_file", "execute", "session_search",
 }
 
 

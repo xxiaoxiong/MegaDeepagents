@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from app.core.logging import logger
@@ -165,7 +165,7 @@ class TeamRoom:
     def update_state(self, mutator) -> None:
         """对 SharedTeamState 应用一段修改，写回 store。"""
         changes = mutator(self.state)
-        self.state.updated_at = datetime.utcnow()
+        self.state.updated_at = datetime.now(UTC)
         if self.store:
             self.store.save_state(self.state)
             self.store.save_room_meta_timestamp(self.room_id, self.state)

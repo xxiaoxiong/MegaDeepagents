@@ -265,11 +265,23 @@ class GovernedRunGraph:
                         break
                     time.sleep(decision.delay_seconds)
             if graph is None:
-                return {
-                    "phase": "planning",
-                    "status": "failed",
-                    "error": f"planner_failed: {last_error}",
-                }
+                # Degradation path: when the LLM Planner exhausts all retries,
+                # fall back to a minimal two-step plan (plan → execute) instead
+                # of killing the Run.  This gives the runtime a chance to make
+                # progress even when the model produces unparseable output.
+                from app.multiagent.planner import build_fallback_plan
+                try:
+                    graph = build_fallback_plan(state["goal"])
+                    self._event("planning_degraded", {
+                        "reason": "fallback_plan_after_retries",
+                        "last_error": str(last_error) if last_error else "",
+                    })
+                except Exception:
+                    return {
+                        "phase": "planning",
+                        "status": "failed",
+                        "error": f"planner_failed: {last_error}",
+                    }
         self._apply_integration_verification_metadata(graph)
         self._event("planning_completed", {"task_count": len(graph.nodes)})
         return {

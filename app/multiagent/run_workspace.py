@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 from app.core.logging import logger
@@ -215,3 +216,35 @@ def remove_run_workspace(run_id: str, cleanup: bool = True) -> None:
 def reset_workspaces() -> None:
     """测试隔离用：清空全局表。"""
     _active_workspaces.clear()
+
+
+def cleanup_old_workspaces(base_root: str, max_age_days: float = 7.0) -> int:
+    """Remove ``run-<id>`` directories older than ``max_age_days``.
+
+    Called at startup and periodically to reclaim disk from completed runs.
+    Only top-level ``run-*`` directories are considered; the ``shared``
+    directory and any non-run subdirectory are left untouched.  A directory
+    whose mtime is within the retention window is skipped so active or
+    recently-finished runs are never affected.
+
+    Returns the number of directories removed.
+    """
+    root = Path(base_root)
+    if not root.is_dir():
+        return 0
+    cutoff = time.time() - max_age_days * 86400
+    removed = 0
+    for entry in root.iterdir():
+        if not entry.is_dir():
+            continue
+        if not entry.name.startswith("run-"):
+            continue
+        try:
+            if entry.stat().st_mtime > cutoff:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            removed += 1
+            logger.info("[RunWorkspace] retention cleanup removed %s", entry)
+        except Exception as exc:  # pragma: no cover - defensive cleanup
+            logger.warning("[RunWorkspace] retention cleanup failed for %s: %s", entry, exc)
+    return removed

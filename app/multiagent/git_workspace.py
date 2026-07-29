@@ -10,7 +10,7 @@ import sys
 import threading
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -53,12 +53,12 @@ class WorktreeLease:
     agent_id: str
     worktree_path: str
     branch: str
-    acquired_at: datetime = field(default_factory=datetime.utcnow)
-    expires_at: datetime = field(default_factory=lambda: datetime.utcnow() + timedelta(minutes=10))
+    acquired_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    expires_at: datetime = field(default_factory=lambda: datetime.now(UTC) + timedelta(minutes=10))
     released_at: datetime | None = None
 
     def active(self) -> bool:
-        return self.released_at is None and self.expires_at > datetime.utcnow()
+        return self.released_at is None and self.expires_at > datetime.now(UTC)
 
 
 def _ensure_schema() -> None:
@@ -102,7 +102,7 @@ class RepositoryWorkspaceManager:
         manifest = {
             "source_repository": self.source_repository,
             "base_branch": self.base_branch, "base_commit_sha": self.base_commit_sha,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(UTC).isoformat(),
         }
         (root / "control" / "repository.json").write_text(
             json.dumps(manifest, indent=2), encoding="utf-8"
@@ -135,7 +135,7 @@ class AgentWorktreeManager:
         with self._lock:
             existing = self.get(run_id, agent_id)
             if existing and existing.active() and Path(existing.worktree_path).is_dir():
-                existing.expires_at = datetime.utcnow() + timedelta(seconds=self.lease_seconds)
+                existing.expires_at = datetime.now(UTC) + timedelta(seconds=self.lease_seconds)
                 self._save(existing, "active")
                 return existing
             path = Path(self.repository.run_workspace) / "worktrees" / _slug(agent_id)
@@ -161,7 +161,7 @@ class AgentWorktreeManager:
             lease = WorktreeLease(
                 lease_id="lease_" + uuid.uuid4().hex[:16], run_id=run_id,
                 agent_id=agent_id, worktree_path=str(path), branch=branch,
-                expires_at=datetime.utcnow() + timedelta(seconds=self.lease_seconds),
+                expires_at=datetime.now(UTC) + timedelta(seconds=self.lease_seconds),
             )
             self._save(lease, "active")
             return lease
@@ -222,7 +222,7 @@ class AgentWorktreeManager:
         if int(ahead or "0") > 0:
             return False
         _git(self.repository.source_repository, "worktree", "remove", lease.worktree_path)
-        lease.released_at = datetime.utcnow()
+        lease.released_at = datetime.now(UTC)
         self._save(lease, "released")
         return True
 
@@ -240,6 +240,55 @@ class AgentWorktreeManager:
              lease.released_at.isoformat() if lease.released_at else None),
         )
         _get_conn().commit()
+
+    def cleanup_expired_leases(self) -> int:
+        """Remove worktree directories and branches for expired, unreleased leases.
+
+        Called at startup and periodically to prevent orphaned worktrees from
+        accumulating when agents crash or are cancelled mid-task.  Leases that
+        still have uncommitted work (``git status`` non-empty or commits ahead
+        of base) are left in place — their data is recoverable and removal
+        would destroy evidence.
+
+        Returns the number of leases successfully cleaned up.
+        """
+        now = datetime.now(UTC)
+        cleaned = 0
+        rows = _get_conn().execute(
+            "SELECT payload FROM worktree_leases "
+            "WHERE status='active' AND released_at IS NULL "
+            "AND expires_at < ?",
+            (now.isoformat(),),
+        ).fetchall()
+        for row in rows:
+            data = json.loads(row["payload"])
+            for field_name in ("acquired_at", "expires_at", "released_at"):
+                if data.get(field_name):
+                    data[field_name] = datetime.fromisoformat(data[field_name])
+            lease = WorktreeLease(**data)
+            try:
+                wt_path = Path(lease.worktree_path)
+                if wt_path.is_dir():
+                    # Only remove if no uncommitted changes — preserving work.
+                    status = _git(lease.worktree_path, "status", "--porcelain").stdout.strip()
+                    ahead = _git(lease.worktree_path, "rev-list", "--count",
+                                 f"{self.repository.base_commit_sha}..HEAD").stdout.strip()
+                    if not status and int(ahead or "0") == 0:
+                        _git(self.repository.source_repository, "worktree",
+                             "remove", lease.worktree_path, check=False)
+                    else:
+                        # Has uncommitted/unmerged work — skip to preserve data.
+                        continue
+                # Best-effort branch deletion; failure is non-fatal.
+                _git(self.repository.source_repository, "branch", "-D",
+                     lease.branch, check=False)
+                lease.released_at = datetime.now(UTC)
+                self._save(lease, "released")
+                cleaned += 1
+            except Exception:
+                # A single failed cleanup must not prevent processing others.
+                continue
+        return cleaned
 
 
 class ConflictDetector:
@@ -262,7 +311,7 @@ class MergeQueueItem:
     branch: str
     status: str = "queued"
     conflicts: list[str] = field(default_factory=list)
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 @dataclass(frozen=True)
@@ -294,7 +343,7 @@ class IntegrationVerificationPlan:
 class MergeQueue:
     def enqueue(self, item: MergeQueueItem) -> None:
         _ensure_schema()
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(UTC).isoformat()
         _get_conn().execute(
             "INSERT INTO merge_queue VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (item.queue_id, item.run_id, item.agent_id, item.commit_sha, item.status,

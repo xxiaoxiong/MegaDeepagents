@@ -2,24 +2,35 @@
 
 import re
 import sqlite3
-import threading
-from pathlib import Path
 from typing import Any
 
-from app.core.config import settings
+from app.memory.cold_memory import get_connection as get_cold_memory_connection
 
 
-_local = threading.local()
+# Track which connection objects have already been bootstrapped with the FTS
+# schema.  ``get_cold_memory_conn`` delegates to ``cold_memory.get_connection``
+# so the ``messages`` base table exists before the FTS triggers are created,
+# and so the FTS connection IS the canonical application connection (one per
+# thread, proper WAL pragmas) instead of an independent sqlite3.connect that
+# violated AGENTS.md.
+_initialized_connection_ids: set[int] = set()
 
 
 def get_cold_memory_conn() -> sqlite3.Connection:
-    if not hasattr(_local, "conn") or _local.conn is None:
-        db_path = Path(settings.sqlite_path)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        _local.conn = sqlite3.connect(str(db_path), check_same_thread=False)
-        _local.conn.row_factory = sqlite3.Row
-        _init_fts(_local.conn)
-    return _local.conn
+    """Return the canonical connection, ensuring the FTS schema is bootstrapped.
+
+    Previously this opened an independent connection (no WAL pragmas, no
+    busy_timeout) to the same database file, violating AGENTS.md.  It now
+    reuses ``cold_memory.get_connection`` (which itself delegates to the
+    canonical factory) so the FTS virtual tables and triggers live on the same
+    per-thread connection as the ``messages`` table they index.
+    """
+    connection = get_cold_memory_connection()
+    connection_id = id(connection)
+    if connection_id not in _initialized_connection_ids:
+        _init_fts(connection)
+        _initialized_connection_ids.add(connection_id)
+    return connection
 
 
 def _init_fts(conn: sqlite3.Connection) -> None:

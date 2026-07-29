@@ -20,7 +20,7 @@ import os
 import tempfile
 from pathlib import Path
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
@@ -71,7 +71,7 @@ class Artifact:
     produced_by: str                # Agent 名
     commit_sha: str | None = None
     status: ArtifactStatus = ArtifactStatus.DRAFT
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     metadata: dict[str, Any] = field(default_factory=dict)
     predecessor_id: str | None = None  # 上一版本（修复链）
     parent_artifact_id: str | None = None  # 修复对象（repair patch 对应的原 artifact）
@@ -109,7 +109,7 @@ class Artifact:
             produced_by=d["produced_by"],
             commit_sha=d.get("commit_sha") or (d.get("metadata") or {}).get("commit_sha"),
             status=ArtifactStatus(d.get("status", "draft")),
-            created_at=datetime.fromisoformat(d["created_at"]) if d.get("created_at") else datetime.utcnow(),
+            created_at=datetime.fromisoformat(d["created_at"]) if d.get("created_at") else datetime.now(UTC),
             metadata=dict(d.get("metadata", {})),
             predecessor_id=d.get("predecessor_id"),
             parent_artifact_id=d.get("parent_artifact_id"),
@@ -309,7 +309,7 @@ class ArtifactStore:
                     produced_by=r.get("produced_by", ""),
                     commit_sha=(r.get("metadata") or {}).get("commit_sha") if isinstance(r.get("metadata"), dict) else None,
                     status=ArtifactStatus(r.get("status", "published")),
-                    created_at=datetime.fromisoformat(r["created_at"]) if isinstance(r.get("created_at"), str) else datetime.utcnow(),
+                    created_at=datetime.fromisoformat(r["created_at"]) if isinstance(r.get("created_at"), str) else datetime.now(UTC),
                     metadata=dict(r.get("metadata", {}) if isinstance(r.get("metadata"), dict) else {}),
                     predecessor_id=r.get("predecessor_id"),
                     parent_artifact_id=r.get("parent_artifact_id"),

@@ -2,7 +2,7 @@
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from app.core.logging import logger
@@ -149,7 +149,7 @@ class TaskStore:
             set_clauses.append(f"{key} = ?")
             values.append(val)
 
-        values.append(datetime.utcnow().isoformat())
+        values.append(datetime.now(UTC).isoformat())
         values.append(task_id)
 
         sql = f"UPDATE tasks SET {', '.join(set_clauses)}, updated_at = ? WHERE task_id = ?"
@@ -212,7 +212,7 @@ class TaskStore:
                 artifact.path,
                 artifact.name,
                 artifact.size_bytes,
-                datetime.utcnow().isoformat(),
+                datetime.now(UTC).isoformat(),
             ),
         )
         self.conn.commit()

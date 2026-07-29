@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
@@ -34,8 +34,8 @@ class ToolInvocation(BaseModel):
     status: ToolInvocationStatus = ToolInvocationStatus.STARTED
     result: dict[str, Any] = Field(default_factory=dict)
     error: str = ""
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     @classmethod
     def key_for(cls, run_id: str, agent_id: str, task_id: str,
@@ -75,7 +75,7 @@ class ToolSideEffectJournal:
         item = self._require(idempotency_key)
         item.status = ToolInvocationStatus.COMPLETED
         item.result = result
-        item.updated_at = datetime.utcnow()
+        item.updated_at = datetime.now(UTC)
         self._save(item)
         return item
 
@@ -83,7 +83,7 @@ class ToolSideEffectJournal:
         item = self._require(idempotency_key)
         item.status = ToolInvocationStatus.CANCELLED if cancelled else ToolInvocationStatus.FAILED
         item.error = error
-        item.updated_at = datetime.utcnow()
+        item.updated_at = datetime.now(UTC)
         self._save(item)
         return item
 
@@ -98,7 +98,7 @@ class ToolSideEffectJournal:
             item.status = (ToolInvocationStatus.NEEDS_HUMAN if item.side_effecting
                            else ToolInvocationStatus.FAILED)
             item.error = "process_restarted_during_tool"
-            item.updated_at = datetime.utcnow()
+            item.updated_at = datetime.now(UTC)
             self._save(item)
             recovered.append(item)
         return recovered

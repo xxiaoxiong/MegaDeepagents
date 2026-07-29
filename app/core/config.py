@@ -85,12 +85,23 @@ class Settings(BaseSettings):
     llm_cache_path: str = "./runtime/cache/llm_cache.db"
 
     # ========== 安全加固 ==========
-    cors_origins: list[str] = ["*"]
+    # Never default to ``["*"]`` together with ``allow_credentials=True``:
+    # Starlette reflects the Origin header under that combination, which is
+    # equivalent to whitelisting any malicious page.  The local dev frontend
+    # (Vite on 5173) is the only safe default; production deployments must set
+    # ``CORS_ORIGINS`` explicitly.
+    cors_origins: list[str] = ["http://127.0.0.1:5173", "http://localhost:5173"]
+    # Optional bearer token guarding control-plane decisions (permission /
+    # plan approval).  When unset, decision endpoints are only reachable from
+    # loopback and remain open in single-user dev.  When set, callers must send
+    # ``Authorization: Bearer <token>``.  Required for any non-loopback /
+    # Docker / reverse-proxy deployment.
+    control_plane_api_token: str = ""
     rate_limit_per_minute: int = 100
     max_message_length: int = 50000
     pending_runner_ttl_minutes: int = 30
     max_concurrency: int = 4
-    max_team_size: int = 5
+    max_team_size: int = 6
     max_spawn_depth: int = 2
     max_repair_rounds: int = 3
     # 900s left planning tasks stuck for 15 min before the scheduler could
@@ -108,6 +119,14 @@ class Settings(BaseSettings):
     audit_heartbeat_interval_seconds: float = 15.0
     default_auto_approve_low_risk: bool = False
     frontend_origin: str = "http://127.0.0.1:5173"
+    # Global cap on simultaneously active Runs.  ``asyncio.to_thread`` occupies
+    # a host thread for the entire Run duration (minutes–hours); without a
+    # cap, Run #33+ exhausts the default executor (``min(32, cpu+4)``) and
+    # starves synchronous API endpoints (head-of-line blocking).  The cap is
+    # enforced by a semaphore in ``TeamRuntimeFacade``; surplus Runs queue
+    # instead of consuming threads.  Operators scaling horizontally should
+    # raise this alongside the executor pool size.
+    max_concurrent_runs: int = 8
 
     # ========== LangSmith 可观测性（可选；未配置时本地可跑） ==========
     langsmith_enabled: bool = False  # 总开关，默认 False 满足"未配置本地可跑"约束
@@ -141,6 +160,16 @@ class Settings(BaseSettings):
             self.sqlite_path = self.database_url.removeprefix("sqlite:///")
         elif not self.database_url:
             self.database_url = f"sqlite:///{self.sqlite_path}"
+        # ``allow_credentials=True`` + ``cors_origins=["*"]`` causes Starlette
+        # to reflect the request Origin header, which is equivalent to
+        # whitelisting every origin.  Refuse to start in that state rather
+        # than silently widening the CORS surface.
+        if "*" in self.cors_origins:
+            # Drop the wildcard and fall back to the loopback dev origins so
+            # that a stale ``CORS_ORIGINS=*`` env override cannot reopen the
+            # reflection hole; log nothing here (settings is pre-logging) —
+            # the main app startup warns about non-loopback exposure.
+            self.cors_origins = ["http://127.0.0.1:5173", "http://localhost:5173"]
         self._ensure_dirs()
         # deepagents 0.6.8 内部走 `init_chat_model("openai:<model>")` 路径，
         # 无法显式注入 api_key/base_url；这里把 OpenAI 兼容的凭证写到环境变量，

@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
@@ -65,7 +65,7 @@ class TeamIssue(BaseModel):
     status: IssueStatus = IssueStatus.OPEN
     owner: str | None = Field(default=None, description="负责解决的 Agent 名")
     evidence: list[dict[str, Any]] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     resolved_at: datetime | None = None
 
 
@@ -77,7 +77,7 @@ class TeamDecision(BaseModel):
     rationale: str = ""
     decided_by: str
     alternatives: list[str] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class TeamArtifactRef(BaseModel):
@@ -105,7 +105,7 @@ class TeamArtifactRef(BaseModel):
     artifact_id: str | None = Field(default=None, description="稳定产物 ID")
     status: str = Field(default="created", description="created / reviewing / approved / rejected")
     size_bytes: int = 0
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class SharedTeamState(BaseModel):
@@ -141,8 +141,8 @@ class SharedTeamState(BaseModel):
     final_artifact_refs: list[TeamArtifactRef] = Field(default_factory=list)
 
     metadata: dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     # ========== 合法阶段转换 ==========
 
@@ -204,7 +204,7 @@ class SharedTeamState(BaseModel):
             if i.id == issue_id:
                 i.status = status
                 if status in (IssueStatus.RESOLVED, IssueStatus.WONT_FIX):
-                    i.resolved_at = datetime.utcnow()
+                    i.resolved_at = datetime.now(UTC)
                 return True
         return False
 
@@ -254,7 +254,7 @@ class SharedTeamState(BaseModel):
         for a in self.artifacts:
             if a.path == path:
                 a.reviewed_by = reviewed_by
-                a.reviewed_at = datetime.utcnow()
+                a.reviewed_at = datetime.now(UTC)
                 a.status = status
                 if message_id:
                     a.message_id = message_id

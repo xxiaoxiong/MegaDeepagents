@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 import threading
 from typing import Any
 
@@ -83,7 +83,7 @@ class AgentRegistry:
             checkpoint_namespace=checkpoint_namespace_override or checkpoint_namespace or f"agent:{name}:{run_id}",
             workspace_root=workspace_root,
             capabilities=capabilities or [],
-            created_at=created_at_override or datetime.utcnow(),
+            created_at=created_at_override or datetime.now(UTC),
             max_concurrency=max_concurrency,
             metadata=metadata or {},
             worktree_path=worktree_path,
@@ -96,27 +96,33 @@ class AgentRegistry:
     # ===== 查询 =====
 
     def get(self, agent_id: str) -> AgentInstance | None:
-        return self._agents.get(agent_id)
+        with self._lock:
+            return self._agents.get(agent_id)
 
     def list_all(self) -> list[AgentInstance]:
-        return list(self._agents.values())
+        with self._lock:
+            return list(self._agents.values())
 
     def list_by_run(self, run_id: str) -> list[AgentInstance]:
-        return [a for a in self._agents.values() if a.run_id == run_id]
+        with self._lock:
+            return [a for a in self._agents.values() if a.run_id == run_id]
 
     def list_by_team(self, team_id: str) -> list[AgentInstance]:
-        return [a for a in self._agents.values() if a.team_id == team_id]
+        with self._lock:
+            return [a for a in self._agents.values() if a.team_id == team_id]
 
     def list_by_status(self, status: AgentStatus) -> list[AgentInstance]:
-        return [a for a in self._agents.values() if a.status == status]
+        with self._lock:
+            return [a for a in self._agents.values() if a.status == status]
 
     def find_by_capability(self, capability: str, run_id: str | None = None) -> list[AgentInstance]:
         result = []
-        for a in self._agents.values():
-            if capability in a.capabilities:
-                if run_id is None or a.run_id == run_id:
-                    if a.is_idle() or a.can_work():
-                        result.append(a)
+        with self._lock:
+            for a in self._agents.values():
+                if capability in a.capabilities:
+                    if run_id is None or a.run_id == run_id:
+                        if a.is_idle() or a.can_work():
+                            result.append(a)
         return result
 
     def find_idle(self, run_id: str, capabilities: list[str] | None = None) -> AgentInstance | None:
@@ -215,11 +221,26 @@ class AgentRegistry:
     # ===== 心跳租约 =====
 
     def heartbeat(self, agent_id: str) -> bool:
-        a = self._agents.get(agent_id)
-        if a is None:
-            return False
-        a.heartbeat()
-        self._persist(a)
+        # Hold the registry lock for the read + heartbeat so the agent is not
+        # removed (``purge_run`` / ``remove``) between the lookup and the
+        # heartbeat write.  The agent's own ``_state_lock`` makes the field
+        # update atomic, but the registry lookup itself still needs the guard
+        # to avoid operating on a stale reference.
+        with self._lock:
+            a = self._agents.get(agent_id)
+            if a is None:
+                return False
+            a.heartbeat()
+        # Heartbeat runs every few seconds for every active agent.  A transient
+        # DB failure must not crash the heartbeat coroutine (which would then
+        # stop refreshing the lease and falsely mark the agent dead), but it is
+        # still logged loudly so divergence is visible.  Critical state
+        # transitions go through ``transition``/``reserve_idle_agent`` which let
+        # ``_persist`` raise.
+        try:
+            self._persist(a)
+        except Exception as exc:
+            logger.error("[AgentRegistry] heartbeat persist agent=%s failed: %s", agent_id, exc)
         return True
 
     def cleanup_expired(self) -> list[str]:
@@ -235,25 +256,32 @@ class AgentRegistry:
         """
         from app.multiagent.agent_instance import AgentStatus
         expiry = []
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         active_states = {
             AgentStatus.CLAIMING, AgentStatus.RUNNING, AgentStatus.STOPPING,
         }
-        for agent_id, a in list(self._agents.items()):
-            if a.last_heartbeat_at is None:
-                continue
-            if a.status not in active_states:
-                # IDLE/FAILED/STOPPED/BLOCKED agents are never reaped here.
-                continue
-            idle_time = (now - a.last_heartbeat_at).total_seconds()
-            if idle_time > self._lease_timeout and a.is_alive():
-                a.update_status(AgentStatus.FAILED)
-                self._persist(a)
-                expiry.append(agent_id)
-                logger.warning(
-                    f"[AgentRegistry] agent {agent_id} lease expired ({idle_time:.0f}s) "
-                    f"while status={a.status.value}"
-                )
+        with self._lock:
+            for agent_id, a in list(self._agents.items()):
+                if a.last_heartbeat_at is None:
+                    continue
+                if a.status not in active_states:
+                    # IDLE/FAILED/STOPPED/BLOCKED agents are never reaped here.
+                    continue
+                idle_time = (now - a.last_heartbeat_at).total_seconds()
+                if idle_time > self._lease_timeout and a.is_alive():
+                    a.update_status(AgentStatus.FAILED)
+                    try:
+                        self._persist(a)
+                    except Exception as exc:
+                        logger.error(
+                            "[AgentRegistry] cleanup_expired persist agent=%s failed: %s",
+                            agent_id, exc,
+                        )
+                    expiry.append(agent_id)
+                    logger.warning(
+                        f"[AgentRegistry] agent {agent_id} lease expired ({idle_time:.0f}s) "
+                        f"while status={a.status.value}"
+                    )
         return expiry
 
     # ===== 销毁 =====
@@ -277,7 +305,23 @@ class AgentRegistry:
         return True
 
     def remove(self, agent_id: str) -> bool:
-        return self._agents.pop(agent_id, None) is not None
+        with self._lock:
+            return self._agents.pop(agent_id, None) is not None
+
+    def purge_run(self, run_id: str) -> int:
+        """Drop every agent belonging to a finished run from the registry.
+
+        Without this the process-level ``_agents`` dict grows without bound:
+        ``cleanup_expired`` only flips expired agents to FAILED, it never
+        removes them, and ``remove`` was never called by any production path.
+        Returns the number of agents evicted.
+        """
+        evicted = 0
+        with self._lock:
+            for agent_id in [aid for aid, a in self._agents.items() if a.run_id == run_id]:
+                self._agents.pop(agent_id, None)
+                evicted += 1
+        return evicted
 
     @staticmethod
     def _persist(agent: AgentInstance) -> None:
@@ -285,28 +329,26 @@ class AgentRegistry:
 
         Callers must not need to remember a second persistence operation after
         every reserve/release/heartbeat transition; a restart should observe
-        the same agent lease that the scheduler just made.
+        the same agent lease that the scheduler just made.  A failed durable
+        write makes recovery unsafe (in-memory state diverges from disk), so
+        it is surfaced to the caller — aligned with ``TaskBoard._persist``.
+        Background loops that must stay alive (``heartbeat``, ``cleanup_expired``)
+        catch and log this themselves.
         """
-        try:
-            from app.infrastructure.database.run_store import get_agent_run_history
-            get_agent_run_history().upsert_agent_instance(
-                agent_id=agent.agent_id, team_id=agent.team_id, run_id=agent.run_id,
-                profile_id=agent.profile_id, name=agent.name, role=agent.role,
-                session_id=agent.session_id, thread_id=agent.thread_id,
-                checkpoint_namespace=agent.checkpoint_namespace,
-                status=agent.status.value, current_task_id=agent.current_task_id,
-                workspace_root=agent.workspace_root,
-                last_heartbeat_at=agent.last_heartbeat_at,
-                capabilities=agent.capabilities,
-                metadata={**agent.metadata, "worktree_path": agent.worktree_path,
-                          "mailbox_cursor": agent.mailbox_cursor},
-                created_at=agent.created_at, stopped_at=agent.stopped_at,
-            )
-        except Exception as exc:
-            # Scheduling must observe the transition even if durable storage is
-            # temporarily unavailable; the run will fail/recover explicitly,
-            # never silently become completed.
-            logger.error("[AgentRegistry] persist agent=%s failed: %s", agent.agent_id, exc)
+        from app.infrastructure.database.run_store import get_agent_run_history
+        get_agent_run_history().upsert_agent_instance(
+            agent_id=agent.agent_id, team_id=agent.team_id, run_id=agent.run_id,
+            profile_id=agent.profile_id, name=agent.name, role=agent.role,
+            session_id=agent.session_id, thread_id=agent.thread_id,
+            checkpoint_namespace=agent.checkpoint_namespace,
+            status=agent.status.value, current_task_id=agent.current_task_id,
+            workspace_root=agent.workspace_root,
+            last_heartbeat_at=agent.last_heartbeat_at,
+            capabilities=agent.capabilities,
+            metadata={**agent.metadata, "worktree_path": agent.worktree_path,
+                      "mailbox_cursor": agent.mailbox_cursor},
+            created_at=agent.created_at, stopped_at=agent.stopped_at,
+        )
 
 
 # ===== 全局单例 =====

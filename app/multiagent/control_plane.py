@@ -132,14 +132,13 @@ class TeamControlPlaneService:
     def team_mark_blocked(self, run_id: str, agent_id: str, task_id: str,
                           reason: str) -> bool:
         self._caller(run_id, agent_id)
-        task = self.board.get(task_id, run_id=run_id)
-        if task is None or task.claimed_by != agent_id or task.status != BoardTaskStatus.RUNNING:
-            return False
-        task.status = BoardTaskStatus.BLOCKED
-        task.last_error = reason
-        self.board.add(task)
-        self._audit("mark_blocked", run_id, agent_id, {"task_id": task_id, "reason": reason})
-        return True
+        # Use the board's atomic transition instead of a get→mutate→add
+        # sequence: the latter mutated a shared object while other threads
+        # could iterate it, and raced with the scheduler's own state changes.
+        success = self.board.mark_blocked(task_id, agent_id, reason, run_id=run_id)
+        if success:
+            self._audit("mark_blocked", run_id, agent_id, {"task_id": task_id, "reason": reason})
+        return success
 
     def team_request_replan(
         self,
@@ -329,13 +328,24 @@ class TeamControlPlaneService:
 
 
 def build_team_tools(service: TeamControlPlaneService, run_id: str, agent_id: str,
-                     safety_point: Callable[[], Any] | None = None) -> list[Any]:
-    """Build the governed internal tool set with a bound, non-forgeable caller."""
+                     safety_point: Callable[[], Any] | None = None,
+                     cancel_event: Any | None = None) -> list[Any]:
+    """Build the governed internal tool set with a bound, non-forgeable caller.
+
+    ``cancel_event`` is the same ``CancellationToken`` the scheduler sets when
+    a task times out or a teammate is stopped.  Without this check a timed-out
+    worker thread keeps running (``asyncio.to_thread`` cannot interrupt sync
+    code) and its team tools would still mutate the shared board/registry —
+    creating ghost sub-tasks or flipping state on a task the scheduler has
+    already released.  Each tool now refuses to act once the token is set.
+    """
     from langchain.tools import tool
 
     def before() -> None:
         if safety_point:
             safety_point()
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("agent_cancelled: team tools unavailable after cancel/timeout")
 
     @tool
     def team_list_members() -> str:

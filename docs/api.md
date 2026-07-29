@@ -25,11 +25,18 @@ Git 路径；浏览器路径本身不会上传仓库。
 
 ## 子资源
 
-- Agents：`/runs/{run_id}/agents`、`/agents/{agent_id}`、消息、停止。
-- Tasks：`/runs/{run_id}/tasks`、`/tasks/{task_id}?run_id=...`、`task-graph`。
-- Artifacts：清单、详情、lineage、文本 content、download。
-- Governance：permissions 和 plans 的待审批清单与 decision。
-- Evidence：verification、errors、worktrees、git。
+- Agents：`/runs/{run_id}/agents`、`/runs/{run_id}/agents/{agent_id}`、
+  `/agents/{agent_id}`、消息广播与停止。
+- Messages：`GET /runs/{run_id}/messages`（分页）、`POST /runs/{run_id}/messages`（广播）、
+  `POST /runs/{run_id}/agents/{agent_id}/messages`（定向）。
+- Tasks：`/runs/{run_id}/tasks`、`/runs/{run_id}/tasks/{task_id}`、
+  `/tasks/{task_id}?run_id=...`、`/runs/{run_id}/task-graph`。
+- Artifacts：清单、`/runs/{run_id}/artifacts/{artifact_id}`、
+  `/artifacts/{artifact_id}`（全局详情）、lineage、文本 content（Run 级与全局）、download。
+- Governance：`/runs/{run_id}/permissions`、`/runs/{run_id}/permissions/{request_id}/decision`、
+  `/runs/{run_id}/plans`、`/runs/{run_id}/plans/{plan_id}/decision`。
+- Evidence：`/runs/{run_id}/verification`、`/runs/{run_id}/errors`、
+  `/runs/{run_id}/worktrees`、`/runs/{run_id}/git`。
 - Settings：`GET /settings`，密钥只返回是否已配置。
 
 Artifact content 最大预览 512 KiB；二进制返回 415；download 与 content 都会校验解析后
@@ -75,5 +82,5 @@ SQLite 再发送；空闲期间发送 keepalive 注释。
 记录 `ManualRetryRequested`，并在新的 checkpoint namespace 中重新进入同一 Root Graph。
 没有可恢复 Task 时返回 409。
 
-常见错误：404 资源或边界不存在，409 当前状态不允许操作，415 Artifact 无文本预览，
-422 请求校验失败，429 超过速率限制。
+常见错误：403 控制面操作需要 API token（非环回调用），404 资源或边界不存在，
+409 当前状态不允许操作，415 Artifact 无文本预览，422 请求校验失败，429 超过速率限制。

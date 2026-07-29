@@ -1,6 +1,6 @@
 """Pydantic 数据结构：任务、事件、产物、响应格式等。"""
 
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
@@ -36,7 +36,7 @@ class ArtifactInfo(BaseModel):
 class TaskEvent(BaseModel):
     event_type: str = Field(..., description="事件类型")
     data: dict[str, Any] = Field(default_factory=dict, description="事件数据")
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class TaskResponse(BaseModel):

@@ -19,7 +19,7 @@ from __future__ import annotations
 import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -49,6 +49,15 @@ class ToolPolicy(BaseModel):
     allow_file_read: bool = Field(default=True)
     allow_file_write: bool = Field(default=False)
     allow_shell: bool = Field(default=False)
+    allow_team_tools: bool = Field(
+        default=True,
+        description=(
+            "是否暴露团队协作工具（team_list_tasks / team_create_task / "
+            "team_send_message 等）。只读评审角色应关闭，以落实最小权限："
+            "LLM 不应看到它无权调用的工具。V3 的角色边界由本字段 + "
+            "permission_broker（操作级）+ shell_policy（命令级）共同强制。"
+        ),
+    )
 
 
 class MemoryPolicy(BaseModel):
@@ -249,7 +258,7 @@ class CapabilityRegistry:
 
             # 近期活跃加分（活跃 = 有负载但不繁忙）
             if metrics.last_active:
-                idle_hours = (datetime.utcnow() - metrics.last_active).total_seconds() / 3600
+                idle_hours = (datetime.now(UTC) - metrics.last_active).total_seconds() / 3600
                 if idle_hours < 0.5:
                     score += 10.0  # 正在热池里
                 elif idle_hours < 24:
@@ -267,7 +276,7 @@ class CapabilityRegistry:
             m.success_rate = 1.0 if m.total_tasks == 0 else (
                 (m.total_tasks - m.failed_tasks) / m.total_tasks
             )
-            m.last_active = datetime.utcnow()
+            m.last_active = datetime.now(UTC)
             m.current_load = max(0, m.current_load - 1)
 
     def record_failure(self, profile_id: str) -> None:
@@ -278,7 +287,7 @@ class CapabilityRegistry:
             m.success_rate = 1.0 if m.total_tasks == 0 else (
                 (m.total_tasks - m.failed_tasks) / m.total_tasks
             )
-            m.last_active = datetime.utcnow()
+            m.last_active = datetime.now(UTC)
             m.current_load = max(0, m.current_load - 1)
 
     def increment_load(self, profile_id: str) -> None:
@@ -364,6 +373,12 @@ class CapabilityRegistry:
                     allow_file_read=True,
                     allow_file_write=False,
                     allow_shell=False,
+                    # Reviewer only inspects artifacts; it must not create
+                    # tasks, spawn teammates, or otherwise mutate team state.
+                    # The mutating team tools are already gated by
+                    # permission_broker, but least-privilege means the LLM
+                    # should not even see them.
+                    allow_team_tools=False,
                 ),
                 max_concurrency=3,
             ),

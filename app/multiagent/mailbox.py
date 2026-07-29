@@ -18,7 +18,7 @@ import threading
 import asyncio
 import uuid
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Callable
 
@@ -56,7 +56,7 @@ class MailboxMessage(BaseModel):
     delivery_attempts: int = 0
     consumed_at: datetime | None = None
 
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -205,7 +205,7 @@ class Mailbox:
                 return out
             while inbox and len(out) < max_count:
                 msg = inbox.popleft()
-                msg.consumed_at = datetime.utcnow()
+                msg.consumed_at = datetime.now(UTC)
                 out.append(msg)
         for msg in out:
             self._persist_message(msg)
@@ -420,7 +420,7 @@ class Mailbox:
                         reply_to=r.get("reply_to"),
                         delivery_attempts=r.get("delivery_attempts") or 0,
                         consumed_at=datetime.fromisoformat(r["consumed_at"]) if r.get("consumed_at") else None,
-                        created_at=datetime.fromisoformat(r["created_at"]) if r.get("created_at") else datetime.utcnow(),
+                        created_at=datetime.fromisoformat(r["created_at"]) if r.get("created_at") else datetime.now(UTC),
                         metadata=json.loads(r.get("metadata") or "{}"),
                     )
                 except Exception as exc:

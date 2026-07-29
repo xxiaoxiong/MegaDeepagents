@@ -1,6 +1,6 @@
 """Task 数据模型。"""
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -12,7 +12,7 @@ class TaskMessage(BaseModel):
     role: str = Field(..., description="user | assistant | system | tool")
     content: str = Field(default="", description="消息内容")
     extra: dict[str, Any] = Field(default_factory=dict, description="扩展信息，如 tool name、status 等")
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class Task(BaseModel):
@@ -25,5 +25,5 @@ class Task(BaseModel):
     error_message: str | None = None
     events: list[TaskEvent] = Field(default_factory=list)
     messages: list[TaskMessage] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))

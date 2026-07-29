@@ -1,13 +1,23 @@
 """Skills routes: 查询和注册 Skills。"""
 
-from fastapi import APIRouter, Body
-from pydantic import BaseModel
+import re
+from pathlib import Path
+
+from fastapi import APIRouter, Body, HTTPException
+from pydantic import BaseModel, field_validator
 
 from app.core.logging import logger
 from app.skills.loader import get_skill_loader
 from app.skills.metadata import list_skills, register_skill, get_skill, update_skill_state
 
 router = APIRouter()
+
+# Skill names are used directly as filesystem subdirectories under
+# ``settings.skills_dir``.  Reject anything outside ``[A-Za-z0-9_-]`` so
+# ``../../etc/cron.d/pwned`` cannot create a directory outside the skills
+# root.  Keep the pattern tight: dots, spaces, and shell metacharacters are
+# all disallowed.
+_SKILL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 class SkillCreateBody(BaseModel):
@@ -17,9 +27,25 @@ class SkillCreateBody(BaseModel):
     created_by: str = "user"
     source: str = "local"
 
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, value: str) -> str:
+        if not value or len(value) > 64 or not _SKILL_NAME_PATTERN.match(value):
+            raise ValueError(
+                "name must be 1-64 characters of [A-Za-z0-9_-] only"
+            )
+        return value
+
 
 class PinBody(BaseModel):
     pinned: bool
+
+
+def _ensure_safe_skill_name(name: str) -> str:
+    """Defense-in-depth check used by every name-bearing endpoint."""
+    if not name or len(name) > 64 or not _SKILL_NAME_PATTERN.match(name):
+        raise HTTPException(status_code=422, detail="invalid skill name")
+    return name
 
 
 @router.get("/skills")
@@ -46,6 +72,7 @@ def list_skills_api():
 
 @router.get("/skills/{name}")
 def read_skill(name: str):
+    _ensure_safe_skill_name(name)
     loader = get_skill_loader()
     content = loader.read_content(name)
     if content is None:
@@ -55,9 +82,17 @@ def read_skill(name: str):
 
 @router.post("/skills")
 def create_skill(body: SkillCreateBody):
-    from pathlib import Path
     from app.core.config import settings
-    skill_dir = Path(settings.skills_dir) / body.name
+    # Re-check even though pydantic validated: the field_validator only runs
+    # when the body is parsed as JSON; defensive depth costs nothing here.
+    _ensure_safe_skill_name(body.name)
+    skills_root = Path(settings.skills_dir).resolve()
+    skill_dir = (skills_root / body.name).resolve()
+    # Final safety net: ensure the resolved path is still inside skills_root.
+    # A weird filesystem layout (symlinks, case-insensitive mounts) could
+    # otherwise let a "valid" name escape.
+    if not skill_dir.is_relative_to(skills_root):
+        raise HTTPException(status_code=422, detail="invalid skill name")
     skill_dir.mkdir(parents=True, exist_ok=True)
     skill_md = skill_dir / "SKILL.md"
     frontmatter = f"---\nname: {body.name}\ndescription: {body.description}\n"
@@ -77,6 +112,7 @@ def create_skill(body: SkillCreateBody):
 
 @router.post("/skills/{name}/pin")
 def pin_skill(name: str, body: PinBody):
+    _ensure_safe_skill_name(name)
     updated = update_skill_state(name, pinned=body.pinned)
     if not updated:
         return {"error": "Skill not found"}

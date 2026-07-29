@@ -1,7 +1,7 @@
 """任务服务：创建、执行、查询任务。"""
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 
 from app.core.logging import logger
 from app.task.models import ArtifactInfo, Task, TaskEvent, TaskMessage, TaskStatus
@@ -14,7 +14,7 @@ class TaskService:
 
     def create_task(self, user_input: str, thread_id: str = "default") -> Task:
         task_id = str(uuid.uuid4())[:8]
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         task = Task(
             task_id=task_id,
             user_input=user_input,

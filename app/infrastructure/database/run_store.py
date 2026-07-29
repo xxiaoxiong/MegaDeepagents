@@ -61,6 +61,141 @@ def make_task_run_id() -> str:
     return "trun_" + uuid.uuid4().hex[:12]
 
 
+_EVENT_ENVELOPES_DDL = """CREATE TABLE IF NOT EXISTS event_envelopes (
+    event_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, agent_id TEXT,
+    task_id TEXT, event_type TEXT NOT NULL, sequence INTEGER NOT NULL,
+    timestamp TEXT NOT NULL, payload TEXT NOT NULL, trace_id TEXT,
+    idempotency_key TEXT,
+    UNIQUE(run_id, sequence)
+)"""
+
+# Partial unique index: only rows that actually carry an idempotency_key are
+# constrained.  Existing rows (and rows emitted without a key) keep NULL and
+# are unaffected, so this is safe to add to a live database.
+_EVENT_ENVELOPES_IDEM_INDEX_DDL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_event_envelopes_idem "
+    "ON event_envelopes(idempotency_key) WHERE idempotency_key IS NOT NULL"
+)
+
+# ``ALTER TABLE ADD COLUMN`` is needed for databases that already have the
+# table from an older build (CREATE TABLE IF NOT EXISTS will not add the
+# column).  Detect via PRAGMA table_info so the ALTER only runs once.
+_EVENT_ENVELOPES_ADD_IDEM_COLUMN = (
+    "ALTER TABLE event_envelopes ADD COLUMN idempotency_key TEXT"
+)
+
+
+# Track which connection objects have already been bootstrapped with the
+# event_envelopes schema.  ``CREATE TABLE IF NOT EXISTS`` is idempotent but
+# SQLite still parses and plans it on every call; on the SSE hot path
+# (``list_event_envelopes`` polled at ~5 Hz) and on every ``record_event``
+# that parsing showed up as measurable write amplification.  The canonical
+# connection is thread-local so this set is only consulted by one thread.
+_event_envelopes_initialized_conns: set[int] = set()
+
+
+def _ensure_event_envelopes(conn) -> None:
+    """Create the ``event_envelopes`` table if it does not yet exist.
+
+    Centralised so the canonical SSE-replay table is defined in one place
+    instead of being re-declared on every hot-path read/write.  The DDL only
+    runs once per connection object; subsequent calls are a set lookup.
+    """
+    conn_id = id(conn)
+    if conn_id in _event_envelopes_initialized_conns:
+        return
+    conn.execute(_EVENT_ENVELOPES_DDL)
+    # Add the idempotency_key column to pre-existing tables (older builds
+    # created the table without it).  PRAGMA table_info lets us detect the
+    # missing column cheaply; ALTER TABLE ADD COLUMN is idempotent-safe
+    # because we only run it when the column is absent.
+    try:
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(event_envelopes)").fetchall()
+        }
+        if "idempotency_key" not in columns:
+            conn.execute(_EVENT_ENVELOPES_ADD_IDEM_COLUMN)
+    except Exception:
+        # If the ALTER fails (e.g. column somehow already exists under a
+        # concurrent migration), the partial index below still works on
+        # fresh tables and on tables that already have the column.
+        pass
+    conn.execute(_EVENT_ENVELOPES_IDEM_INDEX_DDL)
+    _event_envelopes_initialized_conns.add(conn_id)
+
+
+def _append_event_envelope(
+    conn,
+    *,
+    event_id: str,
+    run_id: str,
+    event_type: str,
+    agent_id: str | None = None,
+    task_id: str | None = None,
+    task_run_id: str | None = None,
+    trace_id: str | None = None,
+    occurred_at: str | None = None,
+    payload: dict[str, Any] | None = None,
+    idempotency_key: str | None = None,
+) -> int:
+    """Append one event to ``team_events`` + ``event_envelopes`` atomically.
+
+    This is the transactional outbox writer.  The caller MUST already hold a
+    ``BEGIN IMMEDIATE`` transaction on ``conn`` so the event is committed in
+    the same statement as the state change it describes — that is what makes
+    the event visible to the SSE stream (which reads ``event_envelopes``)
+    without a separate consumer/ACK loop.  The previous ``control_plane_outbox``
+    table wrote rows here but never drained them, so control-plane events
+    (TaskCreated / TaskGraphReplanned / TaskGraphMutation) were invisible to
+    SSE; this helper replaces that dead infrastructure.
+
+    When ``idempotency_key`` is supplied, a prior event with the same key
+    short-circuits: the existing sequence is returned and no duplicate row is
+    inserted.  This protects budget restoration (``TaskToolBudgetConsumed``)
+    and other replay-sensitive callers from double-counting when the same
+    logical event is emitted more than once.
+
+    Returns the assigned per-run sequence number.
+    """
+    timestamp = occurred_at or datetime.now(UTC).isoformat()
+    safe_payload = _redact_event_payload(payload or {})
+    payload_json = json.dumps(safe_payload)
+    # Idempotency: if a prior event with the same key already exists, return
+    # its sequence and skip the insert.  The partial unique index
+    # ``idx_event_envelopes_idem`` is the backstop in case two callers race
+    # inside separate transactions (the second INSERT would raise
+    # IntegrityError, which the caller's rollback handles).
+    if idempotency_key is not None:
+        existing = conn.execute(
+            "SELECT sequence FROM event_envelopes WHERE idempotency_key=?",
+            (idempotency_key,),
+        ).fetchone()
+        if existing is not None:
+            return int(existing["sequence"])
+    conn.execute(
+        """INSERT INTO team_events (
+            event_id, run_id, event_type, agent_id, task_id, task_run_id,
+            timestamp, trace_id, payload
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (event_id, run_id, event_type, agent_id, task_id, task_run_id,
+         timestamp, trace_id, payload_json),
+    )
+    sequence = int(conn.execute(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM event_envelopes WHERE run_id=?",
+        (run_id,),
+    ).fetchone()["seq"])
+    conn.execute(
+        """INSERT INTO event_envelopes (
+            event_id, run_id, agent_id, task_id, event_type, sequence,
+            timestamp, payload, trace_id, idempotency_key
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (event_id, run_id, agent_id, task_id, event_type, sequence,
+         timestamp, payload_json, trace_id, idempotency_key),
+    )
+    return sequence
+
+
 class AgentRunHistory:
     """AgentInstance、TaskRun、TeamEvent 持久化接口。
 
@@ -77,7 +212,7 @@ class AgentRunHistory:
                       workspace_root: str, status: str, max_rounds: int,
                       review_required: bool, metadata: dict[str, Any] | None = None) -> None:
         _ensure_team_runs(self.conn)
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(UTC).isoformat()
         self.conn.execute(
             """INSERT INTO team_runs (run_id, goal, team_id, mode, workspace_root, status,
                max_rounds, review_required, metadata, created_at, updated_at)
@@ -97,7 +232,7 @@ class AgentRunHistory:
     def update_team_run_status(self, run_id: str, status: str) -> bool:
         _ensure_team_runs(self.conn)
         cur = self.conn.execute("UPDATE team_runs SET status=?, updated_at=? WHERE run_id=?",
-                                (status, datetime.utcnow().isoformat(), run_id))
+                                (status, datetime.now(UTC).isoformat(), run_id))
         self.conn.commit()
         return cur.rowcount > 0
 
@@ -250,18 +385,39 @@ class AgentRunHistory:
     def merge_team_run_metadata(
         self, run_id: str, updates: dict[str, Any]
     ) -> dict[str, Any] | None:
-        """Merge operational metadata without replacing the durable Run."""
-        record = self.get_team_run(run_id)
-        if record is None:
-            return None
-        metadata = dict(record.get("metadata") or {})
-        metadata.update(updates)
-        self.conn.execute(
-            "UPDATE team_runs SET metadata=?, updated_at=? WHERE run_id=?",
-            (json.dumps(metadata), datetime.utcnow().isoformat(), run_id),
-        )
-        self.conn.commit()
-        return metadata
+        """Merge operational metadata without replacing the durable Run.
+
+        Previously this performed a read-modify-write outside any transaction:
+        ``get_team_run`` read ``metadata``, then a separate ``UPDATE`` wrote
+        it back.  ``acquire_team_run_execution_lease`` / ``refresh_*`` write
+        ``metadata.execution_lease`` inside ``BEGIN IMMEDIATE``; if either of
+        those ran between the read and the write here, the lease would be
+        silently overwritten and the scheduler's lease-lost detector would
+        cancel a still-running Run.  Wrap the whole merge in
+        ``BEGIN IMMEDIATE`` so the read and the write are one atomic step.
+        """
+        _ensure_team_runs(self.conn)
+        now = datetime.now(UTC)
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT metadata FROM team_runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                self.conn.rollback()
+                return None
+            metadata = json.loads(row["metadata"] or "{}")
+            metadata.update(updates)
+            self.conn.execute(
+                "UPDATE team_runs SET metadata=?, updated_at=? WHERE run_id=?",
+                (json.dumps(metadata), now.isoformat(), run_id),
+            )
+            self.conn.commit()
+            return metadata
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def list_team_runs(self, limit: int = 50) -> list[dict[str, Any]]:
         """List durable runs for one unified API control plane."""
@@ -283,7 +439,7 @@ class AgentRunHistory:
                  payload=excluded.payload, updated_at=excluded.updated_at""",
             (
                 payload["run_id"], payload["task_id"], json.dumps(payload),
-                datetime.utcnow().isoformat(),
+                datetime.now(UTC).isoformat(),
             ),
         )
         self.conn.commit()
@@ -342,7 +498,7 @@ class AgentRunHistory:
                VALUES (?, ?, ?, ?)
                ON CONFLICT(run_id) DO UPDATE SET version=excluded.version,
                  graph_json=excluded.graph_json, updated_at=excluded.updated_at""",
-            (run_id, version, json.dumps(graph), datetime.utcnow().isoformat()),
+            (run_id, version, json.dumps(graph), datetime.now(UTC).isoformat()),
         )
         self.conn.commit()
 
@@ -382,7 +538,7 @@ class AgentRunHistory:
         created_at: datetime | None = None,
         stopped_at: datetime | None = None,
     ) -> None:
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(UTC).isoformat()
         self.conn.execute(
             """
             INSERT INTO agent_instances (
@@ -408,7 +564,7 @@ class AgentRunHistory:
                 last_heartbeat_at.isoformat() if last_heartbeat_at else None,
                 json.dumps(capabilities or []),
                 json.dumps(metadata or {}),
-                (created_at or datetime.utcnow()).isoformat(),
+                (created_at or datetime.now(UTC)).isoformat(),
                 now,
                 stopped_at.isoformat() if stopped_at else None,
             ),
@@ -472,7 +628,7 @@ class AgentRunHistory:
                 status, checkpoint_id,
                 json.dumps(artifact_ids or []),
                 json.dumps(tool_calls or []),
-                (started_at or datetime.utcnow()).isoformat(),
+                (started_at or datetime.now(UTC)).isoformat(),
                 finished_at.isoformat() if finished_at else None,
                 error,
                 json.dumps(metadata or {}),
@@ -487,7 +643,7 @@ class AgentRunHistory:
         checkpoint_id: str | None = None,
         error: str | None = None,
     ) -> bool:
-        finished_at = (datetime.utcnow().isoformat()
+        finished_at = (datetime.now(UTC).isoformat()
                         if status in ("succeeded", "failed", "cancelled") else None)
         cur = self.conn.execute(
             """
@@ -550,40 +706,40 @@ class AgentRunHistory:
         trace_id: str | None = None,
         timestamp: datetime | None = None,
         payload: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> None:
-        occurred_at = (timestamp or datetime.utcnow()).isoformat()
-        safe_payload = _redact_event_payload(payload or {})
+        occurred_at = (timestamp or datetime.now(UTC)).isoformat()
         conn = self.conn
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS event_envelopes (
-                event_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, agent_id TEXT,
-                task_id TEXT, event_type TEXT NOT NULL, sequence INTEGER NOT NULL,
-                timestamp TEXT NOT NULL, payload TEXT NOT NULL, trace_id TEXT,
-                UNIQUE(run_id, sequence)
-            )"""
-        )
-        conn.execute("BEGIN IMMEDIATE")
+        _ensure_event_envelopes(conn)
+        # Transaction-aware: when a caller already holds a BEGIN IMMEDIATE
+        # (e.g. TransactionalTaskService.apply runs mutations inside one and
+        # lifecycle hooks call back into record_event), append within that
+        # transaction so the event commits atomically with the state change.
+        # Starting a nested BEGIN would raise "cannot start a transaction
+        # within a transaction".  Only manage BEGIN/COMMIT when no transaction
+        # is active.
+        owns_transaction = not conn.in_transaction
+        if owns_transaction:
+            conn.execute("BEGIN IMMEDIATE")
         try:
-            conn.execute(
-                """INSERT INTO team_events (
-                    event_id, run_id, event_type, agent_id, task_id, task_run_id,
-                    timestamp, trace_id, payload
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (event_id, run_id, event_type, agent_id, task_id, task_run_id,
-                 occurred_at, trace_id, json.dumps(safe_payload)),
+            _append_event_envelope(
+                conn,
+                event_id=event_id,
+                run_id=run_id,
+                event_type=event_type,
+                agent_id=agent_id,
+                task_id=task_id,
+                task_run_id=task_run_id,
+                trace_id=trace_id,
+                occurred_at=occurred_at,
+                payload=payload,
+                idempotency_key=idempotency_key,
             )
-            sequence = int(conn.execute(
-                "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM event_envelopes WHERE run_id=?",
-                (run_id,),
-            ).fetchone()["seq"])
-            conn.execute(
-                "INSERT INTO event_envelopes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (event_id, run_id, agent_id, task_id, event_type, sequence,
-                 occurred_at, json.dumps(safe_payload), trace_id),
-            )
-            conn.commit()
+            if owns_transaction:
+                conn.commit()
         except Exception:
-            conn.rollback()
+            if owns_transaction:
+                conn.rollback()
             raise
 
     def list_events(self, run_id: str, event_type: str | None = None) -> list[dict[str, Any]]:
@@ -598,14 +754,7 @@ class AgentRunHistory:
 
     def list_event_envelopes(self, run_id: str, after_sequence: int = 0,
                              limit: int = 500) -> list[dict[str, Any]]:
-        self.conn.execute(
-            """CREATE TABLE IF NOT EXISTS event_envelopes (
-                event_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, agent_id TEXT,
-                task_id TEXT, event_type TEXT NOT NULL, sequence INTEGER NOT NULL,
-                timestamp TEXT NOT NULL, payload TEXT NOT NULL, trace_id TEXT,
-                UNIQUE(run_id, sequence)
-            )"""
-        )
+        _ensure_event_envelopes(self.conn)
         rows = self.conn.execute(
             "SELECT * FROM event_envelopes WHERE run_id=? AND sequence>? "
             "ORDER BY sequence LIMIT ?", (run_id, after_sequence, min(limit, 2000)),
@@ -622,14 +771,7 @@ class AgentRunHistory:
 
     def event_envelope_stats(self, run_id: str) -> dict[str, Any]:
         """Return cheap liveness statistics without replaying the audit log."""
-        self.conn.execute(
-            """CREATE TABLE IF NOT EXISTS event_envelopes (
-                event_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, agent_id TEXT,
-                task_id TEXT, event_type TEXT NOT NULL, sequence INTEGER NOT NULL,
-                timestamp TEXT NOT NULL, payload TEXT NOT NULL, trace_id TEXT,
-                UNIQUE(run_id, sequence)
-            )"""
-        )
+        _ensure_event_envelopes(self.conn)
         aggregate = self.conn.execute(
             "SELECT COUNT(*) AS event_count, COALESCE(MAX(sequence), 0) AS last_sequence "
             "FROM event_envelopes WHERE run_id=?",
@@ -674,7 +816,7 @@ class AgentRunHistory:
             """,
             (
                 request_id, run_id, agent_id, operation, target, reason,
-                (created_at or datetime.utcnow()).isoformat()
+                (created_at or datetime.now(UTC)).isoformat()
             ),
         )
         self.conn.commit()
@@ -691,7 +833,7 @@ class AgentRunHistory:
             SET status = 'decided', decided_by = ?, decision = ?, decided_at = ?
             WHERE request_id = ? AND status = 'pending'
             """,
-            (decided_by, decision, datetime.utcnow().isoformat(), request_id)
+            (decided_by, decision, datetime.now(UTC).isoformat(), request_id)
         )
         self.conn.commit()
         return cur.rowcount > 0
@@ -730,18 +872,26 @@ class AgentRunHistory:
         conn = self.conn
         conn.execute("BEGIN IMMEDIATE")
         try:
+            # INSERT OR REPLACE would clobber an existing row's ``status``
+            # (e.g. ``verified`` / ``rejected``) back to ``published`` on any
+            # re-insert with the same artifact_id.  Artifact ids are UUIDs so
+            # this is not reachable today, but the REPLACE semantics were a
+            # latent footgun: a future refactor that reuses an id would
+            # silently un-verify an artifact.  ON CONFLICT DO NOTHING preserves
+            # the durable lifecycle state.
             conn.execute(
                 """
-                INSERT OR REPLACE INTO artifacts (
+                INSERT INTO artifacts (
                     artifact_id, run_id, task_id, type, relative_path, content_hash,
                     size_bytes, version, produced_by, status, predecessor_id,
                     parent_artifact_id, created_at, metadata
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(artifact_id) DO NOTHING
                 """,
                 (
                     artifact_id, run_id, task_id, type, relative_path, content_hash,
                     size_bytes, version, produced_by, status, predecessor_id,
-                    parent_artifact_id, datetime.utcnow().isoformat(),
+                    parent_artifact_id, datetime.now(UTC).isoformat(),
                     json.dumps(metadata or {})
                 )
             )
@@ -821,7 +971,7 @@ class AgentRunHistory:
                 thread_id, reply_to, delivery_attempts,
                 consumed_at.isoformat() if consumed_at else None,
                 status,
-                (created_at or datetime.utcnow()).isoformat(),
+                (created_at or datetime.now(UTC)).isoformat(),
                 json.dumps(metadata or {}),
             )
         )
@@ -856,7 +1006,7 @@ class AgentRunHistory:
     def mark_mailbox_consumed(self, message_id: str) -> bool:
         cur = self.conn.execute(
             "UPDATE mailbox_messages SET status='consumed', consumed_at=? WHERE message_id=?",
-            (datetime.utcnow().isoformat(), message_id)
+            (datetime.now(UTC).isoformat(), message_id)
         )
         self.conn.commit()
         return cur.rowcount > 0
@@ -908,6 +1058,13 @@ def _ensure_team_runs(conn) -> None:
             metadata TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
         )"""
     )
+    # ``list_team_runs`` orders by ``updated_at DESC LIMIT 50`` on every
+    # dashboard load; without this index SQLite does a full table scan plus
+    # a filesort on every call.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_team_runs_updated_at "
+        "ON team_runs(updated_at DESC)"
+    )
     conn.commit()
 
 
@@ -954,3 +1111,12 @@ def get_agent_run_history() -> AgentRunHistory:
 def reset_agent_run_history() -> None:
     global _history
     _history = None
+    # The per-connection bootstrap cache (_event_envelopes_initialized_conns)
+    # keys on id(conn).  Tests (and any caller that closes/reopens the
+    # canonical connection) get a fresh connection object whose id() may be
+    # reused after the old one is GC'd; a stale cache hit then skips the
+    # event_envelopes DDL and the next list_event_envelopes / record_event
+    # raises "no such table".  Clearing the cache on reset restores the
+    # invariant that a fresh connection always bootstraps its schema.  In
+    # production this function is never called, so the cache keeps working.
+    _event_envelopes_initialized_conns.clear()

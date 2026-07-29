@@ -546,7 +546,7 @@ class ParallelTeamScheduler:
         for 10 minutes behind T1's 900-s planning run because the scheduler
         never woke up to re-evaluate ``list_pending``.
         """
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         soonest: float | None = None
         for task in self.board.list_by_run(self.run_id):
             if task.status != BoardTaskStatus.PENDING:
@@ -587,12 +587,12 @@ class ParallelTeamScheduler:
             task for task in all_tasks
             if task.status == BoardTaskStatus.PENDING
             and task.next_attempt_at is not None
-            and task.next_attempt_at > datetime.utcnow()
+            and task.next_attempt_at > datetime.now(UTC)
         ]
         if deferred:
             due_at = min(task.next_attempt_at for task in deferred)
             wait_seconds = max(
-                0.05, (due_at - datetime.utcnow()).total_seconds()
+                0.05, (due_at - datetime.now(UTC)).total_seconds()
             )
             self._event("RetryBackoffWaiting", payload={
                 "task_ids": [task.task_id for task in deferred],
@@ -1470,12 +1470,45 @@ class ParallelTeamScheduler:
         store = getattr(self.verifier, "artifact_store", None)
         artifacts: dict[str, dict[str, Any]] = {}
         if store is not None:
+            # Recompute the on-disk hash for every produced artifact before
+            # handing it to the verifier.  ``_collect_dependency_artifacts``
+            # already called ``verify_integrity`` on upstream evidence, but
+            # the task's *own* outputs were never re-hashed, so a tampered
+            # artifact (post-``mark_produced`` edit, symlink swap, partial
+            # write after a crash) would pass verification.  Fail closed: a
+            # single integrity failure rejects the whole task.
+            tampered: list[str] = []
             for artifact in store.list_by_task(task.task_id):
                 if artifact.run_id != self.run_id:
+                    continue
+                try:
+                    if not store.verify_integrity(artifact.id):
+                        tampered.append(artifact.id)
+                        continue
+                except Exception as exc:
+                    logger.warning(
+                        "[ParallelSched] integrity probe failed task=%s art=%s: %s",
+                        task.task_id, artifact.id, exc,
+                    )
+                    tampered.append(artifact.id)
                     continue
                 content = store.read(artifact.id)
                 artifacts[artifact.id] = {"artifact_id": artifact.id,
                                           "content": content or "", "path": artifact.path}
+            if tampered:
+                current = self.board.get(task.task_id, run_id=self.run_id)
+                if current is not None:
+                    current.metadata["verification"] = {
+                        "verdict": "repair",
+                        "summary": "artifact integrity check failed",
+                        "tampered_artifact_ids": tampered,
+                    }
+                    self.board.add(current)
+                logger.warning(
+                    "[ParallelSched] integrity check failed task=%s arts=%s",
+                    task.task_id, tampered,
+                )
+                return False
         node = self.task_graph.nodes.get(task.task_id) if self.task_graph else None
         requires_artifact = bool(node and getattr(node, "output_contract", None)
                                  and getattr(node.output_contract, "artifact_type", "any") != "any")
@@ -1885,18 +1918,3 @@ def _step_to(dag: Any, node_id: str, target: Any) -> None:
         TaskNodeStatus.SUCCEEDED, TaskNodeStatus.FAILED
     ):
         dag.update_status(node_id, target)
-
-
-def _node_transition(from_status: Any, to_status: Any) -> bool:
-    """判断 TaskNode 状态转换是否合法（含中间补步）。"""
-    from app.multiagent.task_graph import is_legal_task_transition, TaskNodeStatus
-    if from_status == to_status:
-        return True
-    if is_legal_task_transition(from_status, to_status):
-        return True
-    chain_path = [TaskNodeStatus.READY, TaskNodeStatus.RUNNING]
-    current = from_status
-    for step in chain_path:
-        if is_legal_task_transition(current, step):
-            current = step
-    return is_legal_task_transition(current, to_status)

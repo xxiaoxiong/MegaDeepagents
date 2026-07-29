@@ -15,7 +15,7 @@ V3 编排与 Worker 之间的核心计划数据模型：
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
@@ -163,7 +163,7 @@ class ExecutionError(BaseModel):
     message: str = ""
     tool_name: str | None = None
     attempt: int = 0
-    occurred_at: datetime = Field(default_factory=datetime.utcnow)
+    occurred_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class TaskNode(BaseModel):
@@ -223,8 +223,8 @@ class TaskGraph(BaseModel):
     root_task_id: str
     nodes: dict[str, TaskNode] = Field(default_factory=dict)
     version: int = 1
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     @model_validator(mode="after")
     def _root_exists(self) -> "TaskGraph":
@@ -360,10 +360,10 @@ class TaskGraph(BaseModel):
             return False
         node.status = status
         if status == TaskNodeStatus.RUNNING and node.started_at is None:
-            node.started_at = datetime.utcnow()
+            node.started_at = datetime.now(UTC)
         if status in (TaskNodeStatus.SUCCEEDED, TaskNodeStatus.FAILED,
                       TaskNodeStatus.SKIPPED, TaskNodeStatus.CANCELLED):
-            node.completed_at = datetime.utcnow()
+            node.completed_at = datetime.now(UTC)
         self._touch()
         return True
 
@@ -495,4 +495,4 @@ class TaskGraph(BaseModel):
 
     def _touch(self) -> None:
         self.version += 1
-        self.updated_at = datetime.utcnow()
+        self.updated_at = datetime.now(UTC)

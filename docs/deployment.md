@@ -54,6 +54,21 @@ Git、Node 和 npm，供 Agent 和仓库级门禁验证常见 Python/Node 项目
 Go 等运行时需要在派生镜像中显式安装。访问后端根路径即可打开运行控制台，API 使用同源
 地址。公共官网和运行控制台刻意分离。
 
+### 镜像源
+
+`Dockerfile` 面向中国网络环境预配置了加速镜像源，海外部署可按需移除：
+
+| 层 | 镜像源 | 作用 |
+|---|---|---|
+| 基础镜像 | `docker.m.daocloud.io` | Docker Hub 代理（`node`、`python` 官方镜像） |
+| npm | `registry.npmmirror.com` | 前端构建 `npm ci` 加速 |
+| apt | `mirrors.aliyun.com` | Debian 包安装（git、ca-certificates） |
+| pip | `pypi.tuna.tsinghua.edu.cn` | Python 依赖安装加速 |
+
+移除方法：将 `Dockerfile` 中的 `FROM docker.m.daocloud.io/...` 改为官方镜像，
+删除 `npm config set registry`、`sed ... mirrors.aliyun.com` 和
+`-i https://pypi.tuna.tsinghua.edu.cn/simple` 即可恢复默认源。
+
 ## 健康检查
 
 - `GET /health`

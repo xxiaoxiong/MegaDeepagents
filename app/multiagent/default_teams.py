@@ -131,8 +131,15 @@ FINALIZER_SPEC = AgentSpec(
 
 SOFTWARE_DEV_TEAM = TeamSpec(
     name="software_dev_team",
-    description="软件开发团队：规划 → 实现 → 测试 → 评审 → 收尾",
-    agents=[PLANNNER_SPEC, CODER_SPEC, TESTER_SPEC, REVIEWER_SPEC, FINALIZER_SPEC],
+    description="软件开发团队：规划 → 调研 → 实现 → 测试 → 评审 → 收尾",
+    # Researcher is included because the Planner frequently emits a T002
+    # task with capabilities=['research', 'web_research'] (frontend/backend
+    # stacks to investigate, library choices, etc.).  Without a Researcher
+    # role in ``allowed_roles``, ``TeamBuilder.build_team_sync`` raises
+    # ``no_matching_worker`` and the entire run fails before any code is
+    # produced.  See run that failed with
+    #   no_matching_worker for task=T002 capabilities=['research','web_research'].
+    agents=[PLANNNER_SPEC, RESEARCHER_SPEC, CODER_SPEC, TESTER_SPEC, REVIEWER_SPEC, FINALIZER_SPEC],
     max_rounds=20,
     termination_policy="review_passed_or_max_rounds",
     review_required=True,

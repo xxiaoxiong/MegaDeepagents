@@ -20,7 +20,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from app.core.logging import logger
@@ -206,7 +206,7 @@ class TeamRunner:
         if not self.room or not self.adapter or not self.termination_checker:
             raise RuntimeError("TeamRunner not initialized. Use TeamRunner.create() or .load() first.")
 
-        start_time = datetime.utcnow()
+        start_time = datetime.now(UTC)
         self._init_executor()
 
         # 0. 发送 user_request 到总线
@@ -311,8 +311,8 @@ class TeamRunner:
                     break
 
         # 2. 完成
-        elapsed = (datetime.utcnow() - start_time).total_seconds()
-        self.room.state.updated_at = datetime.utcnow()
+        elapsed = (datetime.now(UTC) - start_time).total_seconds()
+        self.room.state.updated_at = datetime.now(UTC)
         self.room.mark_terminated()
         self.store.set_room_terminated(self.room_id, True, self.room.state.phase.value)
 
@@ -338,7 +338,7 @@ class TeamRunner:
             phase=self.room.state.phase.value,
             total_rounds=self._round,
             termination_reason=termination_reason,
-            completed_at=datetime.utcnow(),
+            completed_at=datetime.now(UTC),
         )
 
         # emit: task terminated

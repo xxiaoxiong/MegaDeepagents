@@ -185,9 +185,17 @@ def test_shell_argv_blocks_injection_and_supports_cancellation(tmp_path):
     cancel = threading.Event()
     box: dict[str, object] = {}
 
+    # Use a script file rather than ``python -c "..."``: the inline-script
+    # flag is escalated to UNKNOWN by ShellPolicyEngine (arbitrary code
+    # execution vector) and would require a PermissionBroker.  A script file
+    # is classified as BUILD_TEST, keeping this test focused on the
+    # cancellation mechanism rather than permission policy.
+    sleep_script = tmp_path / "_sleep.py"
+    sleep_script.write_text("import time; time.sleep(30)\n", encoding="utf-8")
+
     def run_long() -> None:
         box["result"] = runner.run(
-            [sys.executable, "-c", "import time; time.sleep(30)"],
+            [sys.executable, str(sleep_script)],
             cwd=str(tmp_path), timeout=60, cancel_token=cancel,
         )
 
@@ -441,9 +449,15 @@ def test_lifecycle_hook_can_block_completion_and_command_hook_is_structured(tmp_
     })
     assert result.block
     assert "review" in result.feedback
+    # Use a script file rather than ``python -c "..."``: the inline-script
+    # flag is escalated to UNKNOWN by ShellPolicyEngine (arbitrary code
+    # execution vector) and would require a PermissionBroker that the
+    # command-hook path does not configure.
+    hook_script = tmp_path / "_hook_ok.py"
+    hook_script.write_text("print('hook ok')\n", encoding="utf-8")
     hook_id = engine.register_command_hook(
         LifecycleEvent.BEFORE_TOOL_USE,
-        [sys.executable, "-c", "print('hook ok')"], cwd=str(tmp_path),
+        [sys.executable, str(hook_script)], cwd=str(tmp_path),
     )
     assert hook_id.startswith("hook_")
     assert engine.emit(LifecycleEvent.BEFORE_TOOL_USE, {

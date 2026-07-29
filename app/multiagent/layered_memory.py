@@ -28,7 +28,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from app.core.logging import logger
@@ -58,14 +58,14 @@ class MemoryEntry:
     agent_scope: str | None = None  # None = team-shared；非空 = 该 Agent 私有
     content: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     last_accessed_at: datetime | None = None
     access_count: int = 0
     importance: float = 0.5  # 0-1
     decay_rate: float = 0.01
 
     def touch(self) -> None:
-        self.last_accessed_at = datetime.utcnow()
+        self.last_accessed_at = datetime.now(UTC)
         self.access_count += 1
 
 
@@ -159,7 +159,7 @@ class EpisodicMemory:
                 if kw.lower() in e.content.lower():
                     kw_score += 0.3
             # 重要度 + 衰减
-            age_days = max((datetime.utcnow() - e.created_at).total_seconds() / 86400, 0)
+            age_days = max((datetime.now(UTC) - e.created_at).total_seconds() / 86400, 0)
             importance = e.importance * (1.0 - e.decay_rate * age_days)
             return kw_score + importance
 
@@ -342,9 +342,9 @@ def _row_to_entry(row: dict[str, Any], fallback_tier: str) -> MemoryEntry | None
         return None
     try:
         created_raw = row.get("created_at")
-        created = datetime.fromisoformat(created_raw) if isinstance(created_raw, str) else datetime.utcnow()
+        created = datetime.fromisoformat(created_raw) if isinstance(created_raw, str) else datetime.now(UTC)
     except Exception:
-        created = datetime.utcnow()
+        created = datetime.now(UTC)
     try:
         last_raw = row.get("last_accessed_at")
         last = datetime.fromisoformat(last_raw) if isinstance(last_raw, str) else None

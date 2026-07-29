@@ -2,7 +2,7 @@
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -71,7 +71,7 @@ def register_skill(name: str, path: Path, description: str, created_by: str = "u
                    source: str = "local", state: str = "active", pinned: bool = False,
                    bundled: bool = False, hub_installed: bool = False) -> dict[str, Any]:
     conn = get_connection()
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(UTC).isoformat()
     skill_id = f"skill-{name}"
     content_hash = compute_content_hash(path)
     conn.execute(
@@ -177,8 +177,8 @@ def list_skills(state: str | None = None, created_by: str | None = None) -> list
 
 def record_usage(name: str, event_type: str, task_id: str | None = None, metadata: dict | None = None):
     conn = get_connection()
-    now = datetime.utcnow().isoformat()
-    event_id = f"evt-{datetime.utcnow().timestamp():.0f}-{name}"
+    now = datetime.now(UTC).isoformat()
+    event_id = f"evt-{datetime.now(UTC).timestamp():.0f}-{name}"
     conn.execute(
         """INSERT INTO skill_usage_events (id, skill_id, task_id, event_type, created_at, metadata_json)
            VALUES (?, ?, ?, ?, ?, ?)""",

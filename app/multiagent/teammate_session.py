@@ -16,7 +16,7 @@ import asyncio
 import json
 import threading
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Awaitable, Callable
 
@@ -105,7 +105,7 @@ class QueueItem(BaseModel):
     kind: str
     payload: dict[str, Any] = Field(default_factory=dict)
     sequence: int = 0
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class TeammateSession(BaseModel):
@@ -123,7 +123,7 @@ class TeammateSession(BaseModel):
     inbox: list[dict[str, Any]] = Field(default_factory=list)
     mailbox_cursor: int = 0
     permission_request_ids: list[str] = Field(default_factory=list)
-    last_activity_at: datetime = Field(default_factory=datetime.utcnow)
+    last_activity_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     current_tool_call: dict[str, Any] | None = None
     cancellation_requested: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -134,7 +134,7 @@ class TeammateSession(BaseModel):
         if target not in _LEGAL.get(self.lifecycle_state, set()):
             raise ValueError(f"illegal teammate transition: {self.lifecycle_state.value}->{target.value}")
         self.lifecycle_state = target
-        self.last_activity_at = datetime.utcnow()
+        self.last_activity_at = datetime.now(UTC)
 
 
 def _ensure_schema() -> None:
@@ -216,7 +216,7 @@ class _PersistentQueue:
         cur = _get_conn().execute(
             "UPDATE teammate_queue_items SET status='consumed', consumed_at=? "
             "WHERE item_id=? AND session_id=? AND status='pending'",
-            (datetime.utcnow().isoformat(), item_id, self.session_id),
+            (datetime.now(UTC).isoformat(), item_id, self.session_id),
         )
         _get_conn().commit()
         return cur.rowcount == 1
@@ -275,7 +275,7 @@ class TeammateSessionActor:
                                TeammateCommandType.PLAN_DECISION.value):
                 observed["decisions"].append(item.payload)
             self.commands.ack(item.item_id)
-        self.session.last_activity_at = datetime.utcnow()
+        self.session.last_activity_at = datetime.now(UTC)
         self.supervisor.persist(self.session)
         self.events.put(TeammateEventType.SAFETY_POINT.value, observed)
         return observed
@@ -373,7 +373,7 @@ class TeammateSupervisor:
             "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET "
             "payload=excluded.payload, updated_at=excluded.updated_at",
             (session.session_id, session.run_id, session.agent_id, session.profile_id,
-             json.dumps(payload), datetime.utcnow().isoformat()),
+             json.dumps(payload), datetime.now(UTC).isoformat()),
         )
         _get_conn().commit()
 

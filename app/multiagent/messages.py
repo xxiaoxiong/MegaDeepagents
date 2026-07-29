@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Literal
 
@@ -143,7 +143,7 @@ class AgentMessage(BaseModel):
         default_factory=dict,
         description="自由扩展元数据，例如 round、selected_speaker、tool_name",
     )
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     def to_broadcast_dict(self) -> dict[str, Any]:
         """供前端 / 落库使用的扁平字典。"""

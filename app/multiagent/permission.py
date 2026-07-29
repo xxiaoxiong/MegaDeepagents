@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
@@ -59,7 +59,7 @@ class PermissionRequest(BaseModel):
     decided_by: str | None = None
     decision_reason: str = ""
     scope: str = "once"
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     decided_at: datetime | None = None
     used_at: datetime | None = None
 
@@ -202,7 +202,7 @@ class PermissionBroker:
         current.decided_by = decided_by
         current.decision_reason = reason
         current.scope = "run" if decision == PermissionDecision.APPROVE_FOR_RUN else "once"
-        current.decided_at = datetime.utcnow()
+        current.decided_at = datetime.now(UTC)
         self._update(current)
         self._audit("PermissionDecided", current)
         return current
@@ -259,7 +259,7 @@ class PermissionBroker:
         request = self.get(request_id)
         if request is None:
             return
-        request.used_at = datetime.utcnow()
+        request.used_at = datetime.now(UTC)
         self._update(request)
 
     @staticmethod
@@ -287,7 +287,7 @@ class PermissionBroker:
             request.decision = PermissionDecision.DENY_WITH_FEEDBACK
             request.decided_by = "policy:hook"
             request.decision_reason = result.feedback or "PermissionRequested hook denied"
-            request.decided_at = datetime.utcnow()
+            request.decided_at = datetime.now(UTC)
             _get_conn().execute(
                 "UPDATE structured_permission_requests SET payload=?, status=?, decided_at=? "
                 "WHERE request_id=?",

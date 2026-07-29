@@ -10,10 +10,12 @@ import json
 import time
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
+from app.core.config import settings
 from app.core.logging import logger
 from app.multiagent.default_teams import list_teams as _list_teams
 from app.multiagent.event_emitter import get_event_emitter
@@ -24,6 +26,33 @@ from app.multiagent.team_run_context import TeamRunMode
 from app.multiagent.store import get_multiagent_store
 
 router = APIRouter()
+
+
+# Control-plane decisions (permission approval) on the legacy compatibility
+# router carry the same risk as the V1 endpoints: authorizing one lets an
+# agent run a destructive shell command.  Mirror the V1 token guard.
+_control_plane_security = HTTPBearer(auto_error=False)
+
+
+def _require_control_plane_auth(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_control_plane_security),
+) -> None:
+    """Gate legacy HITL decision endpoints behind the shared bearer token."""
+    import secrets as _secrets
+
+    expected = settings.control_plane_api_token
+    if not expected:
+        client = request.client.host if request.client else ""
+        if client not in {"127.0.0.1", "::1", "localhost"}:
+            raise HTTPException(
+                status_code=403,
+                detail="Control-plane decisions require a configured API token for non-loopback callers",
+            )
+        return
+    provided = credentials.credentials if credentials else ""
+    if not _secrets.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="Invalid control-plane token")
 
 
 # ========== Request / Response models ==========
@@ -321,7 +350,10 @@ def list_team_run_permissions(run_id: str):
 
 
 @router.post("/team-runs/{run_id}/permissions/{request_id}/decision")
-def decide_team_run_permission(run_id: str, request_id: str, req: PermissionDecisionRequest):
+def decide_team_run_permission(
+    run_id: str, request_id: str, req: PermissionDecisionRequest,
+    _auth: None = Depends(_require_control_plane_auth),
+):
     from app.multiagent.permission import PermissionDecision, get_permission_broker
     try:
         item = get_permission_broker().decide(
@@ -987,7 +1019,7 @@ def resolve_hitl_conflict(task_id: str, issue_id: str, req: HITLResolveRequest):
 
     # 直接从 store 的 team_issues 表更新
     import datetime
-    now = datetime.datetime.utcnow().isoformat()
+    now = datetime.datetime.now(datetime.UTC).isoformat()
     store.conn.execute(
         "UPDATE team_issues SET status = 'resolved', resolved_at = ? WHERE id = ? AND room_id = ?",
         (now, issue_id, room_id),

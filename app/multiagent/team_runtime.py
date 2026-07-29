@@ -6,11 +6,12 @@ Legacy API、CLI 和恢复代码通过该 Facade；V3 使用 application service
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 import os
 import threading
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from app.core.logging import logger
@@ -27,6 +28,19 @@ class TeamRuntimeFacade:
 
     def __init__(self) -> None:
         self._active_runs: dict[str, dict[str, Any]] = {}
+        # Global concurrency cap.  ``asyncio.to_thread(run_governed)`` occupied
+        # a host thread for the entire Run duration (minutes–hours); without a
+        # cap, Run #33+ exhausted the default executor (``min(32, cpu+4)``)
+        # and starved synchronous API endpoints (head-of-line blocking).  The
+        # semaphore queues surplus Runs instead of consuming threads, and the
+        # dedicated executor isolates them from the FastAPI default pool so a
+        # long Run cannot delay ``/health`` or list endpoints.
+        from app.core.config import settings
+        self._run_semaphore = asyncio.Semaphore(max(1, settings.max_concurrent_runs))
+        self._run_executor = ThreadPoolExecutor(
+            max_workers=max(1, settings.max_concurrent_runs),
+            thread_name_prefix="run-governed",
+        )
 
     # ===== Run 生命周期 =====
 
@@ -90,8 +104,13 @@ class TeamRuntimeFacade:
             # Scheduler runs in a worker thread. threading.Event is safe for
             # API cancellation from the serving loop as well as that worker.
             "cancel_event": threading.Event(),
-            "created_at": datetime.utcnow(),
+            "created_at": datetime.now(UTC),
         }
+        try:
+            from app.core.metrics import active_runs
+            active_runs.inc()
+        except Exception:  # pragma: no cover - metrics are best-effort
+            pass
         from app.infrastructure.database.run_store import get_agent_run_history
         get_agent_run_history().save_team_run(
             run_id=ctx.run_id, goal=goal, team_id=team_name, mode=mode.value,
@@ -136,7 +155,7 @@ class TeamRuntimeFacade:
             return TeamRunResult(
                 task_id=ctx.run_id, status="failed", final_output="",
                 termination_reason=hook.feedback or "RunStarted hook blocked run",
-                completed_at=datetime.utcnow(),
+                completed_at=datetime.now(UTC),
             )
 
         if ctx.mode == TeamRunMode.DISCUSSION:
@@ -192,21 +211,28 @@ class TeamRuntimeFacade:
             else None
         )
         # The unified LangGraph root graph is the production orchestration
-        # kernel for both single and team execution modes.
-        result = await asyncio.to_thread(
-            run_governed,
-            goal=goal,
-            requested_mode=str(ctx.metadata.get("requested_mode", "team")),
-            planner=lambda g, c: plan_with_llm(g, context=c),
-            executor=executor,
-            verifier=verifier,
-            ctx=ctx,
-            cancel_event=self._active_runs[ctx.run_id]["cancel_event"],
-            task_graph=resume_graph,
-            resume=resume and not restart,
-            resume_decision=resume_decision,
-            max_rounds=max_rounds,
-        )
+        # kernel for both single and team execution modes.  Acquire the global
+        # semaphore so surplus Runs queue instead of starving API endpoints,
+        # and run on the dedicated executor so long Runs do not block the
+        # FastAPI default thread pool (which also serves sync def endpoints).
+        async with self._run_semaphore:
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                self._run_executor,
+                lambda: run_governed(
+                    goal=goal,
+                    requested_mode=str(ctx.metadata.get("requested_mode", "team")),
+                    planner=lambda g, c: plan_with_llm(g, context=c),
+                    executor=executor,
+                    verifier=verifier,
+                    ctx=ctx,
+                    cancel_event=self._active_runs[ctx.run_id]["cancel_event"],
+                    task_graph=resume_graph,
+                    resume=resume and not restart,
+                    resume_decision=resume_decision,
+                    max_rounds=max_rounds,
+                ),
+            )
 
         # 映射结果
         status_map = {
@@ -232,14 +258,61 @@ class TeamRuntimeFacade:
              "error": result.error, "verdict": result.verification_verdict},
         )
 
+        # Reclaim process-level memory once the run is terminal.  The three
+        # process-wide singletons (_active_runs / TaskBoard._tasks /
+        # AgentRegistry._agents) previously retained every historical run's
+        # context, tasks and agents forever, so long-uptime services leaked
+        # memory and scans grew linearly.  Durable state stays in SQLite for
+        # replay/resume; only the in-process cache is evicted.  Paused /
+        # waiting_human runs are resumable, so their in-process cancel_event
+        # and ctx must survive until resume or explicit cancel.
+        if final_status in {"completed", "failed", "cancelled"}:
+            # Update application metrics before purging in-process state.
+            try:
+                from app.core.metrics import runs_total, active_runs
+                runs_total.inc(status=final_status)
+                active_runs.dec()
+            except Exception:  # pragma: no cover - metrics are best-effort
+                pass
+            self._purge_run_state(ctx.run_id)
+
         return TeamRunResult(
             task_id=ctx.run_id,
             status=final_status,
             final_output=result.summary or goal[:200],
             total_rounds=result.rounds,
             termination_reason=result.error,
-            completed_at=datetime.utcnow(),
+            completed_at=datetime.now(UTC),
         )
+
+    def _purge_run_state(self, run_id: str) -> None:
+        """Evict a terminal run from the process-level singletons.
+
+        Best-effort: a failure in one store does not block the others, and the
+        run is already terminal so the eviction is a cleanup, not a state
+        change that callers depend on.  The on-disk RunWorkspace is **not**
+        deleted here because it doubles as the ArtifactStore root — artifacts
+        must survive the run for replay, audit and the SSE event store.  Use
+        ``cleanup_old_workspaces`` for retention-based disk reclamation.
+        """
+        self._active_runs.pop(run_id, None)
+        try:
+            from app.multiagent.task_board import get_task_board
+            get_task_board().purge_run(run_id)
+        except Exception as exc:  # pragma: no cover - defensive cleanup
+            logger.warning("[TeamRuntime] purge task board run=%s failed: %s", run_id, exc)
+        try:
+            from app.multiagent.agent_registry import get_agent_registry
+            get_agent_registry().purge_run(run_id)
+        except Exception as exc:  # pragma: no cover - defensive cleanup
+            logger.warning("[TeamRuntime] purge agent registry run=%s failed: %s", run_id, exc)
+        try:
+            from app.multiagent.run_workspace import remove_run_workspace
+            # cleanup=False: preserve on-disk artifacts; only evict the
+            # in-process dict entry so it does not grow unbounded.
+            remove_run_workspace(run_id, cleanup=False)
+        except Exception as exc:  # pragma: no cover - defensive cleanup
+            logger.warning("[TeamRuntime] purge run workspace run=%s failed: %s", run_id, exc)
 
     def _task_graph_from_persisted_board(self, run_id: str):
         """Load the full persisted plan and overlay current TaskBoard state.
@@ -332,9 +405,15 @@ class TeamRuntimeFacade:
         get_agent_runtime_manager().cancel_run(run_id)
         from app.multiagent.task_board import get_task_board
         get_task_board().cancel_run(run_id)
+        previous_status = run["status"]
         run["status"] = "cancelled"
         from app.infrastructure.database.run_store import get_agent_run_history
         get_agent_run_history().update_team_run_status(run_id, "cancelled")
+        # If the run was already paused/waiting_human, start_run's loop is not
+        # active and will not run its own terminal purge, so evict here.  A
+        # running run is purged by start_run when it observes cancel_event.
+        if previous_status in {"paused", "waiting_human"}:
+            self._purge_run_state(run_id)
         return True
 
     async def pause_run(self, run_id: str) -> bool:

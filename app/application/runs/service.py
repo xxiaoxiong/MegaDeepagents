@@ -213,7 +213,14 @@ class RunApplicationService:
         # A waiting_human checkpoint must only continue after an explicit user
         # decision.  Automatically recovering it would silently approve the
         # suspended LangGraph interrupt.
-        recoverable = {"created", "running"}
+        #
+        # ``interrupted`` is included because a crash between LangGraph setting
+        # the interrupt and the run settling into ``waiting_human``/``paused``
+        # would leave the durable status at ``interrupted``.  Without recovery
+        # such a run sticks forever — ``resume_run`` re-enters the graph, which
+        # re-surfaces the interrupt (or resumes if the interrupt was already
+        # answered durably), so this is safe and never auto-approves HITL.
+        recoverable = {"created", "running", "interrupted"}
         count = 0
         for record in get_agent_run_history().list_team_runs(500):
             if record.get("status") in recoverable:

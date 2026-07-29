@@ -61,6 +61,13 @@ class ShellPolicyEngine:
     POWERSHELL_DESTRUCTIVE = {"remove-item", "clear-content", "format-volume"}
     POWERSHELL_NETWORK = {"invoke-webrequest", "invoke-restmethod", "new-pssession"}
 
+    # Arguments that turn a "read-only" tool into a command-execution vector.
+    # ``find -exec`` / ``-execdir`` run an arbitrary binary on every match;
+    # ``sed -i`` mutates files in place and the ``e`` command executes shell.
+    # These must be escalated past the READ_ONLY fast-path so the permission
+    # broker gets to authorize them.
+    _EXEC_FLAGS = {"-exec", "-execdir", "-ok", "-okdir"}
+
     def normalize(self, command: Sequence[str] | str) -> list[str]:
         if isinstance(command, str):
             # Parsing is only a compatibility adapter.  Execution always uses
@@ -98,14 +105,142 @@ class ShellPolicyEngine:
             if subcommand in self.GIT_READ:
                 return CommandCategory.READ_ONLY
             return CommandCategory.UNKNOWN
+        # ``find``/``sed`` are nominally read-only, but their exec/inplace
+        # flags turn them into arbitrary command execution or file mutation.
+        # Escalate before the READ_ONLY fast-path so the permission broker
+        # authorizes the destructive form.  ``find . -exec cat /etc/passwd \;``
+        # must not bypass the broker.
+        if executable == "find" and self._has_exec_payload(argv):
+            return CommandCategory.FILESYSTEM_DESTRUCTIVE
+        if executable == "sed" and self._sed_is_destructive(argv):
+            return CommandCategory.FILESYSTEM_DESTRUCTIVE
         if executable in self.BUILD_TEST:
             # Package install through npm/pnpm/yarn is still package management.
             if executable in {"npm", "pnpm", "yarn"} and len(argv) > 1 and argv[1] in {"i", "install", "add"}:
                 return CommandCategory.PACKAGE_MANAGEMENT
+            # ``python -c "import os; os.system('rm -rf /')"``, ``node -e
+            # "require('fs').writeFileSync(...)"``, ``npm run <script>`` and
+            # similar inline-script flags turn a build/test launcher into an
+            # arbitrary code execution vector.  They are not "build/test"
+            # activity even though the host binary is in BUILD_TEST — escalate
+            # to SHELL so the PermissionBroker must authorize them, instead of
+            # letting them through the unattended BUILD_TEST fast-path.
+            if self._has_inline_script(executable, argv):
+                return CommandCategory.UNKNOWN
             return CommandCategory.BUILD_TEST
         if executable in self.READ_ONLY:
             return CommandCategory.READ_ONLY
         return CommandCategory.UNKNOWN
+
+    @classmethod
+    def _has_exec_payload(cls, argv: list[str]) -> bool:
+        """``find -exec`` / ``-execdir`` run an arbitrary binary per match."""
+        for arg in argv[1:]:
+            if arg in cls._EXEC_FLAGS:
+                return True
+        return False
+
+    # Inline-script flags per build/test launcher.  These take the *next*
+    # argument (or the rest of a clustered option) as a program to execute
+    # directly, so ``python -c "import os; os.system('rm -rf /')"`` /
+    # ``node -e "..."`` are equivalent to running an arbitrary script under
+    # the host interpreter.  Script runners like ``npm run <name>`` are
+    # deliberately NOT included here: they invoke a predefined script in
+    # ``package.json`` rather than inline code, and the integration
+    # verification path already filters them through ``_safe_integration_argv``.
+    _INLINE_SCRIPT_FLAGS: dict[str, frozenset[str]] = {
+        "python": frozenset({"-c"}),
+        "python3": frozenset({"-c"}),
+        "node": frozenset({"-e", "--eval", "-p", "--print"}),
+        "ruby": frozenset({"-e"}),
+        "perl": frozenset({"-e", "-E"}),
+        "php": frozenset({"-r"}),
+    }
+
+    @classmethod
+    def _has_inline_script(cls, executable: str, argv: list[str]) -> bool:
+        """True when a BUILD_TEST launcher is asked to run inline code.
+
+        ``python -c "..."`` / ``node -e "..."`` escape the "this is just a
+        build/test invocation" assumption: they can execute arbitrary code,
+        including shelling out via ``os.system``.  We return True so the
+        caller escalates the category past BUILD_TEST and forces
+        PermissionBroker authorization.
+        """
+        flags = cls._INLINE_SCRIPT_FLAGS.get(executable)
+        if not flags:
+            return False
+        for arg in argv[1:]:
+            # Stop scanning at the first non-option argument: a leading
+            # ``-`` afterwards is most likely a flag to the script itself
+            # (e.g. ``python script.py -c``), not an interpreter flag.
+            if not arg.startswith("-"):
+                break
+            # ``-c`` may be folded into a cluster like ``-cO`` for python.
+            token = arg.lstrip("-")
+            if any(f.lstrip("-") == token or token.startswith(f.lstrip("-"))
+                   for f in flags):
+                return True
+            # ``--eval``-style long options
+            if arg in flags:
+                return True
+        return False
+
+    @staticmethod
+    def _sed_is_destructive(argv: list[str]) -> bool:
+        """``sed -i`` mutates in place; the ``e`` command executes shell."""
+        inplace = False
+        for arg in argv[1:]:
+            if arg.startswith("-"):
+                # GNU sed folds options like ``-iE``; ``-i`` anywhere in the
+                # cluster enables in-place editing.
+                if "i" in arg:
+                    inplace = True
+            elif "e" in arg and arg.startswith("e"):
+                # A script argument beginning with ``e`` (sed `e` command)
+                # executes the rest of the line as shell.  Conservative match.
+                return True
+            else:
+                # The first non-option argument is the script; ``e`` command
+                # inside it executes shell.
+                if "e" in arg.split("\n")[0] and (";" in arg or arg.startswith("e")):
+                    return True
+                break
+        return inplace
+
+    @staticmethod
+    def workspace_escape(argv: list[str], root: Path) -> str | None:
+        """Return the first READ_ONLY argument that leaves the task workspace.
+
+        READ_ONLY commands (``head``/``tail``/``cat``/``grep``/``find``/...)
+        bypass the permission broker, so a path argument that resolves outside
+        ``root`` would let an agent read ``/runtime/.env`` or
+        ``/etc/passwd`` without authorization.  Flags are skipped; only
+        path-like arguments are inspected.  An argument is path-like when it
+        is absolute, contains a path separator, or contains a ``..`` segment.
+        """
+        for arg in argv[1:]:
+            if not arg or arg.startswith("-"):
+                continue
+            is_absolute = (
+                arg.startswith("/")
+                or (len(arg) >= 3 and arg[1] == ":" and arg[2] in ("\\", "/"))
+            )
+            has_separator = "/" in arg or "\\" in arg
+            has_dotdot = ".." in Path(arg).parts
+            if not (is_absolute or has_separator or has_dotdot):
+                # A bare token (e.g. a grep pattern or filename) cannot escape
+                # by itself; leave it to the OS to resolve inside cwd.
+                continue
+            try:
+                candidate = (root / arg).resolve() if not is_absolute else Path(arg).resolve()
+            except (OSError, ValueError):
+                return arg
+            try:
+                candidate.relative_to(root)
+            except ValueError:
+                return arg
+        return None
 
     def _classify_powershell(self, argv: list[str]) -> CommandCategory:
         lowered = [part.lower() for part in argv[1:]]
@@ -173,6 +308,17 @@ class ShellCommandRunner:
         root = Path(cwd).resolve()
         if not root.is_dir():
             raise ValueError(f"cwd does not exist: {cwd}")
+        # READ_ONLY commands bypass the PermissionBroker, so they must not be
+        # able to read files outside the task workspace.  ``head /runtime/.env``
+        # or ``cat ../../etc/passwd`` would otherwise leak secrets straight
+        # into the tool result stream.  Reject any path argument that is
+        # absolute or escapes ``cwd`` before execution.
+        if category == CommandCategory.READ_ONLY:
+            escaped = self.policy.workspace_escape(argv, root)
+            if escaped is not None:
+                raise PermissionError(
+                    f"read-only command references path outside workspace: {escaped}"
+                )
         if category in (CommandCategory.FILESYSTEM_DESTRUCTIVE,
                         CommandCategory.PRIVILEGE_ESCALATION):
             # These are never silently converted into a normal shell request.

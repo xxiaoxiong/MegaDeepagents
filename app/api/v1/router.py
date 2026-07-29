@@ -7,8 +7,9 @@ import json
 import time
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.api.v1.schemas import (
     AgentMessageBody,
@@ -47,6 +48,46 @@ def _require_run(run_id: str) -> dict:
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
     return run
+
+
+# Control-plane decisions (permission / plan approval) are the highest-trust
+# operations in the runtime: authorizing one lets an agent run a destructive
+# shell command or push to git.  When ``control_plane_api_token`` is set, every
+# decision endpoint requires ``Authorization: Bearer <token>``.  When unset,
+# the runtime is single-user loopback-only and the guard is a no-op, but a
+# non-loopback host with an empty token is rejected at startup.
+_control_plane_security = HTTPBearer(auto_error=False)
+
+
+def _require_control_plane_auth(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(_control_plane_security),
+) -> None:
+    """Gate HITL decision endpoints behind a shared bearer token.
+
+    The token uses ``secrets.compare_digest`` to avoid timing side-channels.
+    Loopback callers without a configured token are still admitted so local
+    dev keeps working; any remote caller without a token is rejected once a
+    token is configured.
+    """
+    expected = settings.control_plane_api_token
+    if not expected:
+        # No token configured: only loopback callers may decide.  This keeps
+        # the default single-user dev flow working while preventing a remote
+        # attacker (e.g. via a CORS reflection or exposed Docker port) from
+        # approving permissions.
+        client = request.client.host if request.client else ""
+        if client not in {"127.0.0.1", "::1", "localhost"}:
+            raise HTTPException(
+                status_code=403,
+                detail="Control-plane decisions require a configured API token for non-loopback callers",
+            )
+        return
+    provided = credentials.credentials if credentials else ""
+    import secrets as _secrets
+
+    if not _secrets.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="Invalid control-plane token")
 
 
 def _public_run(run: dict) -> dict:
@@ -571,7 +612,8 @@ def list_permissions(run_id: str):
     response_model=FlexibleResponse,
 )
 def decide_permission(
-    run_id: str, request_id: str, body: PermissionDecisionBody
+    run_id: str, request_id: str, body: PermissionDecisionBody,
+    _auth: None = Depends(_require_control_plane_auth),
 ):
     _require_run(run_id)
     from app.multiagent.permission import PermissionDecision, get_permission_broker
@@ -605,7 +647,10 @@ def list_plans(run_id: str):
     "/runs/{run_id}/plans/{plan_id}/decision",
     response_model=FlexibleResponse,
 )
-def decide_plan(run_id: str, plan_id: str, body: PlanDecisionBody):
+def decide_plan(
+    run_id: str, plan_id: str, body: PlanDecisionBody,
+    _auth: None = Depends(_require_control_plane_auth),
+):
     _require_run(run_id)
     from app.multiagent.plan_approval import PlanApprovalService
 

@@ -9,12 +9,18 @@ MegaDeepagents/
 ├─ app/
 │  ├─ api/v1/                    # HTTP 契约、校验、SSE
 │  ├─ application/runs/          # Run 用例：创建、控制、恢复、诊断、只读执行投影
+│  ├─ backends/                  # 虚拟文件系统后端（沙箱读写、路径归一化）
+│  ├─ core/                      # 配置、日志、LLM 工厂、Agent 组装
 │  ├─ domain/runs/               # 与框架无关的 Run 领域模型
 │  ├─ infrastructure/database/   # SQLite 连接与领域存储
+│  ├─ memory/                    # 冷记忆（会话/消息）、FTS5 全文检索、PII 脱敏
+│  ├─ multiagent/                # Agent、Task、Artifact 领域执行组件
 │  ├─ runtime/root_graph/        # 唯一生产编排图
 │  ├─ runtime/supervisor/        # 结构化 Supervisor 决策
-│  ├─ multiagent/                # Agent、Task、Artifact 领域执行组件
-│  ├─ tools/                     # Worker 可调用工具
+│  ├─ skills/                    # Skill 元数据与加载器
+│  ├─ task/                      # 旧版单 Agent 任务运行器（兼容层）
+│  ├─ tools/                     # Worker 可调用工具（MCP、文件、搜索）
+│  ├─ permissions.py             # 文件系统权限中间件（.env 拦截等）
 │  └─ main.py / cli.py           # 入口
 ├─ frontend/                     # 自托管 Vue 运行控制台
 ├─ website/                      # 独立静态项目官网

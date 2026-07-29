@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -207,7 +207,7 @@ class TestNextRetryDelay:
         board.create_task(task_id="t1", run_id="r1", title="T1", objective="o")
         task = board.get("t1", run_id="r1")
         task.status = BoardTaskStatus.PENDING
-        task.next_attempt_at = datetime.utcnow() - timedelta(seconds=5)
+        task.next_attempt_at = datetime.now(UTC) - timedelta(seconds=5)
         board.add(task)
 
         sched = self._make_scheduler()
@@ -222,7 +222,7 @@ class TestNextRetryDelay:
         board.create_task(task_id="t1", run_id="r1", title="T1", objective="o")
         task = board.get("t1", run_id="r1")
         task.status = BoardTaskStatus.PENDING
-        task.next_attempt_at = datetime.utcnow() + timedelta(seconds=3)
+        task.next_attempt_at = datetime.now(UTC) + timedelta(seconds=3)
         board.add(task)
 
         sched = self._make_scheduler()
@@ -237,7 +237,7 @@ class TestNextRetryDelay:
         board.create_task(task_id="t1", run_id="r1", title="T1", objective="o")
         task = board.get("t1", run_id="r1")
         task.status = BoardTaskStatus.PENDING
-        task.next_attempt_at = datetime.utcnow() + timedelta(seconds=60)
+        task.next_attempt_at = datetime.now(UTC) + timedelta(seconds=60)
         board.add(task)
 
         sched = self._make_scheduler()
@@ -253,11 +253,11 @@ class TestNextRetryDelay:
             board.create_task(task_id=tid, run_id="r1", title=tid, objective="o")
             task = board.get(tid, run_id="r1")
             task.status = BoardTaskStatus.PENDING
-            task.next_attempt_at = datetime.utcnow() + timedelta(seconds=30)
+            task.next_attempt_at = datetime.now(UTC) + timedelta(seconds=30)
             board.add(task)
         # Make t2 due sooner
         t2 = board.get("t2", run_id="r1")
-        t2.next_attempt_at = datetime.utcnow() + timedelta(seconds=2)
+        t2.next_attempt_at = datetime.now(UTC) + timedelta(seconds=2)
         board.add(t2)
 
         sched = self._make_scheduler()
@@ -272,7 +272,7 @@ class TestNextRetryDelay:
         board.create_task(task_id="t1", run_id="r1", title="T1", objective="o")
         task = board.get("t1", run_id="r1")
         task.status = BoardTaskStatus.RUNNING
-        task.next_attempt_at = datetime.utcnow() + timedelta(seconds=1)
+        task.next_attempt_at = datetime.now(UTC) + timedelta(seconds=1)
         board.add(task)
 
         sched = self._make_scheduler()

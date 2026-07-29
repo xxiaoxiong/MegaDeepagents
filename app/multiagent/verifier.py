@@ -595,20 +595,41 @@ class Verifier:
                 entry["version"] = getattr(art, "version", 1)
                 entry["produced_by"] = getattr(art, "produced_by", "")
                 entry["path"] = getattr(art, "path", "")
-                # 尝试读真实文件内容
-                root = getattr(self.artifact_store, "_root_path", None)
-                rel = getattr(art, "path", "")
-                if root and rel:
-                    import os as _os
-                    full = _os.path.join(root, rel)
-                    if _os.path.isfile(full):
-                        try:
-                            with open(full, "r", encoding="utf-8", errors="ignore") as f:
-                                content = f.read()
-                            entry.setdefault("content", content[:5000])
-                            entry["content_full_available"] = True
-                        except Exception:
-                            entry["content_full_available"] = False
+                # Read the persisted bytes through the ArtifactStore's safe
+                # resolver.  Directly joining ``root`` + ``rel`` and ``open()``
+                # ing the result bypassed ``_safe_path`` and let a symlink
+                # swapped by the producing agent (``ln -sf /runtime/.env
+                # output.txt``) leak secrets into the rubric prompt.  Going
+                # through ``read_bytes`` enforces the workspace boundary and
+                # rejects traversal / absolute paths.
+                try:
+                    raw = self.artifact_store.read_bytes(aid)
+                except Exception:
+                    raw = None
+                if raw is not None:
+                    # Reject symlinks defensively: even with ``_safe_path`` a
+                    # previously-created symlink whose target was inside the
+                    # workspace at creation time could later be repointed.
+                    # ``read_bytes`` already returns the resolved bytes, but
+                    # we surface the integrity flag so the rubric layer can
+                    # down-rank tampered evidence.
+                    try:
+                        integrity_ok = self.artifact_store.verify_integrity(aid)
+                    except Exception:
+                        integrity_ok = False
+                    entry["content_full_available"] = bool(integrity_ok)
+                    entry["integrity_verified"] = bool(integrity_ok)
+                    if integrity_ok:
+                        text = raw.decode("utf-8", errors="ignore")
+                        entry.setdefault("content", text[:5000])
+                    else:
+                        entry.setdefault(
+                            "content",
+                            "[artifact integrity check failed; content withheld]",
+                        )
+                else:
+                    entry["content_full_available"] = False
+                    entry["integrity_verified"] = False
                 artifacts[key] = entry
         except Exception as exc:
             logger.warning(f"[Verifier] enrich_with_artifact_store 失败: {exc}")

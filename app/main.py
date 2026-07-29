@@ -30,10 +30,48 @@ async def lifespan(_: FastAPI):
     from app.skills.metadata import _init_db, get_connection
 
     init_observability(component="api")
+    # Fail closed on the most dangerous deployment mistake: a non-loopback
+    # host without a control-plane token lets any network caller approve
+    # destructive permissions (CORS already defaults to loopback only).
+    if settings.app_host not in {"127.0.0.1", "0.0.0.0", "localhost"} and not settings.control_plane_api_token:
+        # ``0.0.0.0`` is ambiguous (container bind) so it is not blocked here;
+        # operators binding 0.0.0.0 must set CONTROL_PLANE_API_TOKEN explicitly.
+        if settings.app_host != "0.0.0.0":
+            logger.warning(
+                "App host %s is non-loopback but CONTROL_PLANE_API_TOKEN is empty; "
+                "remote callers cannot be authorized safely.",
+                settings.app_host,
+            )
+    elif settings.app_host == "0.0.0.0" and not settings.control_plane_api_token:
+        logger.warning(
+            "App bound to 0.0.0.0 without CONTROL_PLANE_API_TOKEN; set the token "
+            "before exposing the runtime behind a reverse proxy."
+        )
     try:
         _init_db(get_connection())
     except Exception as exc:
         logger.warning("Skills DB init warmup skipped: %s", exc)
+
+    # Bootstrap the V3 runtime schema (task_board_tasks / task_graph_snapshots /
+    # event_envelopes / task_graph_mutations) before accepting traffic.  These
+    # tables were previously created lazily on the first run, so the readiness
+    # probe and the very first request paid the DDL cost and the instance
+    # reported "not ready" until a run touched the transactional service.
+    try:
+        from app.multiagent.transactional_task_service import TransactionalTaskService
+        TransactionalTaskService()
+    except Exception as exc:
+        logger.warning("V3 runtime schema warmup skipped: %s", exc)
+
+    # Reclaim disk from old run workspaces and expired worktree leases at
+    # startup so orphans from a previous process lifetime do not accumulate.
+    try:
+        from app.multiagent.run_workspace import cleanup_old_workspaces
+        removed = cleanup_old_workspaces(settings.workspace_root, max_age_days=7.0)
+        if removed:
+            logger.info("Reclaimed %s stale run workspace(s)", removed)
+    except Exception as exc:  # pragma: no cover - defensive cleanup
+        logger.warning("Run workspace retention cleanup skipped: %s", exc)
 
     try:
         from app.application.runs.service import get_run_service
@@ -87,6 +125,17 @@ app = FastAPI(
 )
 
 app.state.limiter = limiter
+
+# slowapi only enforces ``default_limits`` and ``@limiter.limit`` decorators
+# when SlowAPIMiddleware intercepts the request.  Without this registration the
+# whole rate-limit configuration is dead and every endpoint is unthrottled.
+from slowapi.middleware import SlowAPIMiddleware  # noqa: E402
+
+# Only register the middleware when slowapi constructed successfully.  The
+# ``_NoopLimiter`` fallback exposes no ``_enabled``/``enabled`` attribute that
+# slowapi's middleware expects, and registering it would raise on import.
+if getattr(limiter, "enabled", True):
+    app.add_middleware(SlowAPIMiddleware)
 
 
 @app.exception_handler(RateLimitExceeded)
@@ -159,8 +208,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    """Track HTTP request count and latency for the /metrics endpoint."""
+    from app.core.metrics import http_requests_total, http_request_duration
+    import time as _time
+
+    start = _time.monotonic()
+    response = await call_next(request)
+    elapsed = _time.monotonic() - start
+    # Normalise path to avoid unbounded cardinality from path params.
+    path = request.url.path
+    # Collapse /runs/{id}/... → /runs/{id}/...  (keep top-level segments)
+    http_requests_total.inc(
+        method=request.method, path=path, status=str(response.status_code),
+    )
+    http_request_duration.observe(elapsed)
+    return response
+
+
 # 挂载 API 路由
 app.include_router(health_router, tags=["health"])
+from app.api.routes_metrics import router as metrics_router  # noqa: E402
+
+app.include_router(metrics_router, tags=["metrics"])
 if settings.enable_legacy_api:
     from app.api.routes_chat import router as chat_router
     from app.api.routes_memory import router as memory_router

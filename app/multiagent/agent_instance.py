@@ -12,11 +12,12 @@ V3 Agent identity requirements：
 """
 from __future__ import annotations
 
-from datetime import datetime
+import threading
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 
 class AgentStatus(str, Enum):
@@ -98,25 +99,46 @@ class AgentInstance(BaseModel):
     capabilities: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     stopped_at: datetime | None = None
 
     # 并发控制
     max_concurrency: int = 1
 
+    # Per-instance lock guarding the check-then-act in ``update_status`` and
+    # ``heartbeat``.  Pydantic v2 ignores non-field attributes during model
+    # serialization, so a plain ``threading.Lock`` is safe here.  The registry
+    # also holds its own RLock around batches of transitions, but callers
+    # sometimes mutate an agent outside the registry (e.g. ``stop`` issued
+    # from a worker thread while ``cleanup_expired`` runs in the heartbeat
+    # loop), so the instance needs its own guard to make the state machine
+    # transition atomic.
+    _state_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
+
     def update_status(self, new_status: AgentStatus) -> bool:
-        if is_legal_agent_transition(self.status, new_status):
-            self.status = new_status
-            self.updated_at = datetime.utcnow()
-            if new_status in (AgentStatus.STOPPED, AgentStatus.FAILED):
-                self.stopped_at = datetime.utcnow()
-            return True
-        return False
+        """Atomically validate and apply a state transition.
+
+        ``is_legal_agent_transition(self.status, ...)`` followed by
+        ``self.status = ...`` was a check-then-act with no synchronization:
+        ``cleanup_expired`` (in the heartbeat loop) and ``stop`` (from a
+        worker thread) could both observe the old status, both decide the
+        transition was legal, and both apply it — leaving the agent in an
+        inconsistent state (e.g. ``FAILED`` without ``stopped_at``).
+        """
+        with self._state_lock:
+            if is_legal_agent_transition(self.status, new_status):
+                self.status = new_status
+                self.updated_at = datetime.now(UTC)
+                if new_status in (AgentStatus.STOPPED, AgentStatus.FAILED):
+                    self.stopped_at = datetime.now(UTC)
+                return True
+            return False
 
     def heartbeat(self) -> None:
-        self.last_heartbeat_at = datetime.utcnow()
-        self.updated_at = datetime.utcnow()
+        with self._state_lock:
+            self.last_heartbeat_at = datetime.now(UTC)
+            self.updated_at = datetime.now(UTC)
 
     def is_alive(self) -> bool:
         return self.status not in (AgentStatus.STOPPED, AgentStatus.FAILED)

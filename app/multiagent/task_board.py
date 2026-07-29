@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any
 
@@ -66,8 +66,8 @@ class BoardTask(BaseModel):
 
     produced_artifact_ids: list[str] = Field(default_factory=list)
     priority: int = 0
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     completed_at: datetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -145,7 +145,7 @@ class TaskBoard:
     def claim(self, task_id: str, agent_id: str, run_id: str | None = None) -> ClaimResult:
         """原子认领。如果 task 已被认领或不在 PENDING 状态，返回失败。"""
         with self._lock:
-            task = self.get(task_id, run_id=run_id)
+            task = self._raw_get(task_id, run_id=run_id)
             if task is None:
                 return ClaimResult(success=False, reason="task_not_found")
             if self._persist_enabled:
@@ -170,23 +170,36 @@ class TaskBoard:
                             success=False, task=task,
                             reason=f"task_not_pending({task.status.value})",
                         )
-                    for dep_id in task.dependencies:
-                        dep_row = conn.execute(
-                            "SELECT payload FROM task_board_tasks WHERE run_id=? AND task_id=?",
-                            (task.run_id, dep_id),
-                        ).fetchone()
-                        dep = (BoardTask.model_validate(json.loads(dep_row["payload"]))
-                               if dep_row else None)
-                        if dep is None or dep.status != BoardTaskStatus.SUCCEEDED:
-                            conn.rollback()
-                            return ClaimResult(
-                                success=False, task=task,
-                                reason=f"dependency_{dep_id}_not_succeeded",
-                            )
+                    if task.dependencies:
+                        # N+1 dependency check collapsed into a single round
+                        # trip.  The previous per-dep SELECT was a 1+N query
+                        # pattern on high-fan-in DAGs (10 deps = 11 reads).
+                        placeholders = ",".join("?" for _ in task.dependencies)
+                        dep_rows = conn.execute(
+                            f"SELECT task_id, payload FROM task_board_tasks "
+                            f"WHERE run_id=? AND task_id IN ({placeholders})",
+                            (task.run_id, *task.dependencies),
+                        ).fetchall()
+                        dep_map: dict[str, BoardTask | None] = {}
+                        for row in dep_rows:
+                            try:
+                                dep_map[row["task_id"]] = BoardTask.model_validate(
+                                    json.loads(row["payload"])
+                                )
+                            except Exception:
+                                dep_map[row["task_id"]] = None
+                        for dep_id in task.dependencies:
+                            dep = dep_map.get(dep_id)
+                            if dep is None or dep.status != BoardTaskStatus.SUCCEEDED:
+                                conn.rollback()
+                                return ClaimResult(
+                                    success=False, task=task,
+                                    reason=f"dependency_{dep_id}_not_succeeded",
+                                )
                     task.status = BoardTaskStatus.CLAIMED
                     task.claimed_by = agent_id
-                    task.claimed_at = datetime.utcnow()
-                    task.updated_at = datetime.utcnow()
+                    task.claimed_at = datetime.now(UTC)
+                    task.updated_at = datetime.now(UTC)
                     conn.execute(
                         "UPDATE task_board_tasks SET payload=?, updated_at=? "
                         "WHERE run_id=? AND task_id=?",
@@ -217,8 +230,8 @@ class TaskBoard:
                     )
             task.status = BoardTaskStatus.CLAIMED
             task.claimed_by = agent_id
-            task.claimed_at = datetime.utcnow()
-            task.updated_at = datetime.utcnow()
+            task.claimed_at = datetime.now(UTC)
+            task.updated_at = datetime.now(UTC)
             self._persist(task)
             logger.info(
                 f"[TaskBoard] claimed task={task_id} agent={agent_id}"
@@ -228,20 +241,20 @@ class TaskBoard:
     def start(self, task_id: str, agent_id: str, run_id: str | None = None) -> bool:
         """CLAIMED → RUNNING。"""
         with self._lock:
-            task = self.get(task_id, run_id=run_id)
+            task = self._raw_get(task_id, run_id=run_id)
             if task is None or task.claimed_by != agent_id:
                 return False
             if task.status != BoardTaskStatus.CLAIMED:
                 return False
             task.status = BoardTaskStatus.RUNNING
-            task.updated_at = datetime.utcnow()
+            task.updated_at = datetime.now(UTC)
             self._persist(task)
             return True
 
     def release(self, task_id: str, agent_id: str, reason: str = "", run_id: str | None = None) -> bool:
         """释放回 PENDING（让其他 Agent 认领）。"""
         with self._lock:
-            task = self.get(task_id, run_id=run_id)
+            task = self._raw_get(task_id, run_id=run_id)
             if task is None or task.claimed_by != agent_id:
                 return False
             if task.status not in (BoardTaskStatus.CLAIMED, BoardTaskStatus.RUNNING, BoardTaskStatus.BLOCKED):
@@ -251,7 +264,7 @@ class TaskBoard:
             task.claimed_at = None
             task.attempts += 1
             task.last_error = reason or None
-            task.updated_at = datetime.utcnow()
+            task.updated_at = datetime.now(UTC)
             self._persist(task)
             logger.info(f"[TaskBoard] released task={task_id} agent={agent_id} reason={reason}")
             return True
@@ -263,13 +276,13 @@ class TaskBoard:
     ) -> bool:
         """标记 succeeded。"""
         with self._lock:
-            task = self.get(task_id, run_id=run_id)
+            task = self._raw_get(task_id, run_id=run_id)
             if task is None or task.claimed_by != agent_id:
                 return False
             task.status = BoardTaskStatus.SUCCEEDED
             task.produced_artifact_ids.extend(artifact_ids or [])
-            task.completed_at = datetime.utcnow()
-            task.updated_at = datetime.utcnow()
+            task.completed_at = datetime.now(UTC)
+            task.updated_at = datetime.now(UTC)
             self._persist(task)
             logger.info(
                 f"[TaskBoard] completed task={task_id} agent={agent_id} "
@@ -283,56 +296,77 @@ class TaskBoard:
     ) -> bool:
         """Record worker output; only the verifier may mark SUCCEEDED."""
         with self._lock:
-            task = self.get(task_id, run_id=run_id)
+            task = self._raw_get(task_id, run_id=run_id)
             if task is None or task.claimed_by != agent_id:
                 return False
             if task.status != BoardTaskStatus.RUNNING:
                 return False
             task.status = BoardTaskStatus.PRODUCED
             task.produced_artifact_ids = list(dict.fromkeys(artifact_ids or []))
-            task.updated_at = datetime.utcnow()
+            task.updated_at = datetime.now(UTC)
             self._persist(task)
             return True
 
     def mark_verifying(self, task_id: str, run_id: str | None = None) -> bool:
         with self._lock:
-            task = self.get(task_id, run_id=run_id)
+            task = self._raw_get(task_id, run_id=run_id)
             if task is None or task.status != BoardTaskStatus.PRODUCED:
                 return False
             task.status = BoardTaskStatus.VERIFYING
-            task.updated_at = datetime.utcnow()
+            task.updated_at = datetime.now(UTC)
             self._persist(task)
             return True
 
     def mark_verified(self, task_id: str, run_id: str | None = None) -> bool:
         with self._lock:
-            task = self.get(task_id, run_id=run_id)
+            task = self._raw_get(task_id, run_id=run_id)
             if task is None or task.status not in (BoardTaskStatus.PRODUCED, BoardTaskStatus.VERIFYING):
                 return False
             task.status = BoardTaskStatus.SUCCEEDED
-            task.completed_at = datetime.utcnow()
-            task.updated_at = datetime.utcnow()
+            task.completed_at = datetime.now(UTC)
+            task.updated_at = datetime.now(UTC)
             self._persist(task)
             return True
 
     def mark_repair_required(self, task_id: str, run_id: str | None = None) -> bool:
         with self._lock:
-            task = self.get(task_id, run_id=run_id)
+            task = self._raw_get(task_id, run_id=run_id)
             if task is None or task.status not in (BoardTaskStatus.PRODUCED, BoardTaskStatus.VERIFYING):
                 return False
             task.status = BoardTaskStatus.REPAIR_REQUIRED
-            task.updated_at = datetime.utcnow()
+            task.updated_at = datetime.now(UTC)
+            self._persist(task)
+            return True
+
+    def mark_blocked(
+        self, task_id: str, agent_id: str, reason: str, run_id: str | None = None,
+    ) -> bool:
+        """Atomically transition a worker's RUNNING task to BLOCKED.
+
+        Replaces the get→mutate→add pattern that previously exposed the shared
+        stored object to concurrent mutation.  Only the claiming agent may
+        block its own task, mirroring ``release``/``complete``.
+        """
+        with self._lock:
+            task = self._raw_get(task_id, run_id=run_id)
+            if task is None or task.claimed_by != agent_id:
+                return False
+            if task.status != BoardTaskStatus.RUNNING:
+                return False
+            task.status = BoardTaskStatus.BLOCKED
+            task.last_error = reason
+            task.updated_at = datetime.now(UTC)
             self._persist(task)
             return True
 
     def supersede_with_repair(self, task_id: str, repair_task_id: str, run_id: str) -> bool:
         """Record verifier-owned replacement without forging worker success."""
         with self._lock:
-            task = self.get(task_id, run_id=run_id)
+            task = self._raw_get(task_id, run_id=run_id)
             if task is None or task.status != BoardTaskStatus.REPAIR_REQUIRED:
                 return False
             task.metadata["superseded_by_repair"] = repair_task_id
-            task.updated_at = datetime.utcnow()
+            task.updated_at = datetime.now(UTC)
             self._persist(task)
             return True
 
@@ -349,12 +383,12 @@ class TaskBoard:
     ) -> bool:
         """标记 failed（或重置为 PENDING 如果还有重试次数）。"""
         with self._lock:
-            task = self.get(task_id, run_id=run_id)
+            task = self._raw_get(task_id, run_id=run_id)
             if task is None or task.claimed_by != agent_id:
                 return False
             task.attempts += 1
             task.last_error = error
-            task.updated_at = datetime.utcnow()
+            task.updated_at = datetime.now(UTC)
             history = task.metadata.setdefault("error_history", [])
             history.append({
                 "attempt": task.attempts,
@@ -406,7 +440,7 @@ class TaskBoard:
                 )
             else:
                 task.status = BoardTaskStatus.FAILED
-                task.completed_at = datetime.utcnow()
+                task.completed_at = datetime.now(UTC)
                 task.next_attempt_at = None
                 logger.warning(
                     f"[TaskBoard] task={task_id} failed permanently: {error}"
@@ -424,7 +458,7 @@ class TaskBoard:
     ) -> bool:
         """Requeue a terminal task through an explicit, audited operator action."""
         with self._lock:
-            task = self.get(task_id, run_id=run_id)
+            task = self._raw_get(task_id, run_id=run_id)
             if task is None or task.status not in {
                 BoardTaskStatus.FAILED,
                 BoardTaskStatus.REPAIR_REQUIRED,
@@ -436,7 +470,7 @@ class TaskBoard:
                 "reason": reason,
                 "previous_status": task.status.value,
                 "previous_attempts": task.attempts,
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.now(UTC).isoformat(),
             })
             if reset_attempts:
                 task.attempts = 0
@@ -448,22 +482,22 @@ class TaskBoard:
             task.completed_at = None
             task.next_attempt_at = None
             task.last_error = reason
-            task.updated_at = datetime.utcnow()
+            task.updated_at = datetime.now(UTC)
             self._persist(task)
             return True
 
     def cancel(self, task_id: str, reason: str = "cancelled", run_id: str | None = None) -> bool:
         """Terminal cancellation owned by the runtime, never by the worker."""
         with self._lock:
-            task = self.get(task_id, run_id=run_id)
+            task = self._raw_get(task_id, run_id=run_id)
             if task is None or task.status in (
                 BoardTaskStatus.SUCCEEDED, BoardTaskStatus.FAILED, BoardTaskStatus.CANCELLED,
             ):
                 return False
             task.status = BoardTaskStatus.CANCELLED
             task.last_error = reason
-            task.completed_at = datetime.utcnow()
-            task.updated_at = datetime.utcnow()
+            task.completed_at = datetime.now(UTC)
+            task.updated_at = datetime.now(UTC)
             self._persist(task)
             return True
 
@@ -477,10 +511,10 @@ class TaskBoard:
     ) -> bool:
         """Persist a control-plane replan fence against stale worker success."""
         with self._lock:
-            task = self.get(task_id, run_id=run_id)
+            task = self._raw_get(task_id, run_id=run_id)
             if task is None or task.status == BoardTaskStatus.CANCELLED:
                 return False
-            requested_at = datetime.utcnow()
+            requested_at = datetime.now(UTC)
             requests = task.metadata.setdefault("replan_requests", [])
             requests.append({
                 "requested_by": requested_by,
@@ -500,8 +534,26 @@ class TaskBoard:
     def cancel_run(self, run_id: str, reason: str = "run_cancelled") -> int:
         """Cancel every non-terminal task so a persisted run cannot revive it."""
         with self._lock:
-            task_ids = [task.task_id for task in self.list_by_run(run_id)]
+            task_ids = [task.task_id for task in self._raw_list_by_run(run_id)]
         return sum(1 for task_id in task_ids if self.cancel(task_id, reason, run_id))
+
+    def purge_run(self, run_id: str) -> int:
+        """Evict a finished run's tasks from the in-process cache.
+
+        The process-level ``_tasks``/``_by_run`` dicts previously lived for the
+        whole process lifetime: nothing ever removed finished runs, so a long
+        uptime service accumulated every historical task and ``list_by_run`` /
+        ``list_pending`` scans grew linearly.  The durable rows in SQLite are
+        untouched and ``restore_run`` can rehydrate the board if the run is
+        ever resumed.  Returns the number of tasks evicted.
+        """
+        evicted = 0
+        with self._lock:
+            keys = self._by_run.pop(run_id, [])
+            for key in keys:
+                if self._tasks.pop(key, None) is not None:
+                    evicted += 1
+        return evicted
 
     # ===== restart recovery =====
 
@@ -528,40 +580,77 @@ class TaskBoard:
         return restored
 
     def prepare_for_resume(self, run_id: str) -> int:
-        """Release leases held by a dead process while preserving completed work."""
+        """Release leases held by a dead process while preserving completed work.
+
+        CLAIMED/RUNNING tasks clearly belonged to a dead worker and go back to
+        PENDING.  PRODUCED/VERIFYING tasks are the zombie window: the worker
+        finished and produced artifacts, but the process died before the
+        verifier could run.  Leaving them in place means ``list_pending`` never
+        returns them and ``all_succeeded`` never sees SUCCEEDED, so the run
+        deadlocks on ``scheduler_deadlock`` even though the work is recoverable.
+        Requeue them to PENDING while preserving ``produced_artifact_ids`` so a
+        retry can reuse the output.
+        """
         changed = 0
         with self._lock:
-            for task in self.list_by_run(run_id):
-                if task.status not in (BoardTaskStatus.CLAIMED, BoardTaskStatus.RUNNING):
+            for task in self._raw_list_by_run(run_id):
+                if task.status not in (
+                    BoardTaskStatus.CLAIMED, BoardTaskStatus.RUNNING,
+                    BoardTaskStatus.PRODUCED, BoardTaskStatus.VERIFYING,
+                ):
                     continue
+                resume_reason = {
+                    BoardTaskStatus.PRODUCED: "interrupted_after_produced",
+                    BoardTaskStatus.VERIFYING: "interrupted_during_verify",
+                }.get(task.status, "interrupted_before_resume")
                 task.status = BoardTaskStatus.PENDING
                 task.claimed_by = None
                 task.claimed_at = None
-                task.last_error = "interrupted_before_resume"
-                task.updated_at = datetime.utcnow()
+                task.last_error = resume_reason
+                task.updated_at = datetime.now(UTC)
                 self._persist(task)
                 changed += 1
         return changed
 
     # ===== 查询 =====
 
-    def get(self, task_id: str, run_id: str | None = None) -> BoardTask | None:
-        """Return a task, requiring a run id whenever it is ambiguous.
+    def _raw_get(self, task_id: str, run_id: str | None = None) -> BoardTask | None:
+        """Internal accessor returning the live stored object reference.
 
-        The optional argument preserves the old single-run API without
-        silently selecting a task from another concurrent run.
+        Board mutation methods run under ``self._lock`` and must mutate the
+        stored object in place so the change is visible to the next locker.
+        External callers must use ``get`` which returns a defensive copy.
         """
         if run_id is not None:
             return self._tasks.get((run_id, task_id))
         matches = [task for (rid, tid), task in self._tasks.items() if tid == task_id]
         return matches[0] if len(matches) == 1 else None
 
-    def list_by_run(self, run_id: str) -> list[BoardTask]:
+    def _raw_list_by_run(self, run_id: str) -> list[BoardTask]:
+        """Internal accessor returning live stored object references."""
         keys = self._by_run.get(run_id, [])
         return [self._tasks[key] for key in keys if key in self._tasks]
 
+    def get(self, task_id: str, run_id: str | None = None) -> BoardTask | None:
+        """Return a defensive copy of a task, requiring a run id when ambiguous.
+
+        Callers receive a deep copy so a read-modify-write sequence outside the
+        board cannot mutate the shared stored object while another thread is
+        iterating it (which previously raised ``dictionary changed size during
+        iteration``).  State changes must go back through ``add`` or an atomic
+        board method.
+        """
+        with self._lock:
+            task = self._raw_get(task_id, run_id=run_id)
+            return task.model_copy(deep=True) if task is not None else None
+
+    def list_by_run(self, run_id: str) -> list[BoardTask]:
+        """Return defensive copies of every task in a run."""
+        with self._lock:
+            return [task.model_copy(deep=True) for task in self._raw_list_by_run(run_id)]
+
     def list_pending(self, run_id: str) -> list[BoardTask]:
-        now = datetime.utcnow()
+        now = datetime.now(UTC)
         return [
             t for t in self.list_by_run(run_id)
             if t.status == BoardTaskStatus.PENDING

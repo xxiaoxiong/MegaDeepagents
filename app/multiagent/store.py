@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from app.core.logging import logger
@@ -341,7 +341,7 @@ def _ensure_schema_version(conn) -> None:
     if current_version < target_version:
         conn.execute(
             "INSERT OR REPLACE INTO schema_version (version, applied_at) VALUES (?, ?)",
-            (target_version, datetime.utcnow().isoformat()),
+            (target_version, datetime.now(UTC).isoformat()),
         )
         logger.info(f"[store] schema version updated: {current_version} → {target_version}")
 
@@ -394,7 +394,7 @@ class MultiAgentStore:
 
     def save_room(self, room) -> None:
         conn = self.conn
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(UTC).isoformat()
         conn.execute(
             """
             INSERT INTO team_rooms (room_id, task_id, goal, team_name, team_spec_json, config_json,
@@ -455,7 +455,7 @@ class MultiAgentStore:
             (
                 state.model_dump_json(),
                 state.phase.value,
-                datetime.utcnow().isoformat(),
+                datetime.now(UTC).isoformat(),
                 room_id,
             ),
         )
@@ -467,7 +467,7 @@ class MultiAgentStore:
             (
                 int(terminated),
                 status,
-                datetime.utcnow().isoformat(),
+                datetime.now(UTC).isoformat(),
                 room_id,
             ),
         )
@@ -499,7 +499,7 @@ class MultiAgentStore:
             VALUES (?, ?, ?, ?)
             ON CONFLICT(room_id, agent_name) DO UPDATE SET agent_json = excluded.agent_json
             """,
-            (room_id, agent.name, agent.model_dump_json(), datetime.utcnow().isoformat()),
+            (room_id, agent.name, agent.model_dump_json(), datetime.now(UTC).isoformat()),
         )
         self.conn.commit()
 
@@ -563,14 +563,14 @@ class MultiAgentStore:
             (room_id, agent_name, message_id, from_agent, message_type, is_read, created_at)
             VALUES (?, ?, ?, ?, ?, 0, ?)
             """,
-            (room_id, agent_name, message_id, from_agent, message_type, datetime.utcnow().isoformat()),
+            (room_id, agent_name, message_id, from_agent, message_type, datetime.now(UTC).isoformat()),
         )
         self.conn.commit()
 
     def ack_message(self, message_id: str, agent_name: str) -> None:
         self.conn.execute(
             "UPDATE agent_inbox SET is_read = 1, read_at = ? WHERE message_id = ? AND agent_name = ?",
-            (datetime.utcnow().isoformat(), message_id, agent_name),
+            (datetime.now(UTC).isoformat(), message_id, agent_name),
         )
         self.conn.commit()
 
@@ -620,7 +620,7 @@ class MultiAgentStore:
             (
                 state.model_dump_json(),
                 state.phase.value,
-                datetime.utcnow().isoformat(),
+                datetime.now(UTC).isoformat(),
                 state.room_id,
             ),
         )
@@ -707,7 +707,7 @@ class MultiAgentStore:
                 json.dumps(message_ids or [], ensure_ascii=False),
                 termination_reason,
                 langsmith_run_url,
-                datetime.utcnow().isoformat(),
+                datetime.now(UTC).isoformat(),
             ),
         )
         self.conn.commit()
@@ -751,7 +751,7 @@ class MultiAgentStore:
                 meta_json,
                 float(entry.get("importance", 0.5)),
                 int(entry.get("access_count", 0)),
-                entry.get("created_at") or datetime.utcnow().isoformat(),
+                entry.get("created_at") or datetime.now(UTC).isoformat(),
                 entry.get("last_accessed_at"),
                 entry.get("task_id"),
             ),
@@ -828,7 +828,7 @@ class MultiAgentStore:
         # bump access_count + last_accessed_at（fire-and-forget，不抛错）
         result_ids = [r["id"] for _, r in matched[:limit]]
         if result_ids:
-            now = datetime.utcnow().isoformat()
+            now = datetime.now(UTC).isoformat()
             placeholders = ",".join("?" * len(result_ids))
             try:
                 self.conn.execute(

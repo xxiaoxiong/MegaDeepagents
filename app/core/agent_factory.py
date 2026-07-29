@@ -2,6 +2,7 @@
 
 import sqlite3
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -141,21 +142,89 @@ def _build_user_tools(registry: ToolRegistry, task_runner: TaskRunner):
     return tools
 
 
-# ========== SqliteSaver 全局缓存 ==========
+# ========== SqliteSaver 连接工厂 ==========
 
-_sqlite_saver: SqliteSaver | None = None
-_sqlite_lock = threading.Lock()
+# Historical note: this module used to expose a process-wide singleton
+# ``_get_sqlite_saver()`` backed by ONE shared ``sqlite3.Connection``.  Every
+# concurrent Run's every agent checkpoint write went through that single
+# connection object, and Python's sqlite3 module serializes access to a
+# connection — so all checkpoint writes were serialized on one global lock,
+# regardless of how many task workers were idle.  Worse, the connection
+# pointed at ``settings.sqlite_path`` (the application database file), so the
+# single writer lock also contended with ``record_event`` / ``task_board.claim``
+# / heartbeat upserts.  Per-scope connections let WAL handle concurrency the
+# way it was designed: many readers, one writer at a time, no Python-level
+# funnel.  AGENTS.md requires the checkpointer connection to stay separate
+# from the application connection; per-scope connections honour that while
+# removing the serialization bottleneck.
+
+_sqlite_saver_lock = threading.Lock()
+_sqlite_saver_schema_ready = False
+
+
+def _ensure_saver_schema(conn) -> None:
+    """Idempotently create the LangGraph checkpoint schema.
+
+    ``SqliteSaver.setup`` issues ``CREATE TABLE IF NOT EXISTS`` so calling it
+    on every connection is cheap, but we gate it behind a process flag so the
+    common path only runs the DDL once per process.
+    """
+    global _sqlite_saver_schema_ready
+    if _sqlite_saver_schema_ready:
+        return
+    with _sqlite_saver_lock:
+        if _sqlite_saver_schema_ready:
+            return
+        SqliteSaver(conn).setup()
+        _sqlite_saver_schema_ready = True
+
+
+def open_sqlite_saver() -> SqliteSaver:
+    """Open a dedicated ``SqliteSaver`` connection for one execution scope.
+
+    Each call returns a fresh ``SqliteSaver`` backed by its own
+    ``sqlite3.Connection`` so concurrent task executions no longer serialize
+    checkpoint writes on a single shared connection.  The caller owns the
+    connection's lifetime and MUST close it when the scope ends
+    (``saver.conn.close()``); prefer ``sqlite_saver_session`` for safe
+    acquisition/release.  The connection intentionally targets
+    ``settings.sqlite_path`` (separate from the application connection object)
+    to honour AGENTS.md's checkpointer/app-connection separation.
+    """
+    conn = sqlite3.connect(settings.sqlite_path, check_same_thread=False)
+    _ensure_saver_schema(conn)
+    return SqliteSaver(conn=conn)
+
+
+@contextmanager
+def sqlite_saver_session() -> Any:
+    """Context manager that yields a per-scope ``SqliteSaver`` and closes it.
+
+    Guarantees the connection is returned to the OS even if the caller raises.
+    Use this in hot paths (executor / resume) where the saver is scoped to a
+    single task or read.  Long-lived agents built via ``build_agent`` hold
+    their own saver for the agent's lifetime and call ``open_sqlite_saver``
+    directly.
+    """
+    saver = open_sqlite_saver()
+    try:
+        yield saver
+    finally:
+        try:
+            saver.conn.close()
+        except Exception:  # pragma: no cover - defensive cleanup
+            pass
 
 
 def _get_sqlite_saver() -> SqliteSaver:
-    """获取全局 SqliteSaver 实例，保持连接打开。"""
-    global _sqlite_saver
-    if _sqlite_saver is None:
-        with _sqlite_lock:
-            if _sqlite_saver is None:
-                conn = sqlite3.connect(settings.sqlite_path, check_same_thread=False)
-                _sqlite_saver = SqliteSaver(conn=conn)
-    return _sqlite_saver
+    """Deprecated shim retained for callers that read checkpoint state.
+
+    Returns a per-call saver (no longer a shared singleton).  Callers should
+    migrate to ``open_sqlite_saver`` / ``sqlite_saver_session`` so the
+    connection is explicitly closed; this shim leaks its connection on the
+    assumption that the process is short-lived or the caller only reads once.
+    """
+    return open_sqlite_saver()
 
 
 # ========== 主 Agent 构建 ==========
@@ -222,8 +291,9 @@ def build_agent(
         "- 最终回答说明完成项、产物路径和未完成项。\n"
     )
 
-    # 使用持久化的 SqliteSaver，支持跨进程恢复
-    checkpointer = _get_sqlite_saver()
+    # 使用持久化的 SqliteSaver，支持跨进程恢复。每次 build_agent 独占一个
+    # 连接，避免全局单连接把所有 agent 的 checkpoint 写串行化在一把锁上。
+    checkpointer = open_sqlite_saver()
 
     context = AgentContext(user_id=thread_id or "default")
     agent = create_deep_agent(

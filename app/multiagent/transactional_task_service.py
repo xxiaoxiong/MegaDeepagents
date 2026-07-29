@@ -3,14 +3,16 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from app.multiagent.lifecycle_hooks import LifecycleEvent, get_lifecycle_hook_engine
-from app.infrastructure.database.run_store import get_agent_run_history
+from app.infrastructure.database.run_store import (
+    _append_event_envelope, get_agent_run_history, make_run_event_id,
+)
 from app.multiagent.store import _get_conn
 from app.multiagent.task_board import BoardTask, get_task_board
 from app.multiagent.task_graph import TaskGraph, TaskNode
@@ -31,7 +33,7 @@ class TaskGraphMutation(BaseModel):
     actor_agent_id: str
     payload: dict[str, Any]
     expected_version: int | None = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class TaskGraphVersion(BaseModel):
@@ -44,10 +46,12 @@ class TaskGraphVersion(BaseModel):
 def _ensure_schema() -> None:
     conn = _get_conn()
     from app.infrastructure.database.run_store import (
-        _ensure_task_board_tasks, _ensure_task_graph_snapshots,
+        _ensure_event_envelopes, _ensure_task_board_tasks,
+        _ensure_task_graph_snapshots,
     )
     _ensure_task_board_tasks(conn)
     _ensure_task_graph_snapshots(conn)
+    _ensure_event_envelopes(conn)
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS task_graph_mutations (
@@ -61,15 +65,6 @@ def _ensure_schema() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_task_graph_mutations_run
             ON task_graph_mutations(run_id, result_version);
-        CREATE TABLE IF NOT EXISTS control_plane_outbox (
-            event_id TEXT PRIMARY KEY,
-            run_id TEXT NOT NULL,
-            event_type TEXT NOT NULL,
-            sequence INTEGER NOT NULL,
-            payload TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            UNIQUE(run_id, sequence)
-        );
         """
     )
     conn.commit()
@@ -141,34 +136,41 @@ class TransactionalTaskService:
                     "VALUES (?, ?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET "
                     "version=excluded.version, graph_json=excluded.graph_json, updated_at=excluded.updated_at",
                     (run_id, graph.version, json.dumps(graph.model_dump(mode="json")),
-                     datetime.utcnow().isoformat()),
+                     datetime.now(UTC).isoformat()),
                 )
-                sequence = int(conn.execute(
-                    "SELECT COALESCE(MAX(sequence), 0) AS seq FROM control_plane_outbox WHERE run_id=?",
-                    (run_id,),
-                ).fetchone()["seq"])
                 for task in board_tasks:
                     mutation_id = f"initial:{run_id}:{task.task_id}"
                     conn.execute(
                         "INSERT OR IGNORE INTO task_board_tasks(run_id, task_id, payload, updated_at) "
                         "VALUES (?, ?, ?, ?)",
                         (run_id, task.task_id, json.dumps(task.model_dump(mode="json")),
-                         datetime.utcnow().isoformat()),
+                         datetime.now(UTC).isoformat()),
                     )
                     conn.execute(
                         "INSERT OR IGNORE INTO task_graph_mutations VALUES (?, ?, ?, ?, ?, ?, ?)",
                         (mutation_id, run_id, actor_agent_id, "initial_task",
                          json.dumps({"task_id": task.task_id}), graph.version,
-                         datetime.utcnow().isoformat()),
+                         datetime.now(UTC).isoformat()),
                     )
-                    sequence += 1
-                    conn.execute(
-                        "INSERT OR IGNORE INTO control_plane_outbox VALUES (?, ?, ?, ?, ?, ?)",
-                        ("evt_" + uuid.uuid4().hex[:16], run_id, "TaskCreated", sequence,
-                         json.dumps({"mutation_id": mutation_id,
-                                     "task_id": task.task_id,
-                                     "version": graph.version}),
-                         datetime.utcnow().isoformat()),
+                    # Publish the TaskCreated control-plane event into the
+                    # canonical SSE stream (event_envelopes) inside this
+                    # transaction.  The old control_plane_outbox table wrote
+                    # these rows but had no consumer, so plan events never
+                    # reached the frontend; event_envelopes is what
+                    # /runs/{run_id}/stream actually replays.
+                    _append_event_envelope(
+                        conn,
+                        event_id=make_run_event_id(),
+                        run_id=run_id,
+                        event_type="TaskCreated",
+                        agent_id=actor_agent_id,
+                        task_id=task.task_id,
+                        payload={
+                            "mutation_id": mutation_id,
+                            "task_id": task.task_id,
+                            "version": graph.version,
+                            "source": "initial_plan",
+                        },
                     )
             conn.commit()
         except Exception:
@@ -288,7 +290,7 @@ class TransactionalTaskService:
             for task in old_tasks:
                 updated = task.model_copy(deep=True)
                 updated.metadata["superseded_by_plan_revision"] = revision
-                updated.updated_at = datetime.utcnow()
+                updated.updated_at = datetime.now(UTC)
                 superseded_tasks.append(updated)
                 conn.execute(
                     "UPDATE task_board_tasks SET payload=?, updated_at=? "
@@ -308,7 +310,7 @@ class TransactionalTaskService:
                         run_id,
                         task.task_id,
                         json.dumps(task.model_dump(mode="json")),
-                        datetime.utcnow().isoformat(),
+                        datetime.now(UTC).isoformat(),
                     ),
                 )
             conn.execute(
@@ -320,7 +322,7 @@ class TransactionalTaskService:
                     run_id,
                     revised.version,
                     json.dumps(revised.model_dump(mode="json")),
-                    datetime.utcnow().isoformat(),
+                    datetime.now(UTC).isoformat(),
                 ),
             )
             conn.execute(
@@ -335,29 +337,25 @@ class TransactionalTaskService:
                         "task_ids": list(revised.nodes),
                     }),
                     revised.version,
-                    datetime.utcnow().isoformat(),
+                    datetime.now(UTC).isoformat(),
                 ),
             )
-            sequence = int(conn.execute(
-                "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq "
-                "FROM control_plane_outbox WHERE run_id=?",
-                (run_id,),
-            ).fetchone()["seq"])
-            conn.execute(
-                "INSERT INTO control_plane_outbox VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    "evt_" + uuid.uuid4().hex[:16],
-                    run_id,
-                    "TaskGraphReplanned",
-                    sequence,
-                    json.dumps({
-                        "mutation_id": mutation_id,
-                        "previous_version": current.version,
-                        "version": revised.version,
-                        "task_ids": list(revised.nodes),
-                    }),
-                    datetime.utcnow().isoformat(),
-                ),
+            # Publish the plan-revision control-plane event into the SSE
+            # stream inside this transaction (replaces the dead
+            # control_plane_outbox write).  Without this the frontend cannot
+            # observe that a replan happened until it re-polls the task graph.
+            _append_event_envelope(
+                conn,
+                event_id=make_run_event_id(),
+                run_id=run_id,
+                event_type="TaskGraphReplanned",
+                agent_id=actor_agent_id,
+                payload={
+                    "mutation_id": mutation_id,
+                    "previous_version": current.version,
+                    "version": revised.version,
+                    "task_ids": list(revised.nodes),
+                },
             )
             conn.commit()
         except Exception:
@@ -387,6 +385,110 @@ class TransactionalTaskService:
         if mutation.expected_version is not None and graph.version != mutation.expected_version:
             raise RuntimeError(f"task graph version conflict: expected {mutation.expected_version}, got {graph.version}")
 
+        conn = _get_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Load the graph from the locked row so the version check is
+            # authoritative and the mutation is applied to the current snapshot.
+            # Previously the graph was read OUTSIDE the transaction and the
+            # version was only re-checked when ``expected_version`` was set, but
+            # the control plane calls create/update/add_dependency with
+            # ``expected_version=None``.  Two concurrent callers both read v5,
+            # each added a node, and the second commit overwrote the first's
+            # whole-graph JSON, silently dropping the first caller's task.
+            # Loading inside BEGIN IMMEDIATE sees the committed winner and
+            # applies this mutation on top of it.
+            current = conn.execute(
+                "SELECT version, graph_json FROM task_graph_snapshots WHERE run_id=?",
+                (mutation.run_id,),
+            ).fetchone()
+            if current is None:
+                raise KeyError(f"task graph not found for run {mutation.run_id}")
+            locked_version = int(current["version"])
+            if mutation.expected_version is not None and locked_version != mutation.expected_version:
+                raise RuntimeError(
+                    f"task graph changed while applying mutation: "
+                    f"expected {mutation.expected_version}, got {locked_version}"
+                )
+            graph = TaskGraph.model_validate(json.loads(current["graph_json"]))
+            board_task, board_updates = self._apply_mutation(graph, mutation)
+            conn.execute(
+                "INSERT INTO task_graph_snapshots(run_id, version, graph_json, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET "
+                "version=excluded.version, graph_json=excluded.graph_json, updated_at=excluded.updated_at",
+                (mutation.run_id, graph.version, json.dumps(graph.model_dump(mode="json")),
+                 datetime.now(UTC).isoformat()),
+            )
+            if board_task is not None:
+                conn.execute(
+                    "INSERT INTO task_board_tasks(run_id, task_id, payload, updated_at) "
+                    "VALUES (?, ?, ?, ?) ON CONFLICT(run_id, task_id) DO NOTHING",
+                    (board_task.run_id, board_task.task_id,
+                     json.dumps(board_task.model_dump(mode="json")), datetime.now(UTC).isoformat()),
+                )
+            for updated_task in board_updates:
+                conn.execute(
+                    "UPDATE task_board_tasks SET payload=?, updated_at=? "
+                    "WHERE run_id=? AND task_id=?",
+                    (json.dumps(updated_task.model_dump(mode="json")),
+                     datetime.now(UTC).isoformat(), updated_task.run_id,
+                     updated_task.task_id),
+                )
+            conn.execute(
+                "INSERT INTO task_graph_mutations VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (mutation.mutation_id, mutation.run_id, mutation.actor_agent_id,
+                 mutation.mutation_type.value, json.dumps(mutation.payload), graph.version,
+                 mutation.created_at.isoformat()),
+            )
+            # Publish the mutation control-plane event into the SSE stream
+            # inside this transaction (replaces the dead control_plane_outbox
+            # write).  Emits one envelope per mutation so the frontend can
+            # render create_task / add_dependency / repair_task live.
+            _append_event_envelope(
+                conn,
+                event_id=make_run_event_id(),
+                run_id=mutation.run_id,
+                event_type="TaskGraphMutation",
+                agent_id=mutation.actor_agent_id,
+                task_id=board_task.task_id if board_task is not None
+                else mutation.payload.get("task_id"),
+                payload={
+                    "mutation_id": mutation.mutation_id,
+                    "mutation_type": mutation.mutation_type.value,
+                    "version": graph.version,
+                },
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        if board_task is not None:
+            board = get_task_board()
+            if board.get(board_task.task_id, run_id=mutation.run_id) is None:
+                # Add to the in-process projection after the transaction.  Its
+                # durable row already exists and add() is an idempotent upsert.
+                board.add(board_task)
+            for updated_task in board_updates:
+                board.add(updated_task)
+        elif mutation.mutation_type == TaskGraphMutationType.ADD_DEPENDENCY:
+            board = get_task_board()
+            task = board.get(mutation.payload["task_id"], run_id=mutation.run_id)
+            if task is not None:
+                task.dependencies = list(graph.nodes[task.task_id].dependencies)
+                board.add(task)
+        return TaskGraphVersion(run_id=mutation.run_id, version=graph.version,
+                                mutation_id=mutation.mutation_id, graph=graph)
+
+    def _apply_mutation(
+        self, graph: TaskGraph, mutation: TaskGraphMutation,
+    ) -> tuple[BoardTask | None, list[BoardTask]]:
+        """Apply ``mutation`` to ``graph`` in place and return board side effects.
+
+        The graph passed in is the freshly locked snapshot read inside the
+        transaction, so structural changes land on the current version instead
+        of overwriting concurrent commits.
+        """
         board_task: BoardTask | None = None
         board_updates: list[BoardTask] = []
         if mutation.mutation_type == TaskGraphMutationType.CREATE_TASK:
@@ -463,7 +565,7 @@ class TransactionalTaskService:
             if target_board is not None:
                 target_board = target_board.model_copy(deep=True)
                 target_board.metadata["superseded_by_repair"] = repair.id
-                target_board.updated_at = datetime.utcnow()
+                target_board.updated_at = datetime.now(UTC)
                 board_updates.append(target_board)
             for node in graph.nodes.values():
                 if node.id == repair.id:
@@ -472,79 +574,11 @@ class TransactionalTaskService:
                 if runtime_task is not None and runtime_task.dependencies != node.dependencies:
                     runtime_task = runtime_task.model_copy(deep=True)
                     runtime_task.dependencies = list(node.dependencies)
-                    runtime_task.updated_at = datetime.utcnow()
+                    runtime_task.updated_at = datetime.now(UTC)
                     board_updates.append(runtime_task)
         else:  # pragma: no cover - exhaustive enum guard
             raise ValueError(mutation.mutation_type)
-
-        conn = _get_conn()
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            current = conn.execute(
-                "SELECT version FROM task_graph_snapshots WHERE run_id=?", (mutation.run_id,)
-            ).fetchone()
-            if current and mutation.expected_version is not None and int(current["version"]) != mutation.expected_version:
-                raise RuntimeError("task graph changed while applying mutation")
-            conn.execute(
-                "INSERT INTO task_graph_snapshots(run_id, version, graph_json, updated_at) "
-                "VALUES (?, ?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET "
-                "version=excluded.version, graph_json=excluded.graph_json, updated_at=excluded.updated_at",
-                (mutation.run_id, graph.version, json.dumps(graph.model_dump(mode="json")),
-                 datetime.utcnow().isoformat()),
-            )
-            if board_task is not None:
-                conn.execute(
-                    "INSERT INTO task_board_tasks(run_id, task_id, payload, updated_at) "
-                    "VALUES (?, ?, ?, ?) ON CONFLICT(run_id, task_id) DO NOTHING",
-                    (board_task.run_id, board_task.task_id,
-                     json.dumps(board_task.model_dump(mode="json")), datetime.utcnow().isoformat()),
-                )
-            for updated_task in board_updates:
-                conn.execute(
-                    "UPDATE task_board_tasks SET payload=?, updated_at=? "
-                    "WHERE run_id=? AND task_id=?",
-                    (json.dumps(updated_task.model_dump(mode="json")),
-                     datetime.utcnow().isoformat(), updated_task.run_id,
-                     updated_task.task_id),
-                )
-            sequence = int(conn.execute(
-                "SELECT COALESCE(MAX(sequence), 0) + 1 AS seq FROM control_plane_outbox WHERE run_id=?",
-                (mutation.run_id,),
-            ).fetchone()["seq"])
-            conn.execute(
-                "INSERT INTO task_graph_mutations VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (mutation.mutation_id, mutation.run_id, mutation.actor_agent_id,
-                 mutation.mutation_type.value, json.dumps(mutation.payload), graph.version,
-                 mutation.created_at.isoformat()),
-            )
-            conn.execute(
-                "INSERT INTO control_plane_outbox VALUES (?, ?, ?, ?, ?, ?)",
-                ("evt_" + uuid.uuid4().hex[:16], mutation.run_id, "TaskGraphMutation",
-                 sequence, json.dumps({"mutation_id": mutation.mutation_id,
-                                       "version": graph.version}),
-                 datetime.utcnow().isoformat()),
-            )
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-
-        if board_task is not None:
-            board = get_task_board()
-            if board.get(board_task.task_id, run_id=mutation.run_id) is None:
-                # Add to the in-process projection after the transaction.  Its
-                # durable row already exists and add() is an idempotent upsert.
-                board.add(board_task)
-            for updated_task in board_updates:
-                board.add(updated_task)
-        elif mutation.mutation_type == TaskGraphMutationType.ADD_DEPENDENCY:
-            board = get_task_board()
-            task = board.get(mutation.payload["task_id"], run_id=mutation.run_id)
-            if task is not None:
-                task.dependencies = list(graph.nodes[task.task_id].dependencies)
-                board.add(task)
-        return TaskGraphVersion(run_id=mutation.run_id, version=graph.version,
-                                mutation_id=mutation.mutation_id, graph=graph)
+        return board_task, board_updates
 
     def create_task(self, run_id: str, actor_agent_id: str, task: dict[str, Any],
                     mutation_id: str | None = None) -> TaskGraphVersion:

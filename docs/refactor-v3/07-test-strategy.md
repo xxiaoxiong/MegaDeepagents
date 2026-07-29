@@ -30,4 +30,5 @@ cd frontend && npm run test && npm run build
 
 - 基线：511 passed，4 failed，5 skipped（正确 PATH）。
 - Windows 修复及 V3 根图/API 后：517 passed，6 skipped。
+- 第二轮深度审查修复后：543 passed，5 deselected（live_model 套件按需启用）。
 - 新测试包含旧附件迁移、统一单/团队根图和真实 repair task。

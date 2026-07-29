@@ -237,47 +237,49 @@ async def aload_checkpoint(run_id: str, agent_id: str) -> dict[str, Any] | None:
 
 
 def _load_checkpoint_sync(thread_id: str, agent_id: str, run_id: str) -> dict[str, Any] | None:
+    from app.core.agent_factory import sqlite_saver_session
     try:
-        from app.core.agent_factory import _get_sqlite_saver
-        saver = _get_sqlite_saver()
+        session_cm = sqlite_saver_session()
     except Exception as exc:
         logger.warning(f"[Resume] SqliteSaver 不可用，跳过 checkpoint 加载: {exc}")
         return None
     config = {"configurable": {"thread_id": thread_id}}
-    try:
-        import asyncio
-        snapshot = asyncio.run(saver.aget(config))
-    except RuntimeError:
-        # 嵌套 event loop 场景：用同步接口（langgraph 通常提供 get() 兼容）
+    with session_cm as saver:
         try:
-            snapshot = saver.get(config)
+            import asyncio
+            snapshot = asyncio.run(saver.aget(config))
+        except RuntimeError:
+            # 嵌套 event loop 场景：用同步接口（langgraph 通常提供 get() 兼容）
+            try:
+                snapshot = saver.get(config)
+            except Exception as exc:
+                logger.warning(f"[Resume] saver.get 失败 thread={thread_id}: {exc}")
+                return None
         except Exception as exc:
-            logger.warning(f"[Resume] saver.get 失败 thread={thread_id}: {exc}")
+            logger.warning(f"[Resume] saver.aget 失败 thread={thread_id}: {exc}")
             return None
-    except Exception as exc:
-        logger.warning(f"[Resume] saver.aget 失败 thread={thread_id}: {exc}")
-        return None
-    if snapshot is None:
-        return None
-    return _snapshot_to_dict(snapshot, thread_id, agent_id, run_id)
+        if snapshot is None:
+            return None
+        return _snapshot_to_dict(snapshot, thread_id, agent_id, run_id)
 
 
 async def _load_checkpoint_async(thread_id: str, agent_id: str, run_id: str) -> dict[str, Any] | None:
+    from app.core.agent_factory import sqlite_saver_session
     try:
-        from app.core.agent_factory import _get_sqlite_saver
-        saver = _get_sqlite_saver()
+        session_cm = sqlite_saver_session()
     except Exception as exc:
         logger.warning(f"[Resume] SqliteSaver 不可用: {exc}")
         return None
     config = {"configurable": {"thread_id": thread_id}}
-    try:
-        snapshot = await saver.aget(config)
-    except Exception as exc:
-        logger.warning(f"[Resume] saver.aget 失败 thread={thread_id}: {exc}")
-        return None
-    if snapshot is None:
-        return None
-    return _snapshot_to_dict(snapshot, thread_id, agent_id, run_id)
+    with session_cm as saver:
+        try:
+            snapshot = await saver.aget(config)
+        except Exception as exc:
+            logger.warning(f"[Resume] saver.aget 失败 thread={thread_id}: {exc}")
+            return None
+        if snapshot is None:
+            return None
+        return _snapshot_to_dict(snapshot, thread_id, agent_id, run_id)
 
 
 def _snapshot_to_dict(snapshot: Any, thread_id: str, agent_id: str, run_id: str) -> dict[str, Any]:

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
@@ -30,7 +30,7 @@ class TeammatePlan(BaseModel):
     risks: list[str] = Field(default_factory=list)
     rollback: str = ""
     status: PlanStatus = PlanStatus.WAITING_PLAN_APPROVAL
-    submitted_at: datetime = Field(default_factory=datetime.utcnow)
+    submitted_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     decided_at: datetime | None = None
     decided_by: str | None = None
     feedback: str = ""
@@ -58,11 +58,11 @@ class PlanApprovalService:
             plan.status = PlanStatus.PLAN_REJECTED
             plan.feedback = "plan requires steps and test strategy"
             plan.decided_by = "lead:auto"
-            plan.decided_at = datetime.utcnow()
+            plan.decided_at = datetime.now(UTC)
         elif not plan.risks and len(plan.files) <= 10:
             plan.status = PlanStatus.PLAN_APPROVED
             plan.decided_by = "lead:auto"
-            plan.decided_at = datetime.utcnow()
+            plan.decided_at = datetime.now(UTC)
         else:
             plan.status = PlanStatus.WAITING_PLAN_APPROVAL
         self._save(plan)
@@ -77,7 +77,7 @@ class PlanApprovalService:
             raise KeyError(plan_id)
         plan.status = PlanStatus.PLAN_APPROVED if approved else PlanStatus.PLAN_REJECTED
         plan.decided_by = decided_by
-        plan.decided_at = datetime.utcnow()
+        plan.decided_at = datetime.now(UTC)
         plan.feedback = feedback
         self._save(plan)
         return plan

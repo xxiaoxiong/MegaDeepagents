@@ -156,6 +156,11 @@ def test_verifier_pass_when_all_clean(tmp_path):
     verifier = Verifier(
         llm_rubric=LLMRubricVerifier(model_available=False),
     )
+    # Use a script file rather than ``python -c "..."``: the inline-script
+    # flag is escalated to UNKNOWN by ShellPolicyEngine (arbitrary code
+    # execution vector) and would require a PermissionBroker.
+    verified_script = tmp_path / "_verified.py"
+    verified_script.write_text("print('verified')\n", encoding="utf-8")
     result = verifier.validate(
         goal="做 X",
         artifacts={str(f1): {"content": "print(1)"}},
@@ -164,7 +169,7 @@ def test_verifier_pass_when_all_clean(tmp_path):
             "commands": [
                 VerificationCommand(
                     kind="test",
-                    argv=[sys.executable, "-c", "print('verified')"],
+                    argv=[sys.executable, str(verified_script)],
                     cwd=str(tmp_path),
                 )
             ],

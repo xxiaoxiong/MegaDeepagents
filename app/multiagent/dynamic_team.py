@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -36,7 +36,7 @@ class ParentChildAgentLink(BaseModel):
     parent_agent_id: str
     child_agent_id: str
     depth: int
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 def _ensure_schema() -> None:

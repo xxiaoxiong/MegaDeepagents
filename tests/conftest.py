@@ -57,6 +57,7 @@ def _isolate_multiagent_store(tmp_path):
     from app.multiagent.resume_coordinator import reset_resume_coordinator
     from app.multiagent.run_workspace import reset_workspaces
     from app.multiagent.team_runtime import reset_team_runtime
+    from app.memory.cold_memory import reset_cold_memory
     reset_agent_registry()
     reset_agent_runtime_manager()
     reset_task_board()
@@ -70,6 +71,7 @@ def _isolate_multiagent_store(tmp_path):
     reset_resume_coordinator()
     reset_workspaces()
     reset_team_runtime()
+    reset_cold_memory()
 
     yield
 
