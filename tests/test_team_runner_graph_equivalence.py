@@ -28,17 +28,15 @@ import pytest
 
 # 脚本：按 (agent_name, round) 索引返回 actions 列表
 # 第一轮 Planner 发 plan → 进入 EXECUTING
-# 第二轮 Coder 发 handoff → 仍 EXECUTING
+# 第二轮 Researcher 无动作 → 仍 EXECUTING
 # 第三轮 Coder 调用 Finalizer 推进 finalizing（用 delegation）
 # 第四轮 Finalizer mark_done → COMPLETED
 _EQ_SCRIPT = {
     ("Planner", 1): [{"type": "send_message", "message_type": "plan",
                       "to_agent": "Coder", "content": "plan v1"}],
-    ("Coder", 2): [{"type": "handoff", "to_agent": "Finalizer",
-                    "content": "ready to finalize"}],
-    ("Coder", 2): [{"type": "send_message", "message_type": "delegation",
+    ("Coder", 3): [{"type": "send_message", "message_type": "delegation",
                     "to_agent": "Finalizer", "content": "please finalize"}],
-    ("Finalizer", 3): [{"type": "mark_done", "content": "ALL DONE"}],
+    ("Finalizer", 4): [{"type": "mark_done", "content": "ALL DONE"}],
 }
 
 

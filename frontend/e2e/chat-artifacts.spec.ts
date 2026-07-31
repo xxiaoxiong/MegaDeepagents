@@ -240,7 +240,7 @@ test("desktop keeps activity compact and opens the complete artifact", async ({ 
   await page.screenshot({ path: "test-results/visual/chat-artifact-open.png", fullPage: true });
 
   await page.locator(".chat-drawer-head button").click();
-  await toolCard.locator("summary").click();
+  await toolCard.locator(".tool-head").click();
   await expect(toolCard.locator(".tool-result-text")).toContainText("FULL_FILE_TAIL");
   await expect(toolCard.locator(".tool-result > header strong")).toHaveText("src/large-runtime.ts");
   await page.screenshot({ path: "test-results/visual/chat-tool-expanded.png", fullPage: true });
