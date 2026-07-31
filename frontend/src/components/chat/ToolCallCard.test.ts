@@ -30,13 +30,16 @@ describe("ToolCallCard", () => {
       const details = container.querySelector("details");
       const summary = container.querySelector("summary");
       expect(details?.open).toBe(false);
-      expect(summary?.textContent).toContain("read_file");
+      expect(summary?.textContent).toContain("读取 README.md");
       expect(summary?.textContent).toContain("Coder");
-      expect(summary?.textContent).toContain("已完成");
+      expect(summary?.textContent).toContain("完成");
       expect(summary?.textContent).toContain("125ms");
       expect(container.querySelector(".tool-details")).not.toBeNull();
 
-      summary?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      if (details) {
+        details.open = true;
+        details.dispatchEvent(new Event("toggle"));
+      }
       await nextTick();
       expect(details?.open).toBe(true);
       expect(container.textContent).toContain("# MegaDeepagents");
@@ -91,7 +94,11 @@ describe("ToolCallCard", () => {
 
     try {
       app.mount(container);
-      container.querySelector("summary")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      const details = container.querySelector("details");
+      if (details) {
+        details.open = true;
+        details.dispatchEvent(new Event("toggle"));
+      }
       await nextTick();
       await Promise.resolve();
       await nextTick();
