@@ -274,7 +274,7 @@ class GovernedRunGraph:
                     time.sleep(decision.delay_seconds)
             if graph is None:
                 # Degradation path: when the LLM Planner exhausts all retries,
-                # fall back to a minimal two-step plan (plan â†’ execute) instead
+                # fall back to a minimal role-safe plan (plan â†’ execute â†’ verify) instead
                 # of killing the Run.  This gives the runtime a chance to make
                 # progress even when the model produces unparseable output.
                 from app.multiagent.planner import build_fallback_plan
@@ -367,658 +367,6 @@ class GovernedRunGraph:
                 "error": result.error,
             }
         except Exception as exc:
-            logger.exception("[RootGraph] dispatch failed run=%s", self.ctx.run_id)
-            return {
-                "phase": "dispatch_failed",
-                "dispatch_status": "failed",
-                "status": "failed",
-                "error": str(exc),
-            }
-
-    def _collect(self, state: AgentRunState) -> dict[str, Any]:
-        graph = self._load_graph(state)
-        from app.multiagent.task_board import BoardTaskStatus, get_task_board
-
-        tasks = get_task_board().list_by_run(self.ctx.run_id)
-        result = {
-            "phase": "collected",
-            "active_task_ids": [
-                task.task_id for task in tasks
-                if task.status in (BoardTaskStatus.CLAIMED, BoardTaskStatus.RUNNING)
-                and not task.metadata.get("superseded_by_plan_revision")
-            ],
-            "completed_task_ids": [
-                task.task_id for task in tasks
-                if task.status == BoardTaskStatus.SUCCEEDED
-                and not task.metadata.get("superseded_by_plan_revision")
-            ],
-            "blocked_task_ids": [
-                task.task_id for task in tasks
-                if task.status in (
-                    BoardTaskStatus.BLOCKED,
-                    BoardTaskStatus.REPAIR_REQUIRED,
-                    BoardTaskStatus.REPLAN_REQUIRED,
-                )
-                and not task.metadata.get("superseded_by_plan_revision")
-            ],
-            "task_graph_json": graph.model_dump_json(),
-        }
-        self._event("collection_completed", {
-            "active_task_ids": result["active_task_ids"],
-            "completed_task_ids": result["completed_task_ids"],
-            "blocked_task_ids": result["blocked_task_ids"],
-        })
-        return result
-
-    def _verify(self, state: AgentRunState) -> dict[str, Any]:
-        graph = self._load_graph(state)
-        from app.multiagent.task_board import BoardTaskStatus, get_task_board
-
-        board_tasks = get_task_board().list_by_run(self.ctx.run_id)
-        incomplete_tasks = [
-            task
-            for task in board_tasks
-            if not task.metadata.get("superseded_by_repair")
-            and not task.metadata.get("superseded_by_plan_revision")
-            and task.status != BoardTaskStatus.SUCCEEDED
-        ]
-        if not board_tasks or incomplete_tasks:
-            failed_task_ids = [task.task_id for task in incomplete_tasks]
-            reason = (
-                "task_board_empty"
-                if not board_tasks
-                else f"tasks_not_succeeded:{failed_task_ids}"
-            )
-            summary = {
-                "verdict": "fail",
-                "summary": (
-                    "Run-level verification is blocked until every current "
-                    "non-superseded TaskBoard task is SUCCEEDED"
-                ),
-                "scores": {"task_completion": 0.0},
-                "failed_criteria": [
-                    {
-                        "criterion": "task_board_completion",
-                        "detail": reason,
-                        "severity": "high",
-                    }
-                ],
-                "proposed_tasks": [],
-            }
-            self._event("verification_precondition_failed", {
-                "reason": reason,
-                "task_count": len(board_tasks),
-                "failed_task_ids": failed_task_ids,
-            })
-            return {
-                "phase": "verification_failed",
-                "verification_summary": summary,
-                "error": reason,
-            }
-        artifacts = self._verification_artifacts(graph)
-        try:
-            result = self.verifier.validate(goal=state["goal"], artifacts=artifacts)
-            summary = {
-                "verdict": result.verdict.value,
-                "summary": result.summary,
-                "scores": result.scores,
-                "failed_criteria": [
-                    {
-                        "criterion": item.criterion,
-                        "detail": item.detail,
-                        "severity": item.severity,
-                    }
-                    for item in result.failed_criteria
-                ],
-                "proposed_tasks": [
-                    {
-                        "title": item.title,
-                        "objective": item.objective,
-                        "required_capabilities": list(item.required_capabilities),
-                        "dependencies": list(item.dependencies),
-                        "priority": item.priority,
-                    }
-                    for item in result.proposed_tasks
-                ],
-            }
-            self._event("verification_completed", summary)
-            return {
-                "phase": "verified",
-                "verification_summary": summary,
-                "error": None,
-            }
-        except Exception as exc:
-            return {
-                "phase": "verification_failed",
-                "verification_summary": {
-                    "verdict": "repair",
-                    "summary": str(exc),
-                },
-                "error": str(exc),
-            }
-
-    def _repair(self, state: AgentRunState) -> dict[str, Any]:
-        graph = self._load_graph(state)
-        from app.multiagent.task_board import BoardTaskStatus, get_task_board
-        from app.multiagent.transactional_task_service import TransactionalTaskService
-
-        # å…¨å±€å®‰å…¨ç½‘ï¼šæ€»ä¿®å¤è½®æ¬¡è¶…è¿‡ max_repair_rounds * 3 æ—¶ç›´æŽ¥å¤±è´¥ï¼Œé˜²æ­¢
-        # per-task è®¡æ•°é€»è¾‘æœ‰ bug æ—¶è¿›å…¥æ­»å¾ªçŽ¯ã€‚æ­£å¸¸æƒ…å†µä¸‹ per-task é™åˆ¶ä¼šå…ˆè§¦å‘ã€‚
-        current_repair_round = int(state.get("repair_round", 0))
-        global_limit = self.max_repair_rounds * 3
-        if current_repair_round >= global_limit:
-            self._event("repair_round_exhausted", {
-                "repair_round": current_repair_round,
-                "global_limit": global_limit,
-            })
-            return {
-                "phase": "repair_exhausted",
-                "status": "failed",
-                "error": (
-                    f"global_repair_round_exhausted:{current_repair_round}/"
-                    f"{global_limit}"
-                ),
-            }
-
-        # Per-task ä¿®å¤è½®æ¬¡è®¡æ•°å™¨ï¼šæ¯ä¸ªåŽŸå§‹ä»»åŠ¡é“¾ï¼ˆä»¥ base id ä¸º keyï¼‰å•ç‹¬è®¡æ•°ã€‚
-        # æ—§é€»è¾‘ç”¨å•ä¸€å…¨å±€ ``repair_round`` è®¡æ•°å™¨ï¼Œå¯¼è‡´ä¸€ä¸ªä»»åŠ¡çš„ä¿®å¤é“¾å°±èƒ½
-        # è€—å°½å…¨å±€é¢„ç®—ï¼ˆrun_55507ebfce5744e8: task_1 ç”¨äº† 3/5 è½®ï¼Œtask_2 å’Œ
-        # task_3 åªèƒ½å…±äº«å‰©ä½™ 2 è½®ï¼Œå³ä½¿ v15 å’Œ v33 éƒ½æˆåŠŸäº† run ä»ç„¶å¤±è´¥ï¼‰ã€‚
-        rounds_by_task: dict[str, int] = dict(state.get("repair_rounds_by_task") or {})
-
-        created: list[str] = []
-        board = get_task_board()
-        # å€™é€‰ = æ‰€æœ‰ REPAIR_REQUIRED ä¸”æœªè¢«æ›¿ä»£çš„ taskã€‚
-        #
-        # æ³¨æ„ï¼šè¿™é‡Œ**æ•…æ„å…è®¸**å¯¹ä¿®å¤ä»»åŠ¡ï¼ˆid å½¢å¦‚ task_1__repair_vNï¼‰å†åˆ›å»ºä¿®å¤ã€‚
-        # æ—©å…ˆç‰ˆæœ¬ç”¨ ``"__repair_v" not in task.task_id`` å’Œ ``repair_of is None``
-        # æŠŠä¿®å¤ä»»åŠ¡ä¸€å¾‹æŽ’é™¤ï¼Œå¯¼è‡´ä¸€ä¸ªä¿®å¤ä»»åŠ¡è‡ªèº« per-task éªŒè¯å¤±è´¥ï¼ˆâ†’REPAIR_REQUIREDï¼‰
-        # åŽæ— æ³•å†è¢«ä¿®å¤ï¼šç¬¬ä¸€ä¸ª filter æŽ’é™¤å®ƒï¼Œfallback åªçœ‹ SUCCEEDED å¶å­ä¹Ÿæ‹¿ä¸åˆ°å®ƒ
-        # ï¼ˆå®ƒæ˜¯ REPAIR_REQUIRED ä¸æ˜¯ SUCCEEDEDï¼‰ï¼Œæœ€ç»ˆ ``repair_requested_without_repairable_tasks``
-        # æŠŠæ•´ä¸ª run åˆ¤å¤±è´¥ï¼ˆobserved: agent_c321b21ed4c6 / 1__repair_v8ï¼‰ã€‚
-        #
-        # é“¾å¼é€’å½’ï¼ˆv1â†’v2â†’â€¦ï¼‰ç”±æœ¬æ–¹æ³•é¡¶éƒ¨çš„å…¨å±€å®‰å…¨ç½‘å’Œä¸‹é¢çš„ per-task
-        # ``rounds_by_task[base_id] >= max_repair_rounds`` å®ˆå«å…±åŒå…œåº•ã€‚
-        # ``superseded_by_repair`` æ ‡è®°ç¡®ä¿æˆ‘ä»¬åªä¿®"å½“å‰æœ€æ–°ç‰ˆæœ¬"ï¼Œä¸é‡å¤ä¿®
-        # å·²è¢«æ›¿ä»£çš„æ—§ç‰ˆæœ¬ã€‚
-        candidates = [
-            task for task in board.list_by_run(self.ctx.run_id)
-            if task.status == BoardTaskStatus.REPAIR_REQUIRED
-            and not task.metadata.get("superseded_by_repair")
-            and not task.metadata.get("superseded_by_plan_revision")
-        ]
-        if not candidates:
-            # Whole-run verification happens after every worker task passed.
-            # Repair the successful leaf outputs that contributed to the final
-            # result, not every task in the run.
-            depended_on = {
-                dependency
-                for node in graph.nodes.values()
-                for dependency in node.dependencies
-            }
-            # æ³¨æ„ï¼šè¿™é‡Œå…è®¸å¯¹"æœ€è¿‘ä¸€æ¬¡æˆåŠŸçš„ repair task"å†åˆ›å»ºä¿®å¤ã€‚
-            # æ—©å…ˆçš„ ``__repair_v`` / ``repair_of is None`` è¿‡æ»¤ä¼šæŠŠå·²ç»ä¿®è¿‡
-            # ä¸€æ¬¡çš„ä»»åŠ¡å…¨éƒ¨æŽ’é™¤ï¼Œå¯¼è‡´ verifier åœ¨é¦–æ¬¡ repair ä»æœªè¾¾æ ‡æ—¶æ‹¿ä¸åˆ°
-            # ä»»ä½•å€™é€‰ â†’ ``repair_requested_without_repairable_tasks``ï¼Œæ•´ run
-            # å¤±è´¥ï¼ˆobserved: agent_c321b21ed4c6ï¼‰ã€‚çŽ°åœ¨æ”¹ä¸ºï¼šåªè¦è¯¥ task æœªè¢«
-            # ``superseded_by_repair`` æ ‡è®°ï¼ˆå³å®ƒæ˜¯å½“å‰æœ€æ–°çš„æˆåŠŸäº§å‡ºï¼Œè€Œéžå·²
-            # è¢«æ–°ä¿®å¤æ›¿ä»£çš„æ—§ç‰ˆæœ¬ï¼‰ï¼Œå°±å…è®¸å†ä¿®ä¸€æ¬¡ã€‚é“¾å¼é€’å½’ç”± per-task
-            # ``rounds_by_task`` å®ˆå« + é¡¶éƒ¨å…¨å±€å®‰å…¨ç½‘å…œåº•ï¼Œä¸ä¼šå†æ— é™ v1â†’v8ã€‚
-            candidates = [
-                task for task in board.list_by_run(self.ctx.run_id)
-                if task.status == BoardTaskStatus.SUCCEEDED
-                and task.task_id not in depended_on
-                and not task.metadata.get("superseded_by_repair")
-                and not task.metadata.get("superseded_by_plan_revision")
-            ]
-
-        # Per-task ä¿®å¤é¢„ç®—è¿‡æ»¤ï¼šæ¯ä¸ªåŽŸå§‹ä»»åŠ¡é“¾æœ€å¤šä¿® max_repair_rounds æ¬¡ã€‚
-        # base id = task_id ä¸­ç¬¬ä¸€ä¸ª ``__repair_v`` ä¹‹å‰çš„éƒ¨åˆ†ï¼ˆä¸Ž
-        # task_graph.add_repair_task çš„ id ç”Ÿæˆé€»è¾‘ä¸€è‡´ï¼‰ã€‚ä¿®å¤ä»»åŠ¡
-        # ``task_2__repair_v23`` çš„ base id æ˜¯ ``task_2``ï¼Œæ‰€ä»¥å®ƒå’ŒåŽŸä»»åŠ¡
-        # task_2 å…±äº«åŒä¸€ä¸ªé¢„ç®—è®¡æ•°å™¨ã€‚
-        exhausted_chains: list[str] = []
-        eligible: list[Any] = []
-        for task in candidates:
-            base_id = (
-                task.task_id.split("__repair_v", 1)[0]
-                if "__repair_v" in task.task_id
-                else task.task_id
-            )
-            if rounds_by_task.get(base_id, 0) >= self.max_repair_rounds:
-                exhausted_chains.append(
-                    f"{base_id}({rounds_by_task.get(base_id, 0)}/"
-                    f"{self.max_repair_rounds})"
-                )
-                continue
-            eligible.append(task)
-
-        if not eligible:
-            if exhausted_chains:
-                # æ‰€æœ‰å€™é€‰ä»»åŠ¡çš„ä¿®å¤é“¾éƒ½å·²è€—å°½ per-task é¢„ç®—ã€‚
-                self._event("repair_round_exhausted", {
-                    "exhausted_chains": exhausted_chains,
-                    "max_repair_rounds": self.max_repair_rounds,
-                    "repair_rounds_by_task": rounds_by_task,
-                })
-                return {
-                    "phase": "repair_exhausted",
-                    "status": "failed",
-                    "error": (
-                        f"all_repair_chains_exhausted:"
-                        f"{exhausted_chains}"
-                    ),
-                }
-            # çœŸæ­£æ— å¯ä¿®å¤ä»»åŠ¡ï¼šæ‰€æœ‰ task éƒ½å·²å¤±è´¥/å–æ¶ˆï¼Œæˆ–å…¨éƒ¨å·²è¢«æ›¿ä»£ã€‚
-            # ç»™å‡ºè¯Šæ–­ä¿¡æ¯è€Œä¸æ˜¯å¹²å·´å·´çš„é”™è¯¯ç ï¼Œä¾¿äºŽæŽ’æŸ¥ã€‚
-            board_snapshot = [
-                {"task_id": t.task_id, "status": t.status.value,
-                 "superseded": bool(t.metadata.get("superseded_by_repair"))}
-                for t in board.list_by_run(self.ctx.run_id)
-            ]
-            self._event("repair_no_candidates", {"board": board_snapshot})
-            return {
-                "status": "failed",
-                "error": (
-                    "repair_requested_without_repairable_tasks: "
-                    f"board={board_snapshot}"
-                ),
-            }
-
-        for task in eligible:
-            # é€’å¢žè¯¥ä»»åŠ¡é“¾çš„ per-task ä¿®å¤è®¡æ•°å™¨
-            base_id = (
-                task.task_id.split("__repair_v", 1)[0]
-                if "__repair_v" in task.task_id
-                else task.task_id
-            )
-            rounds_by_task[base_id] = rounds_by_task.get(base_id, 0) + 1
-            # Use the per-task verification result stored in the board task's
-            # metadata as the primary feedback source.  When repair is
-            # triggered by per-task verification (via _route_after_dispatch
-            # â†’ "repair"), the state's verification_summary is stale/empty
-            # because the _verify node was skipped.  The per-task
-            # verification result (stored by parallel_scheduler._verify_task
-            # in task.metadata["verification"]) contains the actual
-            # failed_criteria that the repair agent needs to know what to
-            # fix.  Without this, the repair agent gets an empty feedback
-            # dict and has no idea what was wrong, causing the repair chain
-            # to never converge (run_a3a9f8e5f5004e21: task_2__repair_v11
-            # still got "repair" because the agent didn't know what to fix).
-            per_task_verification = task.metadata.get("verification", {})
-            feedback = (
-                per_task_verification
-                if per_task_verification
-                else state.get("verification_summary", {})
-            )
-            before = set(graph.nodes)
-            # Strip any existing "Repair " prefixes so the objective stays
-            # flat across re-repair chains.  Without this, re-repairing a
-            # repair task compounds the prefix:
-            #   v1: "Repair å¼€å‘åŽç«¯æŽ¥å£" â†’ v2: "Repair Repair å¼€å‘åŽç«¯æŽ¥å£"
-            #   â†’ v3: "Repair Repair Repair å¼€å‘åŽç«¯æŽ¥å£" â€¦  The LLM sees a
-            # garbled objective and loses sight of the actual goal.
-            base_objective = task.objective
-            while base_objective.startswith("Repair "):
-                base_objective = base_objective[len("Repair "):]
-            mutation = TransactionalTaskService().create_repair(
-                self.ctx.run_id,
-                task.task_id,
-                objective=f"Repair {base_objective}",
-                required_capabilities=list(task.required_capabilities),
-                source_artifact_ids=list(task.produced_artifact_ids),
-                verification_feedback=feedback,
-            )
-            graph = mutation.graph
-            created.extend(sorted(set(graph.nodes) - before))
-            artifact_store = getattr(self.verifier, "artifact_store", None)
-            if artifact_store is not None:
-                for artifact_id in task.produced_artifact_ids:
-                    # Failed evidence remains readable through the explicit
-                    # repair contract, but it must not be eligible for the
-                    # next whole-run PASS decision.
-                    artifact_store.mark_rejected(artifact_id)
-        if not created:
-            # eligible éžç©ºä½†æ²¡æœ‰åˆ›å»ºå‡ºä»»ä½• repair task â€”â€” ç†è®ºä¸Šä¸åº”å‘ç”Ÿ
-            # ï¼ˆcreate_repair å†…éƒ¨å¼‚å¸¸æ‰ä¼šèµ°åˆ°è¿™é‡Œï¼‰ï¼Œç»™å‡ºè¯Šæ–­ä¿¡æ¯ä¾¿äºŽæŽ’æŸ¥ã€‚
-            board_snapshot = [
-                {"task_id": t.task_id, "status": t.status.value,
-                 "superseded": bool(t.metadata.get("superseded_by_repair"))}
-                for t in board.list_by_run(self.ctx.run_id)
-            ]
-            self._event("repair_no_candidates", {"board": board_snapshot})
-            return {
-                "status": "failed",
-                "error": (
-                    "repair_created_no_tasks: "
-                    f"eligible={[t.task_id for t in eligible]}, "
-                    f"board={board_snapshot}"
-                ),
-            }
-        self._persist_graph(graph)
-        self._event("repair_planned", {
-            "repair_round": int(state.get("repair_round", 0)) + 1,
-            "repair_rounds_by_task": rounds_by_task,
-            "created_task_ids": created,
-            "verification": state.get("verification_summary", {}),
-        })
-        return {
-            "phase": "repair_planned",
-            "repair_round": int(state.get("repair_round", 0)) + 1,
-            "repair_rounds_by_task": rounds_by_task,
-            "task_graph_json": graph.model_dump_json(),
-            "task_graph_version": graph.version,
-            "error": None,
-        }
-
-    def _replan(self, state: AgentRunState) -> dict[str, Any]:
-        artifact_store = getattr(self.verifier, "artifact_store", None)
-        if artifact_store is not None:
-            for artifact in artifact_store.list_by_run(self.ctx.run_id):
-                if artifact.status.value in {"published", "verified"}:
-                    artifact_store.mark_rejected(artifact.id)
-        self._event("replan_requested", {
-            "repair_round": int(state.get("repair_round", 0)) + 1,
-            "verification": state.get("verification_summary", {}),
-        })
-        return {
-            "phase": "replanning",
-            "task_graph_json": "",
-            "repair_round": int(state.get("repair_round", 0)) + 1,
-            # Replan é‡ç½® per-task è®¡æ•°å™¨ï¼šæ–° plan äº§ç”Ÿå…¨æ–°çš„ task idï¼Œ
-            # æ—§è®¡æ•°å™¨ä¸å†é€‚ç”¨ã€‚å…¨å±€ repair_round ç»§ç»­ç´¯ç§¯ä½œä¸ºå®‰å…¨ç½‘ã€‚
-            "repair_rounds_by_task": {},
-            "error": None,
-        }
-
-    def _human_interrupt(self, state: AgentRunState) -> dict[str, Any]:
-        self._event("human_input_requested", {
-            "reason": state.get("error") or "human approval required",
-            "pending_permission_ids": state.get("pending_permission_ids", []),
-            "pending_plan_ids": state.get("pending_plan_ids", []),
-        })
-        response = interrupt({
-            "run_id": self.ctx.run_id,
-            "reason": state.get("error") or "human approval required",
-            "pending_permission_ids": state.get("pending_permission_ids", []),
-            "pending_plan_ids": state.get("pending_plan_ids", []),
-        })
-        if isinstance(response, dict) and response.get("decision") in {"deny", "cancel"}:
-            return {
-                "phase": "human_denied",
-                "status": "failed",
-                "error": response.get("feedback") or "human denied continuation",
-            }
-        return {
-            "phase": "resumed",
-            "status": "running",
-            "dispatch_status": "",
-            "error": None,
-        }
-
-    def _finalize(self, state: AgentRunState) -> dict[str, Any]:
-        graph = self._load_graph(state)
-        from app.multiagent.task_board import BoardTaskStatus, get_task_board
-
-        board = get_task_board()
-        for task in board.list_by_run(self.ctx.run_id):
-            if task.status == BoardTaskStatus.PRODUCED:
-                if not board.mark_verifying(task.task_id, run_id=self.ctx.run_id):
-                    raise RuntimeError(
-                        f"finalize_state_conflict:{task.task_id}:mark_verifying"
-                    )
-            current = board.get(task.task_id, run_id=self.ctx.run_id)
-            if current is not None and current.status == BoardTaskStatus.VERIFYING:
-                if not board.mark_verified(task.task_id, run_id=self.ctx.run_id):
-                    raise RuntimeError(
-                        f"finalize_state_conflict:{task.task_id}:mark_verified"
-                    )
-        self._sync_board_to_graph(graph)
-        self._persist_graph(graph)
-        summary = state.get("verification_summary", {}).get("summary") or (
-            f"Run completed with {len(state.get('completed_task_ids', []))} verified tasks"
-        )
-        self._event("run_finalized", {"summary": summary})
-        return {
-            "phase": "finalized",
-            "status": "succeeded",
-            "final_output": summary,
-            "task_graph_json": graph.model_dump_json(),
-            "error": None,
-        }
-
-    def _fail(self, state: AgentRunState) -> dict[str, Any]:
-        self._event("run_failed", {"error": state.get("error")})
-        return {"phase": "failed", "status": "failed"}
-
-    def _route_after_dispatch(self, state: AgentRunState) -> str:
-        status = state.get("dispatch_status")
-        if status == "waiting_human":
-            from app.multiagent.task_board import BoardTaskStatus, get_task_board
-
-            statuses = {
-                task.status for task in get_task_board().list_by_run(self.ctx.run_id)
-            }
-            if BoardTaskStatus.REPAIR_REQUIRED in statuses:
-                return "repair"
-            if BoardTaskStatus.REPLAN_REQUIRED in statuses:
-                return "replan"
-            return "human"
-        if status == "paused":
-            return "human"
-        if status == "completed":
-            return "collect"
-        return "fail"
-
-    def _route_after_verify(self, state: AgentRunState) -> str:
-        verdict = state.get("verification_summary", {}).get("verdict", "fail")
-        if verdict == "pass":
-            return "finalize"
-        # å…¨å±€å®‰å…¨ç½‘ï¼šæ€»ä¿®å¤è½®æ¬¡è¾¾åˆ° max_repair_rounds * 3 æ—¶ä¸å†è·¯ç”±åˆ°
-        # repair/replanï¼Œç›´æŽ¥ failã€‚per-task çš„ä¿®å¤é¢„ç®—æ£€æŸ¥åœ¨ _repair / _replan
-        # èŠ‚ç‚¹å†…éƒ¨æ‰§è¡Œï¼Œé‚£é‡Œä¼šç²¾ç¡®æŽ§åˆ¶æ¯æ¡ä»»åŠ¡é“¾çš„ä¿®å¤ä¸Šé™ã€‚è¿™é‡Œåªåšç²—ç²’åº¦çš„
-        # å…¨å±€å…œåº•ï¼Œé˜²æ­¢ per-task é€»è¾‘æœ‰ bug æ—¶æ— é™å¾ªçŽ¯ã€‚
-        global_limit = self.max_repair_rounds * 3
-        if verdict == "repair":
-            if int(state.get("repair_round", 0)) < global_limit:
-                return "repair"
-            return "fail"
-        if verdict == "replan":
-            if int(state.get("repair_round", 0)) < global_limit:
-                return "replan"
-            return "fail"
-        if verdict == "human_required":
-            return "human"
-        return "fail"
-
-    def _persist_graph(self, graph: TaskGraph) -> None:
-        get_agent_run_history().save_task_graph(
-            self.ctx.run_id, graph.model_dump(mode="json")
-        )
-
-    def _event(self, event_type: str, payload: dict[str, Any]) -> None:
-        get_agent_run_history().record_event(
-            event_id=make_run_event_id(),
-            run_id=self.ctx.run_id,
-            event_type=f"root_graph:{event_type}",
-            payload=payload,
-            timestamp=datetime.now(UTC),
-        )
-
-    @staticmethod
-    def _load_graph(state: AgentRunState) -> TaskGraph:
-        graph_json = state.get("task_graph_json") or ""
-        if not graph_json:
-            raise RuntimeError("task_graph_missing")
-        return TaskGraph.model_validate_json(graph_json)
-
-    def _sync_board_to_graph(self, graph: TaskGraph) -> None:
-        from app.multiagent.task_board import BoardTaskStatus, get_task_board
-
-        mapping = {
-            BoardTaskStatus.PENDING: TaskNodeStatus.PENDING,
-            BoardTaskStatus.CLAIMED: TaskNodeStatus.RUNNING,
-            BoardTaskStatus.RUNNING: TaskNodeStatus.RUNNING,
-            BoardTaskStatus.PRODUCED: TaskNodeStatus.RUNNING,
-            BoardTaskStatus.VERIFYING: TaskNodeStatus.RUNNING,
-            BoardTaskStatus.SUCCEEDED: TaskNodeStatus.SUCCEEDED,
-            BoardTaskStatus.REPAIR_REQUIRED: TaskNodeStatus.FAILED,
-            BoardTaskStatus.REPLAN_REQUIRED: TaskNodeStatus.FAILED,
-            BoardTaskStatus.FAILED: TaskNodeStatus.FAILED,
-            BoardTaskStatus.CANCELLED: TaskNodeStatus.CANCELLED,
-        }
-        for task in get_task_board().list_by_run(self.ctx.run_id):
-            node = graph.nodes.get(task.task_id)
-            if node is None:
-                continue
-            target = mapping.get(task.status)
-            if (
-                task.status == BoardTaskStatus.REPAIR_REQUIRED
-                and task.metadata.get("superseded_by_repair")
-            ):
-                target = TaskNodeStatus.SKIPPED
-            if target is not None and node.status != target:
-                # TaskBoard is the execution authority.  Replay the smallest
-                # legal TaskGraph transition path when synchronizing its
-                # terminal state instead of attempting PENDING -> SUCCEEDED.
-                if (
-                    target in {
-                        TaskNodeStatus.SUCCEEDED,
-                        TaskNodeStatus.FAILED,
-                        TaskNodeStatus.SKIPPED,
-                    }
-                    and node.status in {TaskNodeStatus.PENDING, TaskNodeStatus.READY}
-                ):
-                    graph.update_status(task.task_id, TaskNodeStatus.RUNNING)
-                if target == TaskNodeStatus.SKIPPED and node.status == TaskNodeStatus.SUCCEEDED:
-                    graph.update_status(task.task_id, TaskNodeStatus.FAILED)
-                graph.update_status(task.task_id, target)
-            for artifact_id in task.produced_artifact_ids:
-                if artifact_id not in node.output_artifact_ids:
-                    node.output_artifact_ids.append(artifact_id)
-
-    def _verification_artifacts(self, graph: TaskGraph) -> dict[str, dict[str, Any]]:
-        store = getattr(self.verifier, "artifact_store", None)
-        artifacts: dict[str, dict[str, Any]] = {}
-        if store is not None:
-            for artifact in store.list_by_run(self.ctx.run_id):
-                artifacts[f"artifact:{artifact.id}"] = {
-                    "artifact_id": artifact.id,
-                    "path": artifact.path,
-                    "content_hash": artifact.content_hash,
-                    "status": artifact.status.value,
-                }
-        if artifacts:
-            return artifacts
-        for node in graph.nodes.values():
-            for artifact_id in node.output_artifact_ids:
-                artifacts[f"artifact:{artifact_id}"] = {
-                    "artifact_id": artifact_id,
-                    "status": node.status.value,
-                }
-        return artifacts
-
-    def _apply_integration_verification_metadata(self, graph: TaskGraph) -> None:
-        """Carry run-level repository checks into the durable root contract."""
-        root = graph.nodes.get(graph.root_task_id)
-        if root is None:
-            return
-        repository = self.ctx.metadata.get("repository") or {}
-        for key in ("integration_test_argv", "integration_test_commands"):
-            value = self.ctx.metadata.get(key)
-            if value is None and isinstance(repository, dict):
-                value = repository.get(key)
-            if value is not None:
-                root.metadata[key] = value
-
-    def _workspace_components(self) -> dict[str, Any]:
-        repository_meta = self.ctx.metadata.get("repository") or {}
-        source = repository_meta.get("source_repository_path")
-        if not source:
-            return {}
-        from app.multiagent.git_workspace import (
-            AgentWorktreeManager,
-            GitIntegrationManager,
-            RepositoryWorkspaceManager,
-        )
-        from app.multiagent.permission import get_permission_broker
-
-        repository = RepositoryWorkspaceManager(
-            source,
-            self.ctx.workspace_root,
-            base_branch=repository_meta.get("base_branch"),
-            base_commit_sha=repository_meta.get("base_commit_sha"),
-        )
-        broker = get_permission_broker()
-        return {
-            "worktree_manager": AgentWorktreeManager(
-                repository,
-                permission_broker=broker,
-                environment_file_allowlist=repository_meta.get(
-                    "environment_file_allowlist"
-                ) or [],
-            ),
-            "integration_manager": GitIntegrationManager(
-                repository, permission_broker=broker
-            ),
-            "permission_broker": broker,
-        }
-
-    @staticmethod
-    def _to_result(state: AgentRunState) -> OrchestrationResult:
-        graph = None
-        if state.get("task_graph_json"):
-            try:
-                graph = TaskGraph.model_validate_json(state["task_graph_json"])
-            except Exception:
-                graph = None
-        nodes = list(graph.nodes.values()) if graph else []
-        verification = state.get("verification_summary", {})
-        return OrchestrationResult(
-            status=(
-                "completed" if state.get("status") == "succeeded"
-                else "interrupted" if state.get("status") in {"paused", "waiting_human"}
-                else state.get("status", "failed")
-            ),
-            mode=state.get("mode", ""),
-            task_graph_version=state.get("task_graph_version", 0),
-            total_tasks=len(nodes),
-            succeeded_tasks=sum(n.status == TaskNodeStatus.SUCCEEDED for n in nodes),
-            failed_tasks=sum(n.status == TaskNodeStatus.FAILED for n in nodes),
-            verification_verdict=verification.get("verdict", ""),
-            rounds=state.get("dispatch_rounds", 0),
-            error=state.get("error"),
-            summary=state.get("final_output") or verification.get("summary", ""),
-        )
-
-
-def run_governed(
-    *,
-    goal: str,
-    requested_mode: str,
-    planner: Any,
-    executor: Any,
-    verifier: Any,
-    ctx: TeamRunContext,
-    cancel_event: Any | None = None,
-    task_graph: TaskGraph | None = None,
-    resume: bool = False,
-    resume_decision: dict[str, Any] | None = None,
-    max_rounds: int = 30,
-    max_repair_rounds: int | None = None,
-) -> OrchestrationResult:
-    return GovernedRunGraph(
-        ctx=ctx,
-        planner=planner,
-        executor=executor,
-        verifier=verifier,
-        cancel_event=cancel_event,
-        task_graph=task_graph,
-        max_rounds=max_rounds,
-        max_repair_rounds=max_repair_rounds,
-    ).invoke(
-        goal=goal,
-        requested_mode=requested_mode,
-        resume=resume,
-        resume_decision=resume_decision,
-    )
+            logger.exception("[RãÞz¶‰žËkºwµçE¥È½¹ÑÉ…Ð°‰ÕÐ¥ÐµÕÍÐ¹½Ð‰”•±¥¥‰±”™½ÈÑ¡”(€€€€€€€€€€€€€€€€€€€€Œ¹•áÐÝ¡½±”µÉÕ¸AML‘•¥Í¥½¸¸(€€€€€€€€€€€€€€€€€€€…ÉÑ¥™…Ñ}ÍÑ½É”¹µ…É­}É•©•Ñ•¡…ÉÑ¥™…Ñ}¥¤(€€€€€€€¥˜¹½ÐÉ•…Ñ•è(€€€€€€€€€€€€Œ•±¥¥‰±”ƒ¦v{ž¦ë’öšÊ‡šr'–"o–îë–ë’îï’öTÉ•Á…¥ÈÑ…Í¬ƒŠSŠPƒžB¢ºë’â+’â7–êS–>GžR|(€€€€€€€€€€€€Œƒ¾ò!É•…Ñ•}É•Á…¥Èƒ–¦£–ò–âãš&7’òk¢ÖÃ–"Ã¢þg¦3¾ò'¾ò3žîg–ë¢¾+šZ·’þ‡š¿’úÿ’ê;š:Kš~—Ž(€€€€€€€€€€€‰½…É‘}Í¹…ÁÍ¡½Ð€ôl(€€€€€€€€€€€€€€€ì‰Ñ…Í­}¥ˆèÐ¹Ñ…Í­}¥°€‰ÍÑ…ÑÕÌˆèÐ¹ÍÑ…ÑÕÌ¹Ù…±Õ”°(€€€€€€€€€€€€€€€€€‰ÍÕÁ•ÉÍ•‘•ˆè‰½½°¡Ð¹µ•Ñ…‘…Ñ„¹•Ð ‰ÍÕÁ•ÉÍ•‘•‘}‰å}É•Á…¥Èˆ¤¥ô(€€€€€€€€€€€€€€€™½ÈÐ¥¸‰½…É¹±¥ÍÑ}‰å}ÉÕ¸¡Í•±˜¹Ñà¹ÉÕ¹}¥¤(€€€€€€€€€€€t(€€€€€€€€€€€Í•±˜¹}•Ù•¹Ð ‰É•Á…¥É}¹½}…¹‘¥‘…Ñ•Ìˆ°ì‰‰½…Éˆè‰½…É‘}Í¹…ÁÍ¡½Ñô¤(€€€€€€€€€€€É•ÑÕÉ¸ì(€€€€€€€€€€€€€€€€‰ÍÑ…ÑÕÌˆè€‰™…¥±•ˆ°(€€€€€€€€€€€€€€€€‰•ÉÉ½Èˆè€ (€€€€€€€€€€€€€€€€€€€€‰É•Á…¥É}É•…Ñ•‘}¹½}Ñ…Í­Ìè€ˆ(€€€€€€€€€€€€€€€€€€€˜‰•±¥¥‰±”õímÐ¹Ñ…Í­}¥™½ÈÐ¥¸•±¥¥‰±•uô°€ˆ(€€€€€€€€€€€€€€€€€€€˜‰‰½…Éõí‰½…É‘}Í¹…ÁÍ¡½Ñôˆ(€€€€€€€€€€€€€€€€¤°(€€€€€€€€€€€ô(€€€€€€€Í•±˜¹}Á•ÉÍ¥ÍÑ}É…Á ¡É…Á ¤(€€€€€€€Í•±˜¹}•Ù•¹Ð ‰É•Á…¥É}Á±…¹¹•ˆ°ì(€€€€€€€€€€€€‰É•Á…¥É}É½Õ¹ˆè¥¹Ð¡ÍÑ…Ñ”¹•Ð ‰É•Á…¥É}É½Õ¹ˆ°€À¤¤€¬€Ä°(€€€€€€€€€€€€‰É•Á…¥É}É½Õ¹‘Í}‰å}Ñ…Í¬ˆèÉ½Õ¹‘Í}‰å}Ñ…Í¬°(€€€€€€€€€€€€‰É•…Ñ•‘}Ñ…Í­}¥‘ÌˆèÉ•…Ñ•°(€€€€€€€€€€€€‰Ù•É¥™¥…Ñ¥½¸ˆèÍÑ…Ñ”¹•Ð ‰Ù•É¥™¥…Ñ¥½¹}ÍÕµµ…Éäˆ°íô¤°(€€€€€€€ô¤(€€€€€€€É•ÑÕÉ¸ì(€€€€€€€€€€€€‰Á¡…Í”ˆè€‰É•Á…¥É}Á±…¹¹•ˆ°(€€€€€€€€€€€€‰É•Á…¥É}É½Õ¹ˆè¥¹Ð¡ÍÑ…Ñ”¹•Ð ‰É•Á…¥É}É½Õ¹ˆ°€À¤¤€¬€Ä°(€€€€€€€€€€€€‰É•Á…¥É}É½Õ¹‘Í}‰å}Ñ…Í¬ˆèÉ½Õ¹‘Í}‰å}Ñ…Í¬°(€€€€€€€€€€€€‰Ñ…Í­}É…Á¡}©Í½¸ˆèÉ…Á ¹µ½‘•±}‘ÕµÁ}©Í½¸ ¤°(€€€€€€€€€€€€‰Ñ…Í­}É…Á¡}Ù•ÉÍ¥½¸ˆèÉ…Á ¹Ù•ÉÍ¥½¸°(€€€€€€€€€€€€‰•ÉÉ½Èˆè9½¹”°(€€€€€€€ô((€€€‘•˜}É•Á±…¸¡Í•±˜°ÍÑ…Ñ”è•¹ÑIÕ¹MÑ…Ñ”¤€´ø‘¥ÑmÍÑÈ°¹åtè(€€€€€€€…ÉÑ¥™…Ñ}ÍÑ½É”€ô•Ñ…ÑÑÈ¡Í•±˜¹Ù•É¥™¥•È°€‰…ÉÑ¥™…Ñ}ÍÑ½É”ˆ°9½¹”¤(€€€€€€€¥˜…ÉÑ¥™…Ñ}ÍÑ½É”¥Ì¹½Ð9½¹”è(€€€€€€€€€€€™½È…ÉÑ¥™…Ð¥¸…ÉÑ¥™…Ñ}ÍÑ½É”¹±¥ÍÑ}‰å}ÉÕ¸¡Í•±˜¹Ñà¹ÉÕ¹}¥¤è(€€€€€€€€€€€€€€€¥˜…ÉÑ¥™…Ð¹ÍÑ…ÑÕÌ¹Ù…±Õ”¥¸ì‰ÁÕ‰±¥Í¡•ˆ°€‰Ù•É¥™¥•‰ôè(€€€€€€€€€€€€€€€€€€€…ÉÑ¥™…Ñ}ÍÑ½É”¹µ…É­}É•©•Ñ•¡…ÉÑ¥™…Ð¹¥¤(€€€€€€€Í•±˜¹}•Ù•¹Ð ‰É•Á±…¹}É•ÅÕ•ÍÑ•ˆ°ì(€€€€€€€€€€€€‰É•Á…¥É}É½Õ¹ˆè¥¹Ð¡ÍÑ…Ñ”¹•Ð ‰É•Á…¥É}É½Õ¹ˆ°€À¤¤€¬€Ä°(€€€€€€€€€€€€‰Ù•É¥™¥…Ñ¥½¸ˆèÍÑ…Ñ”¹•Ð ‰Ù•É¥™¥…Ñ¥½¹}ÍÕµµ…Éäˆ°íô¤°(€€€€€€€ô¤(€€€€€€€É•ÑÕÉ¸ì(€€€€€€€€€€€€‰Á¡…Í”ˆè€‰É•Á±…¹¹¥¹œˆ°(€€€€€€€€€€€€‰Ñ…Í­}É…Á¡}©Í½¸ˆè€ˆˆ°(€€€€€€€€€€€€‰É•Á…¥É}É½Õ¹ˆè¥¹Ð¡ÍÑ…Ñ”¹•Ð ‰É•Á…¥É}É½Õ¹ˆ°€À¤¤€¬€Ä°(€€€€€€€€€€€€ŒI•Á±…¸ƒ¦7žö¸Á•ÈµÑ…Í¬ƒ¢º‡šVÃ–f£¾òkšZÀÁ±…¸ƒ’êŸžR–£šZÃžjÑ…Í¬¥“¾ò0(€€€€€€€€€€€€Œƒš^Ÿ¢º‡šVÃ–f£’â7–7¦žR£Ž–£–Æ É•Á…¥É}É½Õ¹ƒžîŸžî·žÒ¿žž¿’ös’âë–º'–£žöGŽ(€€€€€€€€€€€€‰É•Á…¥É}É½Õ¹‘Í}‰å}Ñ…Í¬ˆèíô°(€€€€€€€€€€€€‰•ÉÉ½Èˆè9½¹”°(€€€€€€€ô((€€€‘•˜}¡Õµ…¹}¥¹Ñ•ÉÉÕÁÐ¡Í•±˜°ÍÑ…Ñ”è•¹ÑIÕ¹MÑ…Ñ”¤€´ø‘¥ÑmÍÑÈ°¹åtè(€€€€€€€Í•±˜¹}•Ù•¹Ð ‰¡Õµ…¹}¥¹ÁÕÑ}É•ÅÕ•ÍÑ•ˆ°ì(€€€€€€€€€€€€‰É•…Í½¸ˆèÍÑ…Ñ”¹•Ð ‰•ÉÉ½Èˆ¤½È€‰¡Õµ…¸…ÁÁÉ½Ù…°É•ÅÕ¥É•ˆ°(€€€€€€€€€€€€‰Á•¹‘¥¹}Á•Éµ¥ÍÍ¥½¹}¥‘ÌˆèÍÑ…Ñ”¹•Ð ‰Á•¹‘¥¹}Á•Éµ¥ÍÍ¥½¹}¥‘Ìˆ°mt¤°(€€€€€€€€€€€€‰Á•¹‘¥¹}Á±…¹}¥‘ÌˆèÍÑ…Ñ”¹•Ð ‰Á•¹‘¥¹}Á±…¹}¥‘Ìˆ°mt¤°(€€€€€€€ô¤(€€€€€€€É•ÍÁ½¹Í”€ô¥¹Ñ•ÉÉÕÁÐ¡ì(€€€€€€€€€€€€‰ÉÕ¹}¥ˆèÍ•±˜¹Ñà¹ÉÕ¹}¥°(€€€€€€€€€€€€‰É•…Í½¸ˆèÍÑ…Ñ”¹•Ð ‰•ÉÉ½Èˆ¤½È€‰¡Õµ…¸…ÁÁÉ½Ù…°É•ÅÕ¥É•ˆ°(€€€€€€€€€€€€‰Á•¹‘¥¹}Á•Éµ¥ÍÍ¥½¹}¥‘ÌˆèÍÑ…Ñ”¹•Ð ‰Á•¹‘¥¹}Á•Éµ¥ÍÍ¥½¹}¥‘Ìˆ°mt¤°(€€€€€€€€€€€€‰Á•¹‘¥¹}Á±…¹}¥‘ÌˆèÍÑ…Ñ”¹•Ð ‰Á•¹‘¥¹}Á±…¹}¥‘Ìˆ°mt¤°(€€€€€€€ô¤(€€€€€€€¥˜¥Í¥¹ÍÑ…¹”¡É•ÍÁ½¹Í”°‘¥Ð¤…¹É•ÍÁ½¹Í”¹•Ð ‰‘•¥Í¥½¸ˆ¤¥¸ì‰‘•¹äˆ°€‰…¹•°‰ôè(€€€€€€€€€€€É•ÑÕÉ¸ì(€€€€€€€€€€€€€€€€‰Á¡…Í”ˆè€‰¡Õµ…¹}‘•¹¥•ˆ°(€€€€€€€€€€€€€€€€‰ÍÑ…ÑÕÌˆè€‰™…¥±•ˆ°(€€€€€€€€€€€€€€€€‰•ÉÉ½ÈˆèÉ•ÍÁ½¹Í”¹•Ð ‰™••‘‰…¬ˆ¤½È€‰¡Õµ…¸‘•¹¥•½¹Ñ¥¹Õ…Ñ¥½¸ˆ°(€€€€€€€€€€€ô(€€€€€€€É•ÑÕÉ¸ì(€€€€€€€€€€€€‰Á¡…Í”ˆè€‰É•ÍÕµ•ˆ°(€€€€€€€€€€€€‰ÍÑ…ÑÕÌˆè€‰ÉÕ¹¹¥¹œˆ°(€€€€€€€€€€€€‰‘¥ÍÁ…Ñ¡}ÍÑ…ÑÕÌˆè€ˆˆ°(€€€€€€€€€€€€‰•ÉÉ½Èˆè9½¹”°(€€€€€€€ô((€€€‘•˜}™¥¹…±¥é”¡Í•±˜°ÍÑ…Ñ”è•¹ÑIÕ¹MÑ…Ñ”¤€´ø‘¥ÑmÍÑÈ°¹åtè(€€€€€€€É…Á €ôÍ•±˜¹}±½…‘}É…Á ¡ÍÑ…Ñ”¤(€€€€€€€™É½´…ÁÀ¹µÕ±Ñ¥…•¹Ð¹Ñ…Í­}‰½…É¥µÁ½ÉÐ	½…É‘Q…Í­MÑ…ÑÕÌ°•Ñ}Ñ…Í­}‰½…É((€€€€€€€‰½…É€ô•Ñ}Ñ…Í­}‰½…É ¤(€€€€€€€™½ÈÑ…Í¬¥¸‰½…É¹±¥ÍÑ}‰å}ÉÕ¸¡Í•±˜¹Ñà¹ÉÕ¹}¥¤è(€€€€€€€€€€€¥˜Ñ…Í¬¹ÍÑ…ÑÕÌ€ôô	½…É‘Q…Í­MÑ…ÑÕÌ¹AI=Uè(€€€€€€€€€€€€€€€¥˜¹½Ð‰½…É¹µ…É­}Ù•É¥™å¥¹œ¡Ñ…Í¬¹Ñ…Í­}¥°ÉÕ¹}¥õÍ•±˜¹Ñà¹ÉÕ¹}¥¤è(€€€€€€€€€€€€€€€€€€€É…¥Í”IÕ¹Ñ¥µ•ÉÉ½È (€€€€€€€€€€€€€€€€€€€€€€€˜‰™¥¹…±¥é•}ÍÑ…Ñ•}½¹™±¥ÐéíÑ…Í¬¹Ñ…Í­}¥‘ôéµ…É­}Ù•É¥™å¥¹œˆ(€€€€€€€€€€€€€€€€€€€€¤(€€€€€€€€€€€ÕÉÉ•¹Ð€ô‰½…É¹•Ð¡Ñ…Í¬¹Ñ…Í­}¥°ÉÕ¹}¥õÍ•±˜¹Ñà¹ÉÕ¹}¥¤(€€€€€€€€€€€¥˜ÕÉÉ•¹Ð¥Ì¹½Ð9½¹”…¹ÕÉÉ•¹Ð¹ÍÑ…ÑÕÌ€ôô	½…É‘Q…Í­MÑ…ÑÕÌ¹YI%e%9è(€€€€€€€€€€€€€€€¥˜¹½Ð‰½…É¹µ…É­}Ù•É¥™¥•¡Ñ…Í¬¹Ñ…Í­}¥°ÉÕ¹}¥õÍ•±˜¹Ñà¹ÉÕ¹}¥¤è(€€€€€€€€€€€€€€€€€€€É…¥Í”IÕ¹Ñ¥µ•ÉÉ½È (€€€€€€€€€€€€€€€€€€€€€€€˜‰™¥¹…±¥é•}ÍÑ…Ñ•}½¹™±¥ÐéíÑ…Í¬¹Ñ…Í­}¥‘ôéµ…É­}Ù•É¥™¥•ˆ(€€€€€€€€€€€€€€€€€€€€¤(€€€€€€€Í•±˜¹}Íå¹}‰½…É‘}Ñ½}É…Á ¡É…Á ¤(€€€€€€€Í•±˜¹}Á•ÉÍ¥ÍÑ}É…Á ¡É…Á ¤(€€€€€€€ÍÕµµ…Éä€ôÍÑ…Ñ”¹•Ð ‰Ù•É¥™¥…Ñ¥½¹}ÍÕµµ…Éäˆ°íô¤¹•Ð ‰ÍÕµµ…Éäˆ¤½È€ (€€€€€€€€€€€˜‰IÕ¸½µÁ±•Ñ•Ý¥Ñ í±•¸¡ÍÑ…Ñ”¹•Ð ½µÁ±•Ñ•‘}Ñ…Í­}¥‘Ìœ°mt¤¥ôÙ•É¥™¥•Ñ…Í­Ìˆ(€€€€€€€€¤(€€€€€€€Í•±˜¹}•Ù•¹Ð ‰ÉÕ¹}™¥¹…±¥é•ˆ°ì‰ÍÕµµ…ÉäˆèÍÕµµ…Éåô¤(€€€€€€€É•ÑÕÉ¸ì(€€€€€€€€€€€€‰Á¡…Í”ˆè€‰™¥¹…±¥é•ˆ°(€€€€€€€€€€€€‰ÍÑ…ÑÕÌˆè€‰ÍÕ••‘•ˆ°(€€€€€€€€€€€€‰™¥¹…±}½ÕÑÁÕÐˆèÍÕµµ…Éä°(€€€€€€€€€€€€‰Ñ…Í­}É…Á¡}©Í½¸ˆèÉ…Á ¹µ½‘•±}‘ÕµÁ}©Í½¸ ¤°(€€€€€€€€€€€€‰•ÉÉ½Èˆè9½¹”°(€€€€€€€ô((€€€‘•˜}™…¥°¡Í•±˜°ÍÑ…Ñ”è•¹ÑIÕ¹MÑ…Ñ”¤€´ø‘¥ÑmÍÑÈ°¹åtè(€€€€€€€Í•±˜¹}•Ù•¹Ð ‰ÉÕ¹}™…¥±•ˆ°ì‰•ÉÉ½ÈˆèÍÑ…Ñ”¹•Ð ‰•ÉÉ½Èˆ¥ô¤(€€€€€€€É•ÑÕÉ¸ì‰Á¡…Í”ˆè€‰™…¥±•ˆ°€‰ÍÑ…ÑÕÌˆè€‰™…¥±•‰ô((€€€‘•˜}É½ÕÑ•}…™Ñ•É}‘¥ÍÁ…Ñ ¡Í•±˜°ÍÑ…Ñ”è•¹ÑIÕ¹MÑ…Ñ”¤€´øÍÑÈè(€€€€€€€ÍÑ…ÑÕÌ€ôÍÑ…Ñ”¹•Ð ‰‘¥ÍÁ…Ñ¡}ÍÑ…ÑÕÌˆ¤(€€€€€€€¥˜ÍÑ…ÑÕÌ€ôô€‰Ý…¥Ñ¥¹}¡Õµ…¸ˆè(€€€€€€€€€€€™É½´…ÁÀ¹µÕ±Ñ¥…•¹Ð¹Ñ…Í­}‰½…É¥µÁ½ÉÐ	½…É‘Q…Í­MÑ…ÑÕÌ°•Ñ}Ñ…Í­}‰½…É((€€€€€€€€€€€ÍÑ…ÑÕÍ•Ì€ôì(€€€€€€€€€€€€€€€Ñ…Í¬¹ÍÑ…ÑÕÌ™½ÈÑ…Í¬¥¸•Ñ}Ñ…Í­}‰½…É ¤¹±¥ÍÑ}‰å}ÉÕ¸¡Í•±˜¹Ñà¹ÉÕ¹}¥¤(€€€€€€€€€€€ô(€€€€€€€€€€€¥˜	½…É‘Q…Í­MÑ…ÑÕÌ¹IA%I}IEU%I¥¸ÍÑ…ÑÕÍ•Ìè(€€€€€€€€€€€€€€€É•ÑÕÉ¸€‰É•Á…¥Èˆ(€€€€€€€€€€€¥˜	½…É‘Q…Í­MÑ…ÑÕÌ¹IA19}IEU%I¥¸ÍÑ…ÑÕÍ•Ìè(€€€€€€€€€€€€€€€É•ÑÕÉ¸€‰É•Á±…¸ˆ(€€€€€€€€€€€É•ÑÕÉ¸€‰¡Õµ…¸ˆ(€€€€€€€¥˜ÍÑ…ÑÕÌ€ôô€‰Á…ÕÍ•ˆè(€€€€€€€€€€€É•ÑÕÉ¸€‰¡Õµ…¸ˆ(€€€€€€€¥˜ÍÑ…ÑÕÌ€ôô€‰½µÁ±•Ñ•ˆè(€€€€€€€€€€€É•ÑÕÉ¸€‰½±±•Ðˆ(€€€€€€€É•ÑÕÉ¸€‰™…¥°ˆ((€€€‘•˜}É½ÕÑ•}…™Ñ•É}Ù•É¥™ä¡Í•±˜°ÍÑ…Ñ”è•¹ÑIÕ¹MÑ…Ñ”¤€´øÍÑÈè(€€€€€€€Ù•É‘¥Ð€ôÍÑ…Ñ”¹•Ð ‰Ù•É¥™¥…Ñ¥½¹}ÍÕµµ…Éäˆ°íô¤¹•Ð ‰Ù•É‘¥Ðˆ°€‰™…¥°ˆ¤(€€€€€€€¥˜Ù•É‘¥Ð€ôô€‰Á…ÍÌˆè(€€€€€€€€€€€É•ÑÕÉ¸€‰™¥¹…±¥é”ˆ(€€€€€€€€Œƒ–£–Æ–º'–£žöG¾òkšï’þ»–’7¢ö»š²‡¢úû–"Àµ…á}É•Á…¥É}É½Õ¹‘Ì€¨€Ìƒš^Û’â7–7¢Þ¿žRÇ–"À(€€€€€€€€ŒÉ•Á…¥È½É•Á±…»¾ò3žnÓš:”™…¥³Ž	Á•ÈµÑ…Í¬ƒžj’þ»–’7¦Šžº_šŽš~—–r }É•Á…¥È€¼}É•Á±…¸(€€€€€€€€Œƒ¢*ž
+ç–¦£š&Ÿ¢†3¾ò3¦
+¦3’òkžÊûž†»š:Ÿ–"Ûš¾?šv‡’îï–*‡¦Nûžj’þ»–’7’â+¦fCŽ¢þg¦3–>«–kžÊ_žÊK–ê›žj(€€€€€€€€Œƒ–£–Æ–s–êW¾ò3¦bËš¶ˆÁ•ÈµÑ…Í¬ƒ¦ï¢úGšr$‰Õœƒš^Ûš^ƒ¦fC–ú«ž:¿Ž(€€€€€€€±½‰…±}±¥µ¥Ð€ôÍ•±˜¹µ…á}É•Á…¥É}É½Õ¹‘Ì€¨€Ì(€€€€€€€¥˜Ù•É‘¥Ð€ôô€‰É•Á…¥Èˆè(€€€€€€€€€€€¥˜¥¹Ð¡ÍÑ…Ñ”¹•Ð ‰É•Á…¥É}É½Õ¹ˆ°€À¤¤€ð±½‰…±}±¥µ¥Ðè(€€€€€€€€€€€€€€€É•ÑÕÉ¸€‰É•Á…¥Èˆ(€€€€€€€€€€€É•ÑÕÉ¸€‰™…¥°ˆ(€€€€€€€¥˜Ù•É‘¥Ð€ôô€‰É•Á±…¸ˆè(€€€€€€€€€€€¥˜¥¹Ð¡ÍÑ…Ñ”¹•Ð ‰É•Á…¥É}É½Õ¹ˆ°€À¤¤€ð±½‰…±}±¥µ¥Ðè(€€€€€€€€€€€€€€€É•ÑÕÉ¸€‰É•Á±…¸ˆ(€€€€€€€€€€€É•ÑÕÉ¸€‰™…¥°ˆ(€€€€€€€¥˜Ù•É‘¥Ð€ôô€‰¡Õµ…¹}É•ÅÕ¥É•ˆè(€€€€€€€€€€€É•ÑÕÉ¸€‰¡Õµ…¸ˆ(€€€€€€€É•ÑÕÉ¸€‰™…¥°ˆ((€€€‘•˜}Á•ÉÍ¥ÍÑ}É…Á ¡Í•±˜°É…Á èQ…Í­É…Á ¤€´ø9½¹”è(€€€€€€€•Ñ}…•¹Ñ}ÉÕ¹}¡¥ÍÑ½Éä ¤¹Í…Ù•}Ñ…Í­}É…Á  (€€€€€€€€€€€Í•±˜¹Ñà¹ÉÕ¹}¥°É…Á ¹µ½‘•±}‘ÕµÀ¡µ½‘”ô‰©Í½¸ˆ¤(€€€€€€€€¤((€€€‘•˜}•Ù•¹Ð¡Í•±˜°•Ù•¹Ñ}ÑåÁ”èÍÑÈ°Á…å±½…è‘¥ÑmÍÑÈ°¹åt¤€´ø9½¹”è(€€€€€€€•Ñ}…•¹Ñ}ÉÕ¹}¡¥ÍÑ½Éä ¤¹É•½É‘}•Ù•¹Ð (€€€€€€€€€€€•Ù•¹Ñ}¥õµ…­•}ÉÕ¹}•Ù•¹Ñ}¥ ¤°(€€€€€€€€€€€ÉÕ¹}¥õÍ•±˜¹Ñà¹ÉÕ¹}¥°(€€€€€€€€€€€•Ù•¹Ñ}ÑåÁ”õ˜‰É½½Ñ}É…Á éí•Ù•¹Ñ}ÑåÁ•ôˆ°(€€€€€€€€€€€Á…å±½…õÁ…å±½…°(€€€€€€€€€€€Ñ¥µ•ÍÑ…µÀõ‘…Ñ•Ñ¥µ”¹¹½Ü¡UQ¤°(€€€€€€€€¤((€€€ÍÑ…Ñ¥µ•Ñ¡½(€€€‘•˜}±½…‘}É…Á ¡ÍÑ…Ñ”è•¹ÑIÕ¹MÑ…Ñ”¤€´øQ…Í­É…Á è(€€€€€€€É…Á¡}©Í½¸€ôÍÑ…Ñ”¹•Ð ‰Ñ…Í­}É…Á¡}©Í½¸ˆ¤½È€ˆˆ(€€€€€€€¥˜¹½ÐÉ…Á¡}©Í½¸è(€€€€€€€€€€€É…¥Í”IÕ¹Ñ¥µ•ÉÉ½È ‰Ñ…Í­}É…Á¡}µ¥ÍÍ¥¹œˆ¤(€€€€€€€É•ÑÕÉ¸Q…Í­É…Á ¹µ½‘•±}Ù…±¥‘…Ñ•}©Í½¸¡É…Á¡}©Í½¸¤((€€€‘•˜}Íå¹}‰½…É‘}Ñ½}É…Á ¡Í•±˜°É…Á èQ…Í­É…Á ¤€´ø9½¹”è(€€€€€€€™É½´…ÁÀ¹µÕ±Ñ¥…•¹Ð¹Ñ…Í­}‰½…É¥µÁ½ÉÐ	½…É‘Q…Í­MÑ…ÑÕÌ°•Ñ}Ñ…Í­}‰½…É((€€€€€€€µ…ÁÁ¥¹œ€ôì(€€€€€€€€€€€	½…É‘Q…Í­MÑ…ÑÕÌ¹A9%9èQ…Í­9½‘•MÑ…ÑÕÌ¹A9%9°(€€€€€€€€€€€	½…É‘Q…Í­MÑ…ÑÕÌ¹1%5èQ…Í­9½‘•MÑ…ÑÕÌ¹IU99%9°(€€€€€€€€€€€	½…É‘Q…Í­MÑ…ÑÕÌ¹IU99%9èQ…Í­9½‘•MÑ…ÑÕÌ¹IU99%9°(€€€€€€€€€€€	½…É‘Q…Í­MÑ…ÑÕÌ¹AI=UèQ…Í­9½‘•MÑ…ÑÕÌ¹IU99%9°(€€€€€€€€€€€	½…É‘Q…Í­MÑ…ÑÕÌ¹YI%e%9èQ…Í­9½‘•MÑ…ÑÕÌ¹IU99%9°(€€€€€€€€€€€	½…É‘Q…Í­MÑ…ÑÕÌ¹MUèQ…Í­9½‘•MÑ…ÑÕÌ¹MU°(€€€€€€€€€€€	½…É‘Q…Í­MÑ…ÑÕÌ¹IA%I}IEU%IèQ…Í­9½‘•MÑ…ÑÕÌ¹%1°(€€€€€€€€€€€	½…É‘Q…Í­MÑ…ÑÕÌ¹IA19}IEU%IèQ…Í­9½‘•MÑ…ÑÕÌ¹%1°(€€€€€€€€€€€	½…É‘Q…Í­MÑ…ÑÕÌ¹%1èQ…Í­9½‘•MÑ…ÑÕÌ¹%1°(€€€€€€€€€€€	½…É‘Q…Í­MÑ…ÑÕÌ¹911èQ…Í­9½‘•MÑ…ÑÕÌ¹911°(€€€€€€€ô(€€€€€€€™½ÈÑ…Í¬¥¸•Ñ}Ñ…Í­}‰½…É ¤¹±¥ÍÑ}‰å}ÉÕ¸¡Í•±˜¹Ñà¹ÉÕ¹}¥¤è(€€€€€€€€€€€¹½‘”€ôÉ…Á ¹¹½‘•Ì¹•Ð¡Ñ…Í¬¹Ñ…Í­}¥¤(€€€€€€€€€€€¥˜¹½‘”¥Ì9½¹”è(€€€€€€€€€€€€€€€½¹Ñ¥¹Õ”(€€€€€€€€€€€Ñ…É•Ð€ôµ…ÁÁ¥¹œ¹•Ð¡Ñ…Í¬¹ÍÑ…ÑÕÌ¤(€€€€€€€€€€€¥˜€ (€€€€€€€€€€€€€€€Ñ…Í¬¹ÍÑ…ÑÕÌ€ôô	½…É‘Q…Í­MÑ…ÑÕÌ¹IA%I}IEU%I(€€€€€€€€€€€€€€€…¹Ñ…Í¬¹µ•Ñ…‘…Ñ„¹•Ð ‰ÍÕÁ•ÉÍ•‘•‘}‰å}É•Á…¥Èˆ¤(€€€€€€€€€€€€¤è(€€€€€€€€€€€€€€€Ñ…É•Ð€ôQ…Í­9½‘•MÑ…ÑÕÌ¹M-%AA(€€€€€€€€€€€¥˜Ñ…É•Ð¥Ì¹½Ð9½¹”…¹¹½‘”¹ÍÑ…ÑÕÌ€„ôÑ…É•Ðè(€€€€€€€€€€€€€€€€ŒQ…Í­	½…É¥ÌÑ¡”•á•ÕÑ¥½¸…ÕÑ¡½É¥Ñä¸€I•Á±…äÑ¡”Íµ…±±•ÍÐ(€€€€€€€€€€€€€€€€Œ±•…°Q…Í­É…Á ÑÉ…¹Í¥Ñ¥½¸Á…Ñ Ý¡•¸Íå¹¡É½¹¥é¥¹œ¥ÑÌ(€€€€€€€€€€€€€€€€ŒÑ•Éµ¥¹…°ÍÑ…Ñ”¥¹ÍÑ•…½˜…ÑÑ•µÁÑ¥¹œA9%9€´øMU¸(€€€€€€€€€€€€€€€¥˜€ (€€€€€€€€€€€€€€€€€€€Ñ…É•Ð¥¸ì(€€€€€€€€€€€€€€€€€€€€€€€Q…Í­9½‘•MÑ…ÑÕÌ¹MU°(€€€€€€€€€€€€€€€€€€€€€€€Q…Í­9½‘•MÑ…ÑÕÌ¹%1°(€€€€€€€€€€€€€€€€€€€€€€€Q…Í­9½‘•MÑ…ÑÕÌ¹M-%AA°(€€€€€€€€€€€€€€€€€€€ô(€€€€€€€€€€€€€€€€€€€…¹¹½‘”¹ÍÑ…ÑÕÌ¥¸íQ…Í­9½‘•MÑ…ÑÕÌ¹A9%9°Q…Í­9½‘•MÑ…ÑÕÌ¹Ieô(€€€€€€€€€€€€€€€€¤è(€€€€€€€€€€€€€€€€€€€É…Á ¹ÕÁ‘…Ñ•}ÍÑ…ÑÕÌ¡Ñ…Í¬¹Ñ…Í­}¥°Q…Í­9½‘•MÑ…ÑÕÌ¹IU99%9¤(€€€€€€€€€€€€€€€¥˜Ñ…É•Ð€ôôQ…Í­9½‘•MÑ…ÑÕÌ¹M-%AA…¹¹½‘”¹ÍÑ…ÑÕÌ€ôôQ…Í­9½‘•MÑ…ÑÕÌ¹MUè(€€€€€€€€€€€€€€€€€€€É…Á ¹ÕÁ‘…Ñ•}ÍÑ…ÑÕÌ¡Ñ…Í¬¹Ñ…Í­}¥°Q…Í­9½‘•MÑ…ÑÕÌ¹%1¤(€€€€€€€€€€€€€€€É…Á ¹ÕÁ‘…Ñ•}ÍÑ…ÑÕÌ¡Ñ…Í¬¹Ñ…Í­}¥°Ñ…É•Ð¤(€€€€€€€€€€€™½È…ÉÑ¥™…Ñ}¥¥¸Ñ…Í¬¹ÁÉ½‘Õ•‘}…ÉÑ¥™…Ñ}¥‘Ìè(€€€€€€€€€€€€€€€¥˜…ÉÑ¥™…Ñ}¥¹½Ð¥¸¹½‘”¹½ÕÑÁÕÑ}…ÉÑ¥™…Ñ}¥‘Ìè(€€€€€€€€€€€€€€€€€€€¹½‘”¹½ÕÑÁÕÑ}…ÉÑ¥™…Ñ}¥‘Ì¹…ÁÁ•¹¡…ÉÑ¥™…Ñ}¥¤((€€€‘•˜}Ù•É¥™¥…Ñ¥½¹}…ÉÑ¥™…ÑÌ¡Í•±˜°É…Á èQ…Í­É…Á ¤€´ø‘¥ÑmÍÑÈ°‘¥ÑmÍÑÈ°¹åutè(€€€€€€€ÍÑ½É”€ô•Ñ…ÑÑÈ¡Í•±˜¹Ù•É¥™¥•È°€‰…ÉÑ¥™…Ñ}ÍÑ½É”ˆ°9½¹”¤(€€€€€€€…ÉÑ¥™…ÑÌè‘¥ÑmÍÑÈ°‘¥ÑmÍÑÈ°¹åut€ôíô(€€€€€€€¥˜ÍÑ½É”¥Ì¹½Ð9½¹”è(€€€€€€€€€€€™½È…ÉÑ¥™…Ð¥¸ÍÑ½É”¹±¥ÍÑ}‰å}ÉÕ¸¡Í•±˜¹Ñà¹ÉÕ¹}¥¤è(€€€€€€€€€€€€€€€…ÉÑ¥™…ÑÍm˜‰…ÉÑ¥™…Ðéí…ÉÑ¥™…Ð¹¥‘ô‰t€ôì(€€€€€€€€€€€€€€€€€€€€‰…ÉÑ¥™…Ñ}¥ˆè…ÉÑ¥™…Ð¹¥°(€€€€€€€€€€€€€€€€€€€€‰Á…Ñ ˆè…ÉÑ¥™…Ð¹Á…Ñ °(€€€€€€€€€€€€€€€€€€€€‰½¹Ñ•¹Ñ}¡…Í ˆè…ÉÑ¥™…Ð¹½¹Ñ•¹Ñ}¡…Í °(€€€€€€€€€€€€€€€€€€€€‰ÍÑ…ÑÕÌˆè…ÉÑ¥™…Ð¹ÍÑ…ÑÕÌ¹Ù…±Õ”°(€€€€€€€€€€€€€€€ô(€€€€€€€¥˜…ÉÑ¥™…ÑÌè(€€€€€€€€€€€É•ÑÕÉ¸…ÉÑ¥™…ÑÌ(€€€€€€€™½È¹½‘”¥¸É…Á ¹¹½‘•Ì¹Ù…±Õ•Ì ¤è(€€€€€€€€€€€™½È…ÉÑ¥™…Ñ}¥¥¸¹½‘”¹½ÕÑÁÕÑ}…ÉÑ¥™…Ñ}¥‘Ìè(€€€€€€€€€€€€€€€…ÉÑ¥™…ÑÍm˜‰…ÉÑ¥™…Ðéí…ÉÑ¥™…Ñ}¥‘ô‰t€ôì(€€€€€€€€€€€€€€€€€€€€‰…ÉÑ¥™…Ñ}¥ˆè…ÉÑ¥™…Ñ}¥°(€€€€€€€€€€€€€€€€€€€€‰ÍÑ…ÑÕÌˆè¹½‘”¹ÍÑ…ÑÕÌ¹Ù…±Õ”°(€€€€€€€€€€€€€€€ô(€€€€€€€É•ÑÕÉ¸…ÉÑ¥™…ÑÌ((€€€‘•˜}…ÁÁ±å}¥¹Ñ•É…Ñ¥½¹}Ù•É¥™¥…Ñ¥½¹}µ•Ñ…‘…Ñ„¡Í•±˜°É…Á èQ…Í­É…Á ¤€´ø9½¹”è(€€€€€€€€ˆˆ‰…ÉÉäÉÕ¸µ±•Ù•°É•Á½Í¥Ñ½Éä¡•­Ì¥¹Ñ¼Ñ¡”‘ÕÉ…‰±”É½½Ð½¹ÑÉ…Ð¸ˆˆˆ(€€€€€€€É½½Ð€ôÉ…Á ¹¹½‘•Ì¹•Ð¡É…Á ¹É½½Ñ}Ñ…Í­}¥¤(€€€€€€€¥˜É½½Ð¥Ì9½¹”è(€€€€€€€€€€€É•ÑÕÉ¸(€€€€€€€É•Á½Í¥Ñ½Éä€ôÍ•±˜¹Ñà¹µ•Ñ…‘…Ñ„¹•Ð ‰É•Á½Í¥Ñ½Éäˆ¤½Èíô(€€€€€€€™½È­•ä¥¸€ ‰¥¹Ñ•É…Ñ¥½¹}Ñ•ÍÑ}…ÉØˆ°€‰¥¹Ñ•É…Ñ¥½¹}Ñ•ÍÑ}½µµ…¹‘Ìˆ¤è(€€€€€€€€€€€Ù…±Õ”€ôÍ•±˜¹Ñà¹µ•Ñ…‘…Ñ„¹•Ð¡­•ä¤(€€€€€€€€€€€¥˜Ù…±Õ”¥Ì9½¹”…¹¥Í¥¹ÍÑ…¹”¡É•Á½Í¥Ñ½Éä°‘¥Ð¤è(€€€€€€€€€€€€€€€Ù…±Õ”€ôÉ•Á½Í¥Ñ½Éä¹•Ð¡­•ä¤(€€€€€€€€€€€¥˜Ù…±Õ”¥Ì¹½Ð9½¹”è(€€€€€€€€€€€€€€€É½½Ð¹µ•Ñ…‘…Ñ…m­•åt€ôÙ…±Õ”((€€€‘•˜}Ý½É­ÍÁ…•}½µÁ½¹•¹ÑÌ¡Í•±˜¤€´ø‘¥ÑmÍÑÈ°¹åtè(€€€€€€€É•Á½Í¥Ñ½Éå}µ•Ñ„€ôÍ•±˜¹Ñà¹µ•Ñ…‘…Ñ„¹•Ð ‰É•Á½Í¥Ñ½Éäˆ¤½Èíô(€€€€€€€Í½ÕÉ”€ôÉ•Á½Í¥Ñ½Éå}µ•Ñ„¹•Ð ‰Í½ÕÉ•}É•Á½Í¥Ñ½Éå}Á…Ñ ˆ¤(€€€€€€€¥˜¹½ÐÍ½ÕÉ”è(€€€€€€€€€€€É•ÑÕÉ¸íô(€€€€€€€™É½´…ÁÀ¹µÕ±Ñ¥…•¹Ð¹¥Ñ}Ý½É­ÍÁ…”¥µÁ½ÉÐ€ (€€€€€€€€€€€•¹Ñ]½É­ÑÉ••5…¹…•È°(€€€€€€€€€€€¥Ñ%¹Ñ•É…Ñ¥½¹5…¹…•È°(€€€€€€€€€€€I•Á½Í¥Ñ½Éå]½É­ÍÁ…•5…¹…•È°(€€€€€€€€¤(€€€€€€€™É½´…ÁÀ¹µÕ±Ñ¥…•¹Ð¹Á•Éµ¥ÍÍ¥½¸¥µÁ½ÉÐ•Ñ}Á•Éµ¥ÍÍ¥½¹}‰É½­•È((€€€€€€€É•Á½Í¥Ñ½Éä€ôI•Á½Í¥Ñ½Éå]½É­ÍÁ…•5…¹…•È (€€€€€€€€€€€Í½ÕÉ”°(€€€€€€€€€€€Í•±˜¹Ñà¹Ý½É­ÍÁ…•}É½½Ð°(€€€€€€€€€€€‰…Í•}‰É…¹ õÉ•Á½Í¥Ñ½Éå}µ•Ñ„¹•Ð ‰‰…Í•}‰É…¹ ˆ¤°(€€€€€€€€€€€‰…Í•}½µµ¥Ñ}Í¡„õÉ•Á½Í¥Ñ½Éå}µ•Ñ„¹•Ð ‰‰…Í•}½µµ¥Ñ}Í¡„ˆ¤°(€€€€€€€€¤(€€€€€€€‰É½­•È€ô•Ñ}Á•Éµ¥ÍÍ¥½¹}‰É½­•È ¤(€€€€€€€É•ÑÕÉ¸ì(€€€€€€€€€€€€‰Ý½É­ÑÉ••}µ…¹…•Èˆè•¹Ñ]½É­ÑÉ••5…¹…•È (€€€€€€€€€€€€€€€É•Á½Í¥Ñ½Éä°(€€€€€€€€€€€€€€€Á•Éµ¥ÍÍ¥½¹}‰É½­•Èõ‰É½­•È°(€€€€€€€€€€€€€€€•¹Ù¥É½¹µ•¹Ñ}™¥±•}…±±½Ý±¥ÍÐõÉ•Á½Í¥Ñ½Éå}µ•Ñ„¹•Ð (€€€€€€€€€€€€€€€€€€€€‰•¹Ù¥É½¹µ•¹Ñ}™¥±•}…±±½Ý±¥ÍÐˆ(€€€€€€€€€€€€€€€€¤½Èmt°(€€€€€€€€€€€€¤°(€€€€€€€€€€€€‰¥¹Ñ•É…Ñ¥½¹}µ…¹…•Èˆè¥Ñ%¹Ñ•É…Ñ¥½¹5…¹…•È (€€€€€€€€€€€€€€€É•Á½Í¥Ñ½Éä°Á•Éµ¥ÍÍ¥½¹}‰É½­•Èõ‰É½­•È(€€€€€€€€€€€€¤°(€€€€€€€€€€€€‰Á•Éµ¥ÍÍ¥½¹}‰É½­•Èˆè‰É½­•È°(€€€€€€€ô((€€€ÍÑ…Ñ¥µ•Ñ¡½(€€€‘•˜}Ñ½}É•ÍÕ±Ð¡ÍÑ…Ñ”è•¹ÑIÕ¹MÑ…Ñ”¤€´ø=É¡•ÍÑÉ…Ñ¥½¹I•ÍÕ±Ðè(€€€€€€€É…Á €ô9½¹”(€€€€€€€¥˜ÍÑ…Ñ”¹•Ð ‰Ñ…Í­}É…Á¡}©Í½¸ˆ¤è(€€€€€€€€€€€ÑÉäè(€€€€€€€€€€€€€€€É…Á €ôQ…Í­É…Á ¹µ½‘•±}Ù…±¥‘…Ñ•}©Í½¸¡ÍÑ…Ñ•l‰Ñ…Í­}É…Á¡}©Í½¸‰t¤(€€€€€€€€€€€•á•ÁÐá•ÁÑ¥½¸è(€€€€€€€€€€€€€€€É…Á €ô9½¹”(€€€€€€€¹½‘•Ì€ô±¥ÍÐ¡É…Á ¹¹½‘•Ì¹Ù…±Õ•Ì ¤¤¥˜É…Á •±Í”mt(€€€€€€€Ù•É¥™¥…Ñ¥½¸€ôÍÑ…Ñ”¹•Ð ‰Ù•É¥™¥…Ñ¥½¹}ÍÕµµ…Éäˆ°íô¤(€€€€€€€É•ÑÕÉ¸=É¡•ÍÑÉ…Ñ¥½¹I•ÍÕ±Ð (€€€€€€€€€€€ÍÑ…ÑÕÌô (€€€€€€€€€€€€€€€€‰½µÁ±•Ñ•ˆ¥˜ÍÑ…Ñ”¹•Ð ‰ÍÑ…ÑÕÌˆ¤€ôô€‰ÍÕ••‘•ˆ(€€€€€€€€€€€€€€€•±Í”€‰¥¹Ñ•ÉÉÕÁÑ•ˆ¥˜ÍÑ…Ñ”¹•Ð ‰ÍÑ…ÑÕÌˆ¤¥¸ì‰Á…ÕÍ•ˆ°€‰Ý…¥Ñ¥¹}¡Õµ…¸‰ô(€€€€€€€€€€€€€€€•±Í”ÍÑ…Ñ”¹•Ð ‰ÍÑ…ÑÕÌˆ°€‰™…¥±•ˆ¤(€€€€€€€€€€€€¤°(€€€€€€€€€€€µ½‘”õÍÑ…Ñ”¹•Ð ‰µ½‘”ˆ°€ˆˆ¤°(€€€€€€€€€€€Ñ…Í­}É…Á¡}Ù•ÉÍ¥½¸õÍÑ…Ñ”¹•Ð ‰Ñ…Í­}É…Á¡}Ù•ÉÍ¥½¸ˆ°€À¤°(€€€€€€€€€€€Ñ½Ñ…±}Ñ…Í­Ìõ±•¸¡¹½‘•Ì¤°(€€€€€€€€€€€ÍÕ••‘•‘}Ñ…Í­ÌõÍÕ´¡¸¹ÍÑ…ÑÕÌ€ôôQ…Í­9½‘•MÑ…ÑÕÌ¹MU™½È¸¥¸¹½‘•Ì¤°(€€€€€€€€€€€™…¥±•‘}Ñ…Í­ÌõÍÕ´¡¸¹ÍÑ…ÑÕÌ€ôôQ…Í­9½‘•MÑ…ÑÕÌ¹%1™½È¸¥¸¹½‘•Ì¤°(€€€€€€€€€€€Ù•É¥™¥…Ñ¥½¹}Ù•É‘¥ÐõÙ•É¥™¥…Ñ¥½¸¹•Ð ‰Ù•É‘¥Ðˆ°€ˆˆ¤°(€€€€€€€€€€€É½Õ¹‘ÌõÍÑ…Ñ”¹•Ð ‰‘¥ÍÁ…Ñ¡}É½Õ¹‘Ìˆ°€À¤°(€€€€€€€€€€€•ÉÉ½ÈõÍÑ…Ñ”¹•Ð ‰•ÉÉ½Èˆ¤°(€€€€€€€€€€€ÍÕµµ…ÉäõÍÑ…Ñ”¹•Ð ‰™¥¹…±}½ÕÑÁÕÐˆ¤½ÈÙ•É¥™¥…Ñ¥½¸¹•Ð ‰ÍÕµµ…Éäˆ°€ˆˆ¤°(€€€€€€€€¤(()‘•˜ÉÕ¹}½Ù•É¹• (€€€€¨°(€€€½…°èÍÑÈ°(€€€É•ÅÕ•ÍÑ•‘}µ½‘”èÍÑÈ°(€€€Á±…¹¹•Èè¹ä°(€€€•á•ÕÑ½Èè¹ä°(€€€Ù•É¥™¥•Èè¹ä°(€€€ÑàèQ•…µIÕ¹½¹Ñ•áÐ°(€€€…¹•±}•Ù•¹Ðè¹äð9½¹”€ô9½¹”°(€€€Ñ…Í­}É…Á èQ…Í­É…Á ð9½¹”€ô9½¹”°(€€€É•ÍÕµ”è‰½½°€ô…±Í”°(€€€É•ÍÕµ•}‘•¥Í¥½¸è‘¥ÑmÍÑÈ°¹åtð9½¹”€ô9½¹”°(€€€µ…á}É½Õ¹‘Ìè¥¹Ð€ô€ÌÀ°(€€€µ…á}É•Á…¥É}É½Õ¹‘Ìè¥¹Ðð9½¹”€ô9½¹”°(¤€´ø=É¡•ÍÑÉ…Ñ¥½¹I•ÍÕ±Ðè(€€€É•ÑÕÉ¸½Ù•É¹•‘IÕ¹É…Á  (€€€€€€€ÑàõÑà°(€€€€€€€Á±…¹¹•ÈõÁ±…¹¹•È°(€€€€€€€•á•ÕÑ½Èõ•á•ÕÑ½È°(€€€€€€€Ù•É¥™¥•ÈõÙ•É¥™¥•È°(€€€€€€€…¹•±}•Ù•¹Ðõ…¹•±}•Ù•¹Ð°(€€€€€€€Ñ…Í­}É…Á õÑ…Í­}É…Á °(€€€€€€€µ…á}É½Õ¹‘Ìõµ…á}É½Õ¹‘Ì°(€€€€€€€µ…á}É•Á…¥É}É½Õ¹‘Ìõµ…á}É•Á…¥É}É½Õ¹‘Ì°(€€€€¤¹¥¹Ù½­” (€€€€€€€½…°õ½…°°(€€€€€€€É•ÅÕ•ÍÑ•‘}µ½‘”õÉ•ÅÕ•ÍÑ•‘}µ½‘”°(€€€€€€€É•ÍÕµ”õÉ•ÍÕµ”°(€€€€€€€É•ÍÕµ•}‘•¥Í¥½¸õÉ•ÍÕµ•}‘•¥Í¥½¸°(€€€€¤

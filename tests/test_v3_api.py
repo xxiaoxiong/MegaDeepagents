@@ -80,6 +80,51 @@ def test_v1_run_contract_events_and_artifact_download(monkeypatch):
         )
         assert content.status_code == 200
         assert content.json()["content"] == "production evidence"
+        assert content.json()["complete"] is True
+
+        large_text = (
+            ("x" * (64 * 1024 - 1))
+            + "🙂"
+            + ("0123456789\n" * 50_000)
+            + "完整结尾"
+        )
+        large_artifact = store.create(
+            run_id=run_id,
+            task_id="api-large-test",
+            type=ArtifactType.DOCUMENT,
+            relative_path="artifacts/large-report.txt",
+            content=large_text,
+            produced_by="test-worker",
+        )
+        chunks: list[str] = []
+        offset = 0
+        while True:
+            page = client.get(
+                f"/api/v1/runs/{run_id}/artifacts/{large_artifact.id}/content",
+                params={"offset": offset, "limit": 64 * 1024},
+            )
+            assert page.status_code == 200
+            body = page.json()
+            assert body["offset"] == offset
+            chunks.append(body["content"])
+            if body["complete"]:
+                assert body["next_offset"] is None
+                break
+            assert body["next_offset"] > offset
+            offset = body["next_offset"]
+        assert "".join(chunks) == large_text
+
+        workspace_file = client.get(
+            f"/api/v1/runs/{run_id}/files/content",
+            params={"path": "artifacts/large-report.txt", "limit": 32},
+        )
+        assert workspace_file.status_code == 200
+        assert workspace_file.json()["content"].startswith("x" * 32)
+        assert workspace_file.json()["path"] == "artifacts/large-report.txt"
+        assert client.get(
+            f"/api/v1/runs/{run_id}/files/content",
+            params={"path": "../outside.txt"},
+        ).status_code == 403
 
         settings = client.get("/api/v1/settings").json()
         assert "llm_api_key" not in settings

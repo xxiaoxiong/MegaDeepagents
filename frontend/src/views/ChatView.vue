@@ -29,6 +29,7 @@ import { useChatThread } from "@/composables/useChatThread";
 import type {
   AgentRun,
   Artifact,
+  ChatMessage,
   CreateRunInput,
   RunExecution,
   RunMode,
@@ -98,6 +99,14 @@ let executionTimer: number | null = null;
 const drawerOpen = ref(false);
 const selectedArtifactId = ref<string | null>(null);
 const artifacts = ref<Artifact[]>([]);
+const artifactById = computed(
+  () => new Map(artifacts.value.map((artifact) => [artifact.artifact_id, artifact])),
+);
+
+function artifactForMessage(message: ChatMessage): Artifact | null {
+  if (!("type" in message) || message.type !== "artifact") return null;
+  return artifactById.value.get(message.artifactId) ?? null;
+}
 
 async function loadArtifacts(id = runIdRef.value) {
   if (!id) {
@@ -162,6 +171,35 @@ watch(() => thread.messages.value.length, () => {
   // 产出文件随事件增长：抽屉打开时同步刷新，关闭时不浪费请求
   if (drawerOpen.value) void loadArtifacts();
 });
+
+// Artifact cards show filenames rather than opaque IDs even while the drawer
+// is closed.  Fetch metadata as soon as replay/live events reveal an unknown
+// artifact; content is still loaded lazily only after the user opens it.
+watch(
+  () =>
+    thread.messages.value
+      .filter((message) => "type" in message && message.type === "artifact")
+      .map((message) =>
+        "type" in message && message.type === "artifact" ? message.artifactId : "",
+      )
+      .filter(Boolean)
+      .join("|"),
+  (ids) => {
+    if (!ids) return;
+    const hasMissing = ids.split("|").some((id) => !artifactById.value.has(id));
+    if (hasMissing) void loadArtifacts();
+  },
+  { immediate: true },
+);
+
+const activeAgentCount = computed(
+  () =>
+    execution.value?.agents.filter((agent) =>
+      ["claiming", "planning", "running", "working", "testing", "reviewing"].includes(
+        agent.status.toLowerCase(),
+      ),
+    ).length ?? 0,
+);
 
 function openAgent(agentId: string) {
   void router.push({
@@ -423,6 +461,7 @@ const examples = [
         <div class="chat-team-pulse-head">
           <span><GitFork :size="13" /> Agent 团队实时协作</span>
           <small>
+            <template v-if="activeAgentCount > 0">{{ activeAgentCount }} 个 Agent 并行中 · </template>
             {{ execution.summary.peak_concurrency }} 峰值并发 ·
             {{ execution.summary.tool_call_count }} 次工具调用
           </small>
@@ -472,6 +511,7 @@ const examples = [
             :key="msg.id"
             :message="msg"
             :run-id="runIdRef"
+            :artifact="artifactForMessage(msg)"
             @open-artifact="openArtifact"
           />
           <div v-if="!thread.messages.value.length && !thread.loadingHistory.value" class="chat-history-loading">
@@ -556,6 +596,7 @@ const examples = [
         :run-id="runIdRef"
         :artifacts="artifacts"
         :initial-artifact-id="selectedArtifactId"
+        compact
         @selected="(id) => (selectedArtifactId = id)"
       />
     </aside>

@@ -147,6 +147,45 @@ class TestParallelClaim:
 # ===== ParallelTeamScheduler 烟雾测试 =====
 
 class TestParallelScheduler:
+    def test_discovery_fills_multiple_slots_for_same_profile_agents(self):
+        """Independent coding tasks use separate Coder instances in one wave."""
+        from app.multiagent.parallel_scheduler import ParallelTeamScheduler
+
+        board = get_task_board()
+        reg = get_agent_registry()
+        for index in range(3):
+            board.create_task(
+                task_id=f"code_{index}",
+                run_id="r_same_profile_parallel",
+                title=f"Code {index}",
+                objective="independent module",
+                required_capabilities=["coding"],
+            )
+            reg.create_agent(
+                profile_id="coder",
+                name=f"Coder-{index + 1}",
+                role="worker",
+                team_id="team",
+                run_id="r_same_profile_parallel",
+                capabilities=["coding"],
+            )
+        scheduler = ParallelTeamScheduler(
+            run_id="r_same_profile_parallel",
+            max_rounds=10,
+            max_concurrency=3,
+        )
+        scheduler.board = board
+        scheduler.registry = reg
+
+        discovered = scheduler._discover_dispatchable({})
+
+        assert {task.task_id for task in discovered} == {
+            "code_0",
+            "code_1",
+            "code_2",
+        }
+        assert len(set(scheduler._dispatch_agent_hints.values())) == 3
+
     def test_discovery_matches_one_ready_task_per_idle_agent(self):
         """A dispatch wave must not enqueue more work than workers can reserve."""
         from app.multiagent.parallel_scheduler import ParallelTeamScheduler

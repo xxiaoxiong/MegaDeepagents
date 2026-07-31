@@ -1,15 +1,18 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from "vue";
 import {
+  Braces,
   Check,
   ChevronRight,
-  Clock,
+  FileText,
   LoaderCircle,
   Terminal,
   X,
 } from "@lucide/vue";
+import { api } from "@/lib/api";
 
 const props = defineProps<{
+  runId: string;
   toolName: string;
   args: Record<string, unknown>;
   status: "running" | "ok" | "error";
@@ -20,27 +23,17 @@ const props = defineProps<{
 }>();
 
 const statusIcon = computed(() => {
-  switch (props.status) {
-    case "running":
-      return LoaderCircle;
-    case "ok":
-      return Check;
-    case "error":
-      return X;
-  }
+  if (props.status === "running") return LoaderCircle;
+  if (props.status === "error") return X;
+  return Check;
 });
 
 const now = ref(Date.now());
 let elapsedTimer: number | null = null;
+let detailAbort: AbortController | null = null;
 
 function parseBackendTimestamp(value: string): number {
-  // Persisted run timestamps are UTC but older rows use ``datetime.utcnow``
-  // without a trailing timezone. Browsers otherwise interpret those rows as
-  // local time (for example, +8 hours in China) and wildly overstate a live
-  // tool's elapsed time.
-  const normalized = /(?:Z|[+-]\d{2}:\d{2})$/i.test(value)
-    ? value
-    : `${value}Z`;
+  const normalized = /(?:Z|[+-]\d{2}:\d{2})$/i.test(value) ? value : `${value}Z`;
   return new Date(normalized).getTime();
 }
 
@@ -65,19 +58,95 @@ const argEntries = computed(() =>
   })),
 );
 
-const argSummary = computed(() => {
-  const first = argEntries.value[0];
-  if (!first) return "";
-  const compact = first.value.replace(/\s+/g, " ").trim();
-  return `${first.key}=${compact}`.slice(0, 88);
+const normalizedToolName = computed(() => props.toolName.toLowerCase().replace(/[-.]/g, "_"));
+const isFileRead = computed(() =>
+  ["read_file", "readfile", "view_file", "open_file", "get_file_content"].some(
+    (name) => normalizedToolName.value.includes(name),
+  ),
+);
+const filePath = computed(() => {
+  if (!isFileRead.value) return "";
+  for (const key of ["path", "file_path", "filepath", "target_path", "target"]) {
+    const value = props.args?.[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+});
+const fileName = computed(() =>
+  filePath.value.split(/[\\/]/).filter(Boolean).at(-1) ?? filePath.value,
+);
+
+const toolTitle = computed(() => {
+  if (filePath.value) return `读取 ${fileName.value}`;
+  const name = normalizedToolName.value;
+  if (name.includes("create_file")) return "创建文件";
+  if (name.includes("edit_file") || name.includes("write_file")) return "修改文件";
+  if (name.includes("list_dir")) return "查看目录";
+  if (name.includes("execute") || name.includes("shell")) return "运行命令";
+  if (name.includes("search")) return "搜索";
+  return props.toolName;
 });
 
+const statusLabel = computed(() => {
+  if (props.status === "running") return "运行中";
+  if (props.status === "error") return "失败";
+  return "完成";
+});
 const isError = computed(() => props.status === "error");
 const isRunning = computed(() => props.status === "running");
-const statusLabel = computed(() => {
-  if (props.status === "running") return "工具执行中";
-  if (props.status === "error") return "执行失败";
-  return "已完成";
+
+const fullResult = ref("");
+const loadedFilePath = ref("");
+const detailLoading = ref(false);
+const detailError = ref("");
+const loadedBytes = ref(0);
+const totalBytes = ref(0);
+const displayedResult = computed(() => fullResult.value || props.resultPreview || "");
+const progressLabel = computed(() => {
+  if (!detailLoading.value || !totalBytes.value) return "";
+  return `${Math.min(100, Math.round((loadedBytes.value / totalBytes.value) * 100))}%`;
+});
+
+async function loadFullFile() {
+  if (!filePath.value || loadedFilePath.value === filePath.value) return;
+  detailAbort?.abort();
+  const controller = new AbortController();
+  detailAbort = controller;
+  detailLoading.value = true;
+  detailError.value = "";
+  fullResult.value = "";
+  loadedBytes.value = 0;
+  totalBytes.value = 0;
+  try {
+    const data = await api.workspaceFileTextContent(
+      props.runId,
+      filePath.value,
+      controller.signal,
+      (loaded, total) => {
+        loadedBytes.value = loaded;
+        totalBytes.value = total;
+      },
+    );
+    fullResult.value = data.content;
+    loadedFilePath.value = filePath.value;
+  } catch (error) {
+    if (controller.signal.aborted) return;
+    detailError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    if (!controller.signal.aborted && detailAbort === controller) detailLoading.value = false;
+  }
+}
+
+function onToggle(event: Event) {
+  const details = event.currentTarget as HTMLDetailsElement;
+  if (details.open && filePath.value) void loadFullFile();
+}
+
+watch(filePath, () => {
+  detailAbort?.abort();
+  fullResult.value = "";
+  loadedFilePath.value = "";
+  detailError.value = "";
 });
 
 watch(
@@ -98,49 +167,50 @@ watch(
 );
 
 onBeforeUnmount(() => {
+  detailAbort?.abort();
   if (elapsedTimer !== null) window.clearInterval(elapsedTimer);
 });
 </script>
 
 <template>
-  <details class="tool-call-card" :data-status="status">
-    <summary
-      class="tool-head"
-      title="点击查看工具参数和返回结果；计时仅包含工具本身，不包含模型思考"
-    >
+  <details class="tool-call-card" :data-status="status" @toggle="onToggle">
+    <summary class="tool-head" title="点击查看工具返回内容">
       <span class="tool-icon"><Terminal :size="13" /></span>
+      <span class="tool-action">{{ toolTitle }}</span>
       <span v-if="agentName" class="tool-agent-name">{{ agentName }}</span>
-      <code class="tool-name">{{ toolName }}</code>
-      <span v-if="argSummary" class="tool-arg-summary">{{ argSummary }}</span>
       <span class="tool-status">
-        <component
-          :is="statusIcon"
-          :size="12"
-          :class="{ spin: isRunning }"
-        />
-        {{ statusLabel }}
-        <span v-if="durationLabel">· {{ durationLabel }}</span>
+        <component :is="statusIcon" :size="12" :class="{ spin: isRunning }" />
+        {{ statusLabel }}<span v-if="durationLabel"> · {{ durationLabel }}</span>
       </span>
       <ChevronRight class="tool-chevron" :size="13" />
     </summary>
 
     <div class="tool-details">
-      <p class="tool-timing-note">
-        <Clock :size="12" />
-        此耗时从 Agent 真正进入工具边界开始，不包含模型生成和选择工具的时间。
-      </p>
-      <div v-if="argEntries.length" class="tool-args">
-        <div v-for="entry in argEntries" :key="entry.key" class="tool-arg">
-          <span class="tool-arg-key">{{ entry.key }}</span>
-          <pre class="tool-arg-value">{{ entry.value }}</pre>
+      <section v-if="detailLoading || displayedResult || detailError" class="tool-result" :class="{ error: isError }">
+        <header>
+          <FileText v-if="filePath" :size="13" />
+          <Terminal v-else :size="13" />
+          <strong>{{ filePath || "返回结果" }}</strong>
+          <span v-if="detailLoading">正在读取完整内容 {{ progressLabel }}</span>
+        </header>
+        <pre v-if="displayedResult" class="tool-result-text">{{ displayedResult }}</pre>
+        <p v-if="detailError" class="tool-detail-error">{{ detailError }}</p>
+      </section>
+      <p v-else-if="isRunning" class="tool-pending-detail">正在等待工具返回结果。</p>
+
+      <details v-if="argEntries.length" class="tool-args-disclosure">
+        <summary>
+          <Braces :size="12" />
+          参数
+          <code>{{ toolName }}</code>
+        </summary>
+        <div class="tool-args">
+          <div v-for="entry in argEntries" :key="entry.key" class="tool-arg">
+            <span class="tool-arg-key">{{ entry.key }}</span>
+            <pre class="tool-arg-value">{{ entry.value }}</pre>
+          </div>
         </div>
-      </div>
-      <div v-if="resultPreview" class="tool-result" :class="{ error: isError }">
-        <pre class="tool-result-text">{{ resultPreview }}</pre>
-      </div>
-      <p v-else-if="isRunning" class="tool-pending-detail">
-        正在等待工具返回结果。
-      </p>
+      </details>
     </div>
   </details>
 </template>

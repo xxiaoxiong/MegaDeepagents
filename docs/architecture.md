@@ -54,6 +54,8 @@ Run goal 是唯一主线，Root Graph 负责在它的生命周期内派生和回
 
 1. Supervisor 根据目标与复杂度创建带依赖、契约和优先级的 TaskGraph；
 2. TaskBoard 把可执行节点暴露给并行调度器，原子认领避免重复工作；
+   TeamBuilder 按同一依赖层的 profile 需求创建多个 Worker 实例，Scheduler 再以 Run 级
+   semaphore 和一 Agent 一任务匹配填满并发槽；`allow_parallel=false` 是完整独占屏障；
 3. Agent 可以通过统一事务服务派生新 Task，新节点必须关联同一 `run_id` 和父任务；
 4. Artifact 和验证结果回到 collect/verify，而不是在 Worker 内宣布全局成功；
 5. repair 生成定向修复子问题，replan 回到 Supervisor 更新版本化 TaskGraph；

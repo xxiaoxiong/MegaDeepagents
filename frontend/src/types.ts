@@ -263,6 +263,7 @@ export interface ArtifactChatMessage {
   id: string;
   type: "artifact";
   artifactId: string;
+  path?: string | null;
   taskId?: string | null;
   producedBy?: string | null;
   createdAt: string;

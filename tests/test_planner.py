@@ -232,12 +232,16 @@ def test_plan_with_llm_all_retries_exhausted():
 # ===== build_fallback_plan =====
 
 
-def test_fallback_plan_has_two_steps():
+def test_fallback_plan_has_assignable_role_steps():
     graph = build_fallback_plan("build a web service")
-    assert len(graph.nodes) == 2
+    assert len(graph.nodes) == 3
     assert "plan" in graph.nodes
     assert "execute" in graph.nodes
+    assert "verify" in graph.nodes
     assert graph.nodes["execute"].dependencies == ["plan"]
+    assert graph.nodes["verify"].dependencies == ["execute"]
+    assert graph.nodes["execute"].required_capabilities == ["coding"]
+    assert graph.nodes["verify"].required_capabilities == ["testing"]
     assert not graph.has_cycle()
 
 
@@ -247,11 +251,34 @@ def test_fallback_plan_can_be_scheduled():
     ready = graph.ready_tasks()
     assert any(n.id == "plan" for n in ready)
     assert not any(n.id == "execute" for n in ready)
+    assert not any(n.id == "verify" for n in ready)
 
 
 def test_fallback_root_task_id_set():
     graph = build_fallback_plan("test")
     assert graph.root_task_id == "plan"
+
+
+def test_fallback_plan_builds_a_real_team(tmp_path):
+    from app.multiagent.agent_registry import AgentRegistry
+    from app.multiagent.default_teams import SOFTWARE_DEV_TEAM
+    from app.multiagent.team_builder import TeamBuilder
+    from app.multiagent.team_run_context import TeamRunContext
+
+    graph = build_fallback_plan("implement and verify a service")
+    ctx = TeamRunContext.create(
+        goal="implement and verify a service",
+        team_name="software_dev_team",
+        workspace_root=str(tmp_path / "workspace"),
+    )
+
+    agents = TeamBuilder(AgentRegistry()).build_team_sync(
+        ctx,
+        SOFTWARE_DEV_TEAM,
+        graph,
+    )
+
+    assert {agent.profile_id for agent in agents} == {"planner", "coder", "tester"}
 
 
 # ===== 启发式能力纠错：planning→coding/testing =====

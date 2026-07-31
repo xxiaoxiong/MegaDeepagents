@@ -469,9 +469,11 @@ def plan_with_llm(
 # ===== 降级策略 =====
 
 def build_fallback_plan(goal: str) -> TaskGraph:
-    """当 LLM Planner 多次失败时，生成一个基础的两步计划。
+    """当 LLM Planner 多次失败时，生成可实际分配的安全计划。
 
-    降级策略：plan → execute
+    每个任务只声明一个主角色能力。旧降级计划把 ``coding`` 与
+    ``testing`` 同时放进 execute，团队中不存在这种复合 profile，导致
+    Planner 已经降级后仍以 ``no_matching_worker`` 终止整次 Run。
     """
     graph = TaskGraph(root_task_id="plan")
     plan_node = TaskNode(
@@ -491,13 +493,27 @@ def build_fallback_plan(goal: str) -> TaskGraph:
         objective=f"实现目标: {goal[:100]}",
         status=TaskNodeStatus.PENDING,
         dependencies=["plan"],
-        required_capabilities=["coding", "testing"],
+        required_capabilities=["coding"],
         output_contract=OutputContract(
             artifact_type="code",
             description="实现产物",
-            acceptance_criteria=["功能实现并可通过测试"],
+            acceptance_criteria=["目标已实现并提供可验证产物"],
+        ),
+    )
+    verify_node = TaskNode(
+        id="verify",
+        title="验证",
+        objective=f"验证目标实现并报告问题: {goal[:100]}",
+        status=TaskNodeStatus.PENDING,
+        dependencies=["execute"],
+        required_capabilities=["testing"],
+        output_contract=OutputContract(
+            artifact_type="test",
+            description="验证证据",
+            acceptance_criteria=["执行与目标匹配的验证并记录结果"],
         ),
     )
     graph.add_node(plan_node)
     graph.add_node(execute_node)
+    graph.add_node(verify_node)
     return graph

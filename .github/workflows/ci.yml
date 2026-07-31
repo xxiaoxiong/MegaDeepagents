@@ -83,6 +83,46 @@ jobs:
       - name: Build (AGENTS.md gate)
         run: npm run build
 
+  visual-e2e:
+    name: Visual E2E (Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install application dependencies
+        run: npm ci
+
+      - name: Install pinned browser test runner
+        run: npm install --no-save --ignore-scripts @playwright/test@1.54.2
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run desktop and mobile end-to-end tests
+        run: npx playwright test
+
+      - name: Upload visual regression evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-e2e-evidence
+          path: |
+            frontend/test-results
+            frontend/playwright-report
+          if-no-files-found: ignore
+          retention-days: 14
+
   website:
     name: Website (build)
     runs-on: ubuntu-latest

@@ -49,4 +49,47 @@ describe("v1 API client", () => {
       message: "Run not found",
     });
   });
+
+  it("follows artifact cursors until the complete text is available", async () => {
+    const progress = vi.fn();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = String(input);
+      const second = url.includes("offset=4");
+      return new Response(
+        JSON.stringify(
+          second
+            ? {
+                artifact_id: "art_1",
+                path: "report.md",
+                content: "完整",
+                encoding: "utf-8",
+                truncated: false,
+                offset: 4,
+                next_offset: null,
+                total_bytes: 10,
+                complete: true,
+              }
+            : {
+                artifact_id: "art_1",
+                path: "report.md",
+                content: "head",
+                encoding: "utf-8",
+                truncated: true,
+                offset: 0,
+                next_offset: 4,
+                total_bytes: 10,
+                complete: false,
+              },
+        ),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    });
+
+    const content = await api.artifactTextContent("run_1", "art_1", undefined, progress);
+
+    expect(content).toEqual({ path: "report.md", content: "head完整", totalBytes: 10 });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(String(fetchMock.mock.calls[1][0])).toContain("offset=4");
+    expect(progress).toHaveBeenLastCalledWith(10, 10);
+  });
 });
