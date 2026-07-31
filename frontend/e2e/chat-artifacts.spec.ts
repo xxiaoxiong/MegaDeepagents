@@ -253,8 +253,15 @@ test("mobile artifact drawer owns the viewport without horizontal clipping", asy
   await expect(page.locator(".artifact-preview-content")).toContainText("FULL_ARTIFACT_TAIL");
   const viewportWidth = page.viewportSize()?.width ?? 0;
   const drawer = await page.locator(".chat-drawer").boundingBox();
-  expect(drawer?.width).toBeLessThanOrEqual(viewportWidth);
-  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
-  expect(overflow).toBeLessThanOrEqual(1);
-  await page.screenshot({ path: "test-results/visual/chat-artifact-mobile.png", fullPage: true });
+  expect(drawer?.x ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(1);
+  expect(Math.abs((drawer?.width ?? 0) - viewportWidth)).toBeLessThanOrEqual(1);
+  const viewport = await page.evaluate(() => ({
+    innerWidth: window.innerWidth,
+    visualWidth: window.visualViewport?.width ?? window.innerWidth,
+    scrollWidth: document.documentElement.scrollWidth,
+  }));
+  expect(Math.abs(viewport.innerWidth - viewportWidth)).toBeLessThanOrEqual(1);
+  expect(Math.abs(viewport.visualWidth - viewportWidth)).toBeLessThanOrEqual(1);
+  expect(viewport.scrollWidth).toBeLessThanOrEqual(viewportWidth + 1);
+  await page.screenshot({ path: "test-results/visual/chat-artifact-mobile.png" });
 });
