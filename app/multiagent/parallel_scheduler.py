@@ -334,4 +334,1642 @@ class ParallelTeamScheduler:
                                       error="cancelled")
 
             run_record = get_agent_run_history().get_team_run(self.run_id)
-        Û]4îÚ$z{-®éÜj×ç'Våö–BÒ6VÆbç'Våö–C ¢&—6R'VçF–ÖTW'&÷"†b&'F–f7E÷w&öæu÷'Vã§¶'F–f7Eö–GÒ"¢7FGW2ÒvWFGG"†'F–f7Bç7FGW2Â'fÇVR"Â'F–f7Bç7FGW2¢–b&WV—&U÷fW&–f–VBæB7FGW2Ò'fW&–f–VB# ¢&—6R'VçF–ÖTW'&÷"†b&'F–f7Eöæ÷E÷fW&–f–VC§¶'F–f7Eö–GÒ"¢–bæ÷B7F÷&RçfW&–g•ö–çFVw&—G’†'F–f7Eö–B“ ¢&—6R'VçF–ÖTW'&÷"†b&'F–f7Eö–çFVw&—G•öf–ÆVC§¶'F–f7Eö–GÒ"¢6VVâæFB†'F–f7Eö–B¢–G2æVæB†'F–f7Eö–B¢&Vg2æVæB‡°¢&'F–f7Eö–B#¢'F–f7Bæ–BÀ¢'F6µö–B#¢'F–f7BçF6µö–BÀ¢'&öGV6–æuövVçEö–B#¢'F–f7Bç&öGV6VEö'’À¢'G—R#¢'F–f7BçG—RçfÇVRÀ¢'F‚#¢'F–f7BçF‚À¢&6öçFVçEö†6‚#¢'F–f7Bæ6öçFVçEö†6‚À¢'fW'6–öâ#¢'F–f7BçfW'6–öâÀ¢&6öÖÖ—E÷6†#¢'F–f7Bæ6öÖÖ—E÷6†÷"'F–f7BæÖWFFFævWB‚&6öÖÖ—E÷6†"’À¢'fW&–f–6F–öå÷7FFR#¢7FGW2À¢'W'÷6R#¢W'÷6RÀ¢&7&VFVEöB#¢'F–f7Bæ7&VFVEöBæ—6öf÷&ÖB‚’À¢'7VÖÖ'’#¢'F–f7BæÖWFFFævWB‚'7VÖÖ'’"Â""’À¢Ò ¢f÷"FWVæFVæ7•ö–B–âF6²æFWVæFVæ6–W3 ¢FWVæFVæ7’Ò6VÆbæ&ö&BævWB†FWVæFVæ7•ö–BÂ'Våö–C×6VÆbç'Våö–B¢–bFWVæFVæ7’—2æöæR÷"FWVæFVæ7’ç7FGW2Ò&ö&EF6µ7FGW2å5T44TTDTC ¢&—6R'VçF–ÖTW'&÷"†b&FWVæFVæ7•öæ÷E÷fW&–f–VC§¶FWVæFVæ7•ö–GÒ"¢f÷"'F–f7Eö–B–âFWVæFVæ7’ç&öGV6VEö'F–f7Eö–G3 ¢VæEö'F–f7B€¢'F–f7Eö–BÀ¢W'÷6SÒ&FWVæFVæ7’"À¢&WV—&U÷fW&–f–VCÕG'VRÀ¢¢f÷"'F–f7Eö–B–âF6²æÖWFFFævWB‚'6÷W&6Uö'F–f7Eö–G2"ÂµÒ“ ¢VæEö'F–f7B€¢7G"†'F–f7Eö–B’À¢W'÷6SÒ'&W—%÷6÷W&6R"À¢&WV—&U÷fW&–f–VCÔfÇ6RÀ¢¢&WGW&â–G2Â&Vg0 ¢2ÓÓÓÓÒ[z^X[rÓÓÓÓĞ ¢FVböWfVçB€¢6VÆbÀ¢WfVçE÷G—S¢7G"À¢¢À¢–ÆöC¢F–7E·7G"Âç•ÒÂæöæRÒæöæRÀ¢vVçEö–C¢7G"ÂæöæRÒæöæRÀ¢F6µö–C¢7G"ÂæöæRÒæöæRÀ¢’ÓâæöæS ¢g&öÒæ–æg&7G'V7GW&RæFF&6Rç'Vå÷7F÷&R–×÷'B€¢vWEövVçE÷'Våö†—7F÷'’À¢Ö¶U÷'VåöWfVçEö–BÀ¢ ¢vWEövVçE÷'Våö†—7F÷'’‚’ç&V6÷&EöWfVçB€¢WfVçEö–CÖÖ¶U÷'VåöWfVçEö–B‚’À¢'Våö–C×6VÆbç'Våö–BÀ¢WfVçE÷G—SÖWfVçE÷G—RÀ¢vVçEö–CÖvVçEö–BÀ¢F6µö–C×F6µö–BÀ¢F–ÖW7F×ÖFFWF–ÖRææ÷r…UD2’À¢–ÆöC×–ÆöB÷"·ÒÀ¢ ¢FVböf–æÆ—¦R€¢6VÆbÂ&÷VæG3¢–çBÂ7FGW3¢7G"ÂW'&÷#¢7G"ÂæöæRÒæöæRÀ¢’Óâ&ÆÆVÅ'Vå&W7VÇC ¢7VÖÖ&—¦RÒ6VÆbæ&ö&Bç7VÖÖ'’‡6VÆbç'Våö–B¢&W7VÇBÒ&ÆÆVÅ'Vå&W7VÇB€¢7FGW3×7FGW2À¢&÷VæG3×&÷VæG2À¢F÷FÅ÷F6·3×7VÖÖ&—¦RævWB‚'F÷FÂ"Â’À¢266†VGVÆW"6ö×ÆWF–öâ6÷VçG2&öGV6VBF6·3²f–æÂfW&–f–V@¢26ö×ÆWF–öâ&VÖ–ç2f—6–&ÆR6W&FVÇ’–â7VÖÖ'–à¢7V66VVFVC×7VÖÖ&—¦RævWB„&ö&EF6µ7FGW2å5T44TTDTBçfÇVRÂ’À¢f–ÆVC×7VÖÖ&—¦RævWB„&ö&EF6µ7FGW2äd”ÄTBçfÇVRÂ’À¢W'&÷#ÖW'&÷"À¢7VÖÖ'“×7VÖÖ&—¦RÀ¢¢6VÆbåöWfVçB‚%66†VGVÆW%7F÷VB"Â–ÆöC×&W7VÇBçFõöF–7B‚’¢&WGW&â&W7VÇ@ ¢FVböf–æÆ—¦U÷fW&–f–VE÷'Vâ‡6VÆbÂ&÷VæG3¢–çB’Óâ&ÆÆVÅ'Vå&W7VÇC ¢""$Ç’'VâÖÆWfVÂvFW2gFW"WfW'’F6²—2fW&–f–W"Ö÷væVB5T44TTDTBâ"" ¢VæF–æu÷W&Ö—76–öç2Ò6VÆbçW&Ö—76–öåö'&ö¶W"æÆ—7E÷VæF–ær‡6VÆbç'Våö–B¢–bVæF–æu÷W&Ö—76–öç3 ¢&WGW&â6VÆbåöf–æÆ—¦R‡&÷VæG2Â66†VGVÆU7FGW2åt•D”äuô…TÔâçfÇVRÀ¢'VæF–æuö†–v…÷&—6µ÷W&Ö—76–öç2"¢–bç’‡F6²æÖWFFFævWB‚&ÖW&vUö6öæfÆ–7G2"¢f÷"F6²–â6VÆbæ&ö&BæÆ—7Eö'•÷'Vâ‡6VÆbç'Våö–B’“ ¢&WGW&â6VÆbåöf–æÆ—¦R‡&÷VæG2Â66†VGVÆU7FGW2äd”ÄTBçfÇVRÀ¢'Vç&W6öÇfVEöÖW&vUö6öæfÆ–7G2"¢–b6VÆbæ–çFVw&F–öåöÖævW"—2æ÷BæöæS ¢&ö÷BÒ6VÆbçF6µöw&‚ææöFW2ævWB‡6VÆbçF6µöw&‚ç&ö÷E÷F6µö–B’–b6VÆbçF6µöw&‚VÇ6RæöæP¢ÆâÒ6VÆbåö–çFVw&F–öå÷fW&–f–6F–öå÷Æâ‡&ö÷B¢f÷"6†V6²–âÆâæ6†V6·3 ¢–ÆöBÒ6†V6²æö'6W'f&ÆU÷–ÆöB‚¢6VÆbåöWfVçB‚$–çFVw&F–öåfW&–f–6F–öå7F'FVB"Â–ÆöC×–ÆöB¢G'“ ¢&W7VÇBÒ6VÆbæ–çFVw&F–öåöÖævW"çfW&–g•ö6†V6²†6†V6²¢W†6WBW†6WF–öâ2W†3 ¢6VÆbåöWfVçB‚$–çFVw&F–öåfW&–f–6F–öåVæf–Æ&ÆR"Â–ÆöC×°¢¢§–ÆöBÀ¢&W'&÷"#¢7G"†W†2’À¢Ò¢&WGW&â6VÆbåöf–æÆ—¦R€¢&÷VæG2À¢66†VGVÆU7FGW2åt•D”äuô…TÔâçfÇVRÀ¢&–çFVw&F–öå÷fW&–f–6F–öå÷Væf–Æ&ÆR"À¢¢6VÆbåöWfVçB‚$–çFVw&F–öåfW&–f–6F–öä6ö×ÆWFVB"Â–ÆöC×°¢¢§–ÆöBÀ¢'&WGW&æ6öFR#¢&W7VÇBç&WGW&æ6öFRÀ¢&6æ6VÆÆVB#¢&W7VÇBæ6æ6VÆÆVBÀ¢'F–ÖVEö÷WB#¢&W7VÇBçF–ÖVEö÷WBÀ¢&GW&F–öå÷6V6öæG2#¢&W7VÇBæGW&F–öå÷6V6öæG2À¢'7FF÷WE÷&Wf–Wr#¢&W7VÇBç7FF÷WE²Ó%ó¥ÒÀ¢'7FFW'%÷&Wf–Wr#¢&W7VÇBç7FFW'%²Ó%ó¥ÒÀ¢Ò¢–b&W7VÇBç&WGW&æ6öFRÒ÷"&W7VÇBæ6æ6VÆÆVB÷"&W7VÇBçF–ÖVEö÷WC ¢&WGW&â6VÆbåöf–æÆ—¦R€¢&÷VæG2À¢66†VGVÆU7FGW2äd”ÄTBçfÇVRÀ¢b&–çFVw&F–öå÷fW&–f–6F–öåöf–ÆVC§¶6†V6²æÆ&VÇÒ"À¢¢–bÆâæÖ—76–æu÷&WV—&VÖVçG3 ¢6VÆbåöWfVçB‚$–çFVw&F–öåfW&–f–6F–öåVæf–Æ&ÆR"Â–ÆöC×°¢&Ö—76–æu÷&WV—&VÖVçG2#¢Æ—7B‡ÆâæÖ—76–æu÷&WV—&VÖVçG2’À¢'6÷W&6R#¢Æâç6÷W&6RÀ¢Ò¢&WGW&â6VÆbåöf–æÆ—¦R€¢&÷VæG2À¢66†VGVÆU7FGW2åt•D”äuô…TÔâçfÇVRÀ¢&–çFVw&F–öå÷fW&–f–6F–öå÷&WV—&VÖVçG5öÖ—76–ær"À¢¢&WGW&â6VÆbåöf–æÆ—¦R‡&÷VæG2Â66†VGVÆU7FGW2ä4ôÕÄUDTBçfÇVR ¢FVbö–çFVw&F–öå÷fW&–f–6F–öå÷Æâ‡6VÆbÂ&ö÷C¢ç’’Óâç“ ¢g&öÒæ×VÇF–vVçBæv—E÷v÷&·76R–×÷'B€¢–çFVw&F–öåfW&–f–6F–öä6†V6²À¢–çFVw&F–öåfW&–f–6F–öåÆâÀ¢ ¢ÖWFFFÒ&ö÷BæÖWFFF–b&ö÷B—2æ÷BæöæRVÇ6R·Ğ¢6öæf–wW&VBÒÖWFFFævWB‚&–çFVw&F–öå÷FW7Eö6öÖÖæG2"¢–b6öæf–wW&VB—2æöæRæBÖWFFFævWB‚&–çFVw&F–öå÷FW7Eö&wb"“ ¢6öæf–wW&VBÒ¶ÖWFFF²&–çFVw&F–öå÷FW7Eö&wb%ÕĞ¢–b6öæf–wW&VB—2æöæS ¢&WGW&â6VÆbæ–çFVw&F–öåöÖævW"æF—66÷fW%÷fW&–f–6F–öå÷Æâ‚¢–bæ÷B—6–ç7Fæ6R†6öæf–wW&VBÂÆ—7B“ ¢&WGW&â–çFVw&F–öåfW&–f–6F–öåÆâ€¢Ö—76–æu÷&WV—&VÖVçG3Ò‚&–çfÆ–Eö–çFVw&F–öå÷FW7Eö6öÖÖæG2"Â’À¢6÷W&6SÒ&6öæf–wW&VB"À¢¢6†V6·3¢Æ—7E´–çFVw&F–öåfW&–f–6F–öä6†V6µÒÒµĞ¢Ö—76–æs¢Æ—7E·7G%ÒÒµĞ¢f÷"–æFW‚Â—FVÒ–âVçVÖW&FR†6öæf–wW&VB“ ¢–b—6–ç7Fæ6R†—FVÒÂÆ—7B“ ¢&wbÒ—FVĞ¢Æ&VÂÒb$6öæf–wW&VB6†V6²¶–æFW‚²Ò ¢7vBÒ"â ¢F–ÖV÷WBÒ3ã ¢VÆ–b—6–ç7Fæ6R†—FVÒÂF–7B“ ¢&wbÒ—FVÒævWB‚&&wb"¢Æ&VÂÒ7G"†—FVÒævWB‚&Æ&VÂ"’÷"b$6öæf–wW&VB6†V6²¶–æFW‚²Ò"¢7vBÒ7G"†—FVÒævWB‚&7vB"’÷""â"¢G'“ ¢F–ÖV÷WBÒfÆöB†—FVÒævWB‚'F–ÖV÷WE÷6V6öæG2"’÷"3ã¢W†6WB…G—TW'&÷"ÂfÇVTW'&÷"“ ¢Ö—76–æræVæB€¢b&6öæf–wW&VEö6†V6µ÷¶–æFW‚²Ó¦–çfÆ–E÷F–ÖV÷WB ¢¢6öçF–çVP¢VÇ6S ¢Ö—76–æræVæB†b&6öæf–wW&VEö6†V6µ÷¶–æFW‚²Ó¦–çfÆ–E÷6†R"¢6öçF–çVP¢&VÆF—fUö7vBÒF‚†7vBç&WÆ6R‚%ÅÂ"Â"ò"’¢–b€¢ÆVâ†7vB’âS ¢÷"&VÆF—fUö7vBæ—5ö'6öÇWFR‚¢÷""ââ"–â&VÆF—fUö7vBç'G0¢÷"€¢&VÆF—fUö7vBç'G0¢æB#¢"–â&VÆF—fUö7vBç'G5³Ğ¢¢“ ¢Ö—76–æræVæB†b&6öæf–wW&VEö6†V6µ÷¶–æFW‚²Ó§Vç6fUö7vB"¢6öçF–çVP¢–bæ÷BÖF‚æ—6f–æ—FR‡F–ÖV÷WB“ ¢Ö—76–æræVæB†b&6öæf–wW&VEö6†V6µ÷¶–æFW‚²Ó¦–çfÆ–E÷F–ÖV÷WB"¢6öçF–çVP¢–b€¢æ÷B—6–ç7Fæ6R†&wbÂÆ—7B¢÷"æ÷B&w`¢÷"æ÷BÆÂ†—6–ç7Fæ6R‡'BÂ7G"’æB'Bf÷"'B–â&wb¢“ ¢Ö—76–æræVæB†b&6öæf–wW&VEö6†V6µ÷¶–æFW‚²Ó¦–çfÆ–Eö&wb"¢6öçF–çVP¢–bæ÷B6VÆbå÷6fUö–çFVw&F–öåö&wb†&wb“ ¢Ö—76–æræVæB†b&6öæf–wW&VEö6†V6µ÷¶–æFW‚²Ó§Vç6fUö&wb"¢6öçF–çVP¢FWVæFVæ7•÷6÷W&6RÒæöæP¢W†V7WF&ÆRÒ6VÆbåö–çFVw&F–öåöW†V7WF&ÆR†&we³Ò¢FWVæFVæ7•÷&W6öÇfW"ÒvWFGG"€¢6VÆbæ–çFVw&F–öåöÖævW"À¢&æöFUöFWVæFVæ7•÷6÷W&6R"À¢æöæRÀ¢¢–b€¢W†V7WF&ÆR–â²&çÒ"Â'çÒ"Â'–&â'Ğ¢æB6ÆÆ&ÆR†FWVæFVæ7•÷&W6öÇfW"¢“ ¢FWVæFVæ7•÷6÷W&6RÒFWVæFVæ7•÷&W6öÇfW"€¢&VÆF—fUö7vBæ5÷÷6—‚‚¢¢–bFWVæFVæ7•÷6÷W&6R—2æöæS ¢Ö—76–æræVæB€¢b&6öæf–wW&VEö6†V6µ÷¶–æFW‚²Ó¢ ¢&æöFUöFWVæFVæ6–W5öÖ—76–ær ¢¢6öçF–çVP¢6†V6·2æVæB„–çFVw&F–öåfW&–f–6F–öä6†V6²€¢Æ&VÃÖÆ&VÂÀ¢&wc×GWÆR†&wb’À¢7vE÷&VÆF—fS×&VÆF—fUö7vBæ5÷÷6—‚‚’À¢F–ÖV÷WE÷6V6öæG3ÖÖ‚ƒãÂÖ–â‡F–ÖV÷WBÂ5ócã’’À¢FWVæFVæ7•÷6÷W&6SÒ€¢7G"†FWVæFVæ7•÷6÷W&6R¢–bFWVæFVæ7•÷6÷W&6R—2æ÷BæöæP¢VÇ6RæöæP¢’À¢’¢–bæ÷B6†V6·2æBæ÷BÖ—76–æs ¢Ö—76–æræVæB‚&6öæf–wW&VEö–çFVw&F–öåö6†V6·5öV×G’"¢&WGW&â–çFVw&F–öåfW&–f–6F–öåÆâ€¢6†V6·3×GWÆR†6†V6·2’À¢Ö—76–æu÷&WV—&VÖVçG3×GWÆR†Ö—76–ær’À¢6÷W&6SÒ&6öæf–wW&VB"À¢ ¢7FF–6ÖWF†ö@¢FVbö–çFVw&F–öåöW†V7WF&ÆR‡fÇVS¢7G"’Óâ7G# ¢W†V7WF&ÆRÒfÇVRç&WÆ6R‚%ÅÂ"Â"ò"’ç'7Æ—B‚"ò"Â•²ÓÒæÆ÷vW"‚¢f÷"7Vff—‚–â‚"æW†R"Â"æ6ÖB"Â"æ&B"“ ¢W†V7WF&ÆRÒW†V7WF&ÆRç&VÖ÷fW7Vff—‚‡7Vff—‚¢&WGW&âW†V7WF&ÆP ¢6Æ76ÖWF†ö@¢FVb÷6fUö–çFVw&F–öåö&wb†6Ç2Â&wc¢Æ—7E·7G%Ò’Óâ&ööÃ ¢W†V7WF&ÆRÒ6Ç2åö–çFVw&F–öåöW†V7WF&ÆR†&we³Ò¢&w2Ò·'BæÆ÷vW"‚’f÷"'B–â&we³¥ÕĞ¢–bW†V7WF&ÆR–â²'—FW7B'Ó ¢&WGW&âG'VP¢–bW†V7WF&ÆR–â²'—F†öâ"Â'—F†öã2'Ó ¢&WGW&âÆVâ†&w2’ãÒ"æB&w5³ÒÓÒ"ÖÒ"æB&w5³Ò–â°¢'—FW7B"À¢'Væ—GFW7B"À¢&6ö×–ÆVÆÂ"À¢Ğ¢–bW†V7WF&ÆR–â²&çÒ"Â'çÒ"Â'–&â'Ó ¢67&—G2Ò²'FW7B"Â&'V–ÆB"Â&Æ–çB"Â'G—V6†V6²"Â&6†V6²'Ğ¢&WGW&â&ööÂ†&w2’æB€¢&w5³Ò–â67&—G0¢÷"ÆVâ†&w2’ãÒ"æB&w5³ÒÓÒ''Vâ"æB&w5³Ò–â67&—G0¢¢–bW†V7WF&ÆRÓÒ&6&vò# ¢&WGW&â&ööÂ†&w2’æB&w5³Ò–â²'FW7B"Â&6†V6²"Â&6Æ—’'Ğ¢–bW†V7WF&ÆRÓÒ&vò# ¢&WGW&â&ööÂ†&w2’æB&w5³ÒÓÒ'FW7B ¢–bW†V7WF&ÆR–â²&×fâ"Â&w&FÆR"Â&w&FÆWr'Ó ¢&WGW&âç’†&r–â²'FW7B"Â&6†V6²"Â'fW&–g’'Òf÷"&r–â&w2¢–bW†V7WF&ÆRÓÒ&Ö¶R# ¢&WGW&â&ööÂ†&w2’æB&w5³Ò–â²'FW7B"Â&6†V6²"Â'fW&–g’"Â&Æ–çB'Ğ¢&WGW&âfÇ6P ¢2ÓÓÓÓÒK»¾XªiÛşKˆâDrYÎjÚRÓÓÓÓĞ ¢6Æ76ÖWF†ö@¢FVb7–æ5ög&öÕ÷F6µöw&‚€¢6Ç2ÂFs¢ç’Â&ö&C¢F6´&ö&BÂ'Våö–C¢7G"À¢’ÓâæöæS ¢"".h¨¢F6´w&‚y¨Nˆ¨.x+YÎjÚ^X‹F6´&ö&NûÈK¸^YÎjÚRTäD”ärˆ¨.x+ûÈ8  ¢YÊ[›nŠÎ‹>[ªn[ÈZx¾X˜Ş‹>yJûÈÎŠê’&ö&EF6²KˆâF6´æöFR£Zû[©N8 ¢"" ¢f÷"æöFUö–BÂæöFR–âFrææöFW2æ—FV×2‚“ ¢W†—7F–ærÒ&ö&BævWB†æöFUö–BÂ'Våö–C×'Våö–B¢–bW†—7F–ær—2æ÷BæöæS ¢6öçF–çVP¢&ö&Bæ7&VFU÷F6²€¢F6µö–CÖæöFUö–BÀ¢'Våö–C×'Våö–BÀ¢F—FÆSÖæöFRçF—FÆR÷"æöFUö–BÀ¢ö&¦V7F—fSÖæöFRæö&¦V7F—fRÀ¢FWVæFVæ6–W3ÖÆ—7B†æöFRæFWVæFVæ6–W2’À¢&WV—&VEö6&–Æ—F–W3ÖÆ—7B†æöFRç&WV—&VEö6&–Æ—F–W2’À¢&–÷&—G“ÖvWFGG"†æöFRÂ'&–÷&—G’"Â’À¢Ö…öGFV×G3ÖvWFGG"†æöFRÂ&Ö…öGFV×G2"Â2’À¢ ¢7FF–6ÖWF†ö@¢FVb7–æ5ö&6µ÷FõöFr†Fs¢ç’Â&ö&C¢F6´&ö&BÂ'Våö–C¢7G"’ÓâæöæS ¢"".h¨¢&ö&EF6²y¨NiÈ{¸x«nhY¹îXiX‹F6´w&8  ¢‹[Yk9^‹ÚÎhÚ.™;îûÉ¥TäD”är(i"$TE’(i"%Tää”är(i"5T44TTDTBôd”ÄTN8 ¢"" ¢g&öÒæ×VÇF–vVçBçF6µöw&‚–×÷'BF6´æöFU7FGW0¢f÷"B–â&ö&BæÆ—7Eö'•÷'Vâ‡'Våö–B“ ¢æöFRÒFrææöFW2ævWB‡BçF6µö–B¢–bæöFR—2æöæS ¢6öçF–çVP¢F&vWBÒæöæP¢–bBç7FGW2ÓÒ&ö&EF6µ7FGW2å5T44TTDTC ¢F&vWBÒF6´æöFU7FGW2å5T44TTDT@¢VÆ–bBç7FGW2ÓÒ&ö&EF6µ7FGW2äd”ÄTC ¢F&vWBÒF6´æöFU7FGW2äd”ÄT@¢VÆ–bBç7FGW2–â„&ö&EF6µ7FGW2å%Tää”ärÂ&ö&EF6µ7FGW2ä4Ä”ÔTB“ ¢F&vWBÒF6´æöFU7FGW2å%Tää”äp¢VÇ6S ¢6öçF–çVP¢2yJ‚÷7FW÷Fòhê‹ù¾X‹F&vW@¢÷7FW÷Fò†FrÂBçF6µö–BÂF&vWB¢f÷"'B–âBç&öGV6VEö'F–f7Eö–G3 ¢æöFRÒFrææöFW2ævWB‡BçF6µö–B¢–b'Bæ÷B–âæöFRæ÷WGWEö'F–f7Eö–G3 ¢Fræ66WEö'F–f7B‡BçF6µö–BÂ'B  ¦FVb÷7FW÷Fò†Fs¢ç’ÂæöFUö–C¢7G"ÂF&vWC¢ç’’ÓâæöæS ¢"".hÈYk9^‹ÚÎhÚ.™;îhê‹ù¾ˆ¨.x+x«nhX‹F&vWN8  ¢™;îûÉ¥TäD”är(i"$TE’(i"%Tää”är(i"5T44TTDTBôd”ÄT@¢"" ¢g&öÒæ×VÇF–vVçBçF6µöw&‚–×÷'BF6´æöFU7FGW0¢æöFRÒFrææöFW2ævWB†æöFUö–B¢–bæöFR—2æöæR÷"æöFRç7FGW2ÓÒF&vWC ¢&WGW&à¢2TäD”är(i"$TE¢–bæöFRç7FGW2ÓÒF6´æöFU7FGW2åTäD”äs ¢FrçWFFU÷7FGW2†æöFUö–BÂF6´æöFU7FGW2å$TE’¢2$TE’(i"%Tää”äp¢æöFRÒFrææöFW2ævWB†æöFUö–B¢–bæöFRç7FGW2ÓÒF6´æöFU7FGW2å$TE’æBF&vWBÒF6´æöFU7FGW2å$TE“ ¢FrçWFFU÷7FGW2†æöFUö–BÂF6´æöFU7FGW2å%Tää”är¢æöFRÒFrææöFW2ævWB†æöFUö–B¢2%Tää”är(i"F&vWB…5T44TTDTBôd”ÄTB¢–bæöFRç7FGW2ÓÒF6´æöFU7FGW2å%Tää”äræBF&vWB–â€¢F6´æöFU7FGW2å5T44TTDTBÂF6´æöFU7FGW2äd”ÄT@¢“ ¢FrçWFFU÷7FGW2†æöFUö–BÂF&vWB
+            if run_record and run_record.get("status") == "paused":
+                await self._cancel_running(running)
+                return self._finalize(round_n, status=ScheduleStatus.PAUSED.value,
+                                      error="paused")
+
+            if self.board.all_succeeded(self.run_id):
+                return self._finalize_verified_run(round_n)
+
+        # Exhausted max_rounds â€” cancel any still-running tasks.
+        await self._cancel_running(running)
+        return self._finalize(round_n, status="incomplete", error="max_rounds")
+
+    def _discover_dispatchable(
+        self, running: dict[asyncio.Future, str],
+    ) -> list[BoardTask]:
+        """Return tasks that are ready to dispatch right now.
+
+        Filters ``list_pending`` by:
+        - dependency satisfaction (every dep must be SUCCEEDED)
+        - capability match (at least one IDLE agent can serve the task)
+        - not already in-flight (task_id not in ``running``)
+
+        Only IDLE agents are considered for the capability match.  Checking
+        all live agents (which includes RUNNING ones) causes a busy-loop:
+        the task is dispatched, ``_run_one`` fails to reserve an idle agent,
+        the future completes instantly, and ``round_n`` burns through
+        ``max_rounds`` before any running task finishes.  Observed in
+        ``test_v3_root_graph``: 2 tasks sharing 1 summarization agent
+        exhausted 10 rounds in milliseconds, aborting with ``max_rounds``
+        before the first task completed.
+        """
+        from app.multiagent.agent_instance import AgentStatus
+
+        pending = self.board.list_pending(self.run_id)
+        ready = [task for task in pending if self._deps_satisfied(task)]
+
+        idle_agents = [
+            agent
+            for agent in self.registry.list_by_run(self.run_id)
+            if getattr(agent.status, "value", agent.status) == AgentStatus.IDLE.value
+        ]
+        live_agents = [
+            agent
+            for agent in self.registry.list_by_run(self.run_id)
+            if getattr(agent.status, "value", agent.status)
+            not in {"stopped", "failed"}
+        ]
+
+        serviceable: list[tuple[BoardTask, list[Any]]] = []
+        unserviceable: list[BoardTask] = []
+        for task in ready:
+            candidates = [
+                agent
+                for agent in idle_agents
+                if self._agent_can_serve(agent, task)
+            ]
+            if candidates:
+                serviceable.append((task, candidates))
+            else:
+                unserviceable.append(task)
+
+        # Only surface tasks that no live agent can ever serve (a true
+        # capability gap).  Tasks merely blocked by busy agents are
+        # expected â€” they will be dispatched when an agent returns to IDLE.
+        truly_unserviceable = [
+            task for task in unserviceable
+            if not any(
+                self._agent_can_serve(a, task)
+                for a in live_agents
+            )
+        ]
+        if truly_unserviceable:
+            self._event("TasksWaitingForCapability", payload={
+                "tasks": [
+                    {
+                        "task_id": task.task_id,
+                        "required_capabilities": task.required_capabilities,
+                    }
+                    for task in truly_unserviceable
+                ],
+                "available_agents": [
+                    {
+                        "agent_id": agent.agent_id,
+                        "capabilities": agent.capabilities,
+                    }
+                    for agent in live_agents
+                ],
+            })
+
+        already_running = set(running.values())
+        available = {agent.agent_id: agent for agent in idle_agents}
+        capacity = max(0, self.max_concurrency - len(running))
+        selected: list[BoardTask] = []
+
+        # Build a one-wave bipartite match instead of launching one Future per
+        # ready task.  The old implementation could enqueue ten tasks for one
+        # idle teammate; nine futures then failed reservation immediately and
+        # the same work repeated in the next scheduler round.  Most-constrained
+        # tasks are matched first so a generalist does not starve a specialist.
+        ordered = sorted(
+            (
+                (task, candidates)
+                for task, candidates in serviceable
+                if task.task_id not in already_running
+            ),
+            key=lambda item: (
+                len(item[1]),
+                -int(item[0].priority),
+                item[0].created_at,
+                item[0].task_id,
+            ),
+        )
+
+        exclusive_ready = [
+            item for item in ordered
+            if not self._task_allows_parallel(item[0].task_id)
+        ]
+        if running:
+            # ``allow_parallel=False`` is a full barrier: once such a task is
+            # running, no sibling may enter; likewise a new exclusive task
+            # waits for the current parallel wave to drain.  The previous
+            # asymmetric implementation admitted parallel siblings beside an
+            # already-running exclusive task, contradicting the contract and
+            # the regression test below.
+            if any(
+                not self._task_allows_parallel(task_id)
+                for task_id in running.values()
+            ):
+                return []
+            ordered = [
+                item for item in ordered
+                if self._task_allows_parallel(item[0].task_id)
+            ]
+        elif exclusive_ready:
+            # Start one explicit barrier task before admitting another wave.
+            ordered = sorted(
+                exclusive_ready,
+                key=lambda item: (
+                    -int(item[0].priority),
+                    item[0].created_at,
+                    item[0].task_id,
+                ),
+            )[:1]
+            capacity = min(capacity, 1)
+
+        for task, _ in ordered:
+            candidates = [
+                agent
+                for agent in available.values()
+                if self._agent_can_serve(agent, task)
+            ]
+            if not candidates:
+                continue
+            # Prefer the narrowest capable worker; preserve broad generalists
+            # for tasks that have no specialist alternative.
+            chosen = min(
+                candidates,
+                # ``candidates`` preserves registry order, so equal-width
+                # workers retain the established first-registered fairness
+                # contract instead of being reordered by random agent IDs.
+                key=lambda agent: len(agent.capabilities),
+            )
+            selected.append(task)
+            self._dispatch_agent_hints[task.task_id] = chosen.agent_id
+            available.pop(chosen.agent_id, None)
+            if len(selected) >= capacity:
+                break
+        return selected
+
+    def _task_allows_parallel(self, task_id: str) -> bool:
+        if self.task_graph is None:
+            return True
+        node = self.task_graph.nodes.get(task_id)
+        if node is None:
+            return True
+        contract = getattr(node, "output_contract", None)
+        return bool(
+            True if contract is None else contract.allow_parallel
+        )
+
+    @staticmethod
+    def _agent_can_serve(agent: Any, task: BoardTask) -> bool:
+        """Mirror registry capability fallback during dispatch planning."""
+        required = set(task.required_capabilities)
+        if not required:
+            return True
+        available = set(agent.capabilities)
+        if required.issubset(available):
+            return True
+        tool_capabilities = {
+            "file_read",
+            "file_write",
+            "shell_execute",
+            "web_research",
+            "mcp_access",
+            "default",
+        }
+        primary = required - tool_capabilities
+        return bool(primary) and primary.issubset(available)
+
+    def _next_retry_delay(self) -> float | None:
+        """Return how long to wait before re-checking for retry-ready tasks.
+
+        Scans every PENDING task with a future ``next_attempt_at`` and returns
+        the time until the earliest one becomes due, capped at a small upper
+        bound so the scheduler also stays responsive to cancel/pause signals.
+        Returns ``None`` when no deferred retries exist, letting
+        ``asyncio.wait`` block indefinitely (the old behaviour) â€” this is
+        correct when every pending task is already dispatchable and we're
+        purely waiting for a running task to finish.
+
+        Without this cap, ``asyncio.wait(FIRST_COMPLETED)`` blocks until a
+        running task finishes.  In run_e8587ea68ac64ff5, T2's 15-s retry sat
+        for 10 minutes behind T1's 900-s planning run because the scheduler
+        never woke up to re-evaluate ``list_pending``.
+        """
+        now = datetime.now(UTC)
+        soonest: float | None = None
+        for task in self.board.list_by_run(self.run_id):
+            if task.status != BoardTaskStatus.PENDING:
+                continue
+            due = task.next_attempt_at
+            if due is None:
+                continue
+            remaining = (due - now).total_seconds()
+            if remaining <= 0:
+                # Already due â€” wake immediately.
+                return 0.05
+            if soonest is None or remaining < soonest:
+                soonest = remaining
+        if soonest is None:
+            return None
+        # Cap at 5 s so cancel/pause signals are still picked up promptly
+        # even when the next retry is far off.
+        return min(soonest, 5.0)
+
+    async def _resolve_idle(self, round_n: int) -> ParallelRunResult | None:
+        """Handle the case where nothing is running and nothing is dispatchable.
+
+        Returns a final ``ParallelRunResult`` if the run is over, or ``None``
+        after sleeping for a deferred retry / transient gap so the caller can
+        loop back and re-evaluate.
+        """
+        if self.board.all_succeeded(self.run_id):
+            logger.info(
+                f"[ParallelSched] run={self.run_id}: all succeeded at round={round_n}"
+            )
+            return self._finalize_verified_run(round_n)
+
+        all_tasks = self.board.list_by_run(self.run_id)
+        states = [t.status for t in all_tasks]
+
+        # Deferred retries â€” wait for the next attempt to become due.
+        deferred = [
+            task for task in all_tasks
+            if task.status == BoardTaskStatus.PENDING
+            and task.next_attempt_at is not None
+            and task.next_attempt_at > datetime.now(UTC)
+        ]
+        if deferred:
+            due_at = min(task.next_attempt_at for task in deferred)
+            wait_seconds = max(
+                0.05, (due_at - datetime.now(UTC)).total_seconds()
+            )
+            self._event("RetryBackoffWaiting", payload={
+                "task_ids": [task.task_id for task in deferred],
+                "next_attempt_at": due_at.isoformat(),
+                "wait_seconds": round(wait_seconds, 3),
+            })
+            # Cap the sleep so a newly-freed agent or cancel is noticed
+            # promptly even when the next retry is far off.
+            await asyncio.sleep(min(wait_seconds, 1.0))
+            return None
+
+        # Control-plane intervention states.
+        if any(s in (BoardTaskStatus.BLOCKED, BoardTaskStatus.REPAIR_REQUIRED,
+                     BoardTaskStatus.REPLAN_REQUIRED) for s in states):
+            return self._finalize(
+                round_n, status=ScheduleStatus.WAITING_HUMAN.value,
+                error="control_plane_intervention_required",
+            )
+
+        # A task-level cancel may race with a worker completion without setting
+        # the run-wide cancel event.  Once every task is terminal, preserve the
+        # authoritative cancellation outcome instead of misclassifying the
+        # run as a scheduler deadlock.
+        terminal_statuses = {
+            BoardTaskStatus.SUCCEEDED,
+            BoardTaskStatus.FAILED,
+            BoardTaskStatus.CANCELLED,
+        }
+        if states and all(status in terminal_statuses for status in states):
+            if BoardTaskStatus.FAILED in states:
+                return self._finalize(
+                    round_n,
+                    status=ScheduleStatus.FAILED.value,
+                    error="one_or_more_tasks_failed",
+                )
+            if BoardTaskStatus.CANCELLED in states:
+                return self._finalize(
+                    round_n,
+                    status=ScheduleStatus.CANCELLED.value,
+                    error="one_or_more_tasks_cancelled",
+                )
+
+        # Permanent deadlock: a PENDING task depends on a terminal (FAILED /
+        # CANCELLED) task.  FAILEDâ†’SUCCEEDED is not a legal transition (see
+        # _LEGAL_TRANSITIONS in task_graph.py), so these PENDING tasks can
+        # never become dispatchable.  This is a hard failure, not "waiting
+        # for human" â€” the previous WAITING_HUMAN / "no_eligible_worker"
+        # return was misleading (the issue isn't a missing worker, it's a
+        # dead dependency) and prevented the run from routing to _fail.
+        # In run_2a438328372441d8, T01 FAILED and 14 PENDING tasks depended
+        # on it transitively; the scheduler returned WAITING_HUMAN instead
+        # of FAILED, obscuring the real cause.
+        terminal_blocker_ids = {
+            t.task_id for t in all_tasks
+            if t.status in (BoardTaskStatus.FAILED, BoardTaskStatus.CANCELLED)
+        }
+        if terminal_blocker_ids:
+            deadlocked = [
+                t for t in all_tasks
+                if t.status == BoardTaskStatus.PENDING
+                and any(dep in terminal_blocker_ids for dep in t.dependencies)
+            ]
+            if deadlocked:
+                return self._finalize(
+                    round_n, status=ScheduleStatus.FAILED.value,
+                    error=(
+                        "task_deadlock_due_to_failed_dependency: "
+                        f"{[t.task_id for t in deadlocked]}"
+                    ),
+                )
+
+        # No deferred retries, no BLOCKED, nothing running â†’ genuine deadlock
+        # or permanent capability gap.
+        pending = [t for t in all_tasks if t.status == BoardTaskStatus.PENDING]
+        if pending:
+            # çœŸæ­£"æ— äººå¯æœåŠ¡"çš„æ­»é”ï¼šåˆ—å‡ºæ¯ä¸ª pending task çš„ required_capabilities
+            # ä¸ç°å­˜ agent çš„ capabilitiesï¼Œè®©è¿ç»´ / å‰ç«¯èƒ½çœ‹åˆ°åŸå› ï¼ˆè€Œä¸æ˜¯åªæ”¶åˆ°ä¸€ä¸ª
+            # æŠ½è±¡çš„ no_eligible_workerï¼Œå†è¢« root_graph èµ° human_interrupt â†’ dispatch
+            # æ­»å¾ªç¯å‡ åƒæ¬¡äº§å‡ºå‡ åƒæ¡åŒåäº‹ä»¶â€”â€”run è¿›å…¥"æ¶ˆæ¯æš´æ¶¨"ç—‡çŠ¶ï¼‰ã€‚
+            from app.multiagent.agent_instance import AgentStatus
+            live_agent_caps = sorted({
+                cap
+                for agent in self.registry.list_by_run(self.run_id)
+                if getattr(agent.status, "value", agent.status)
+                not in {"stopped", "failed"}
+                for cap in agent.capabilities
+            })
+            pending_detail = [
+                {
+                    "task_id": task.task_id,
+                    "required_capabilities": list(task.required_capabilities),
+                    "dependencies": list(task.dependencies),
+                    "next_attempt_at": (
+                        task.next_attempt_at.isoformat()
+                        if task.next_attempt_at else None
+                    ),
+                }
+                for task in pending
+            ]
+            # åŒºåˆ†ä¸¤ç§åœºæ™¯ï¼šä¾èµ–æœªæ»¡è¶³ï¼ˆç­‰è¿è¡Œä¸­ä»»åŠ¡ï¼‰vs çœŸæ­£æ— äººèƒ½å¹²ã€‚
+            # åªæœ‰çœŸæ— äººèƒ½å¹²æ‰æŠ¥é”™ç»ˆæ­¢ï¼›åªæ˜¯ä¾èµ–æœªæ»¡è¶³è®©å¤–å±‚å† loop ä¸€æ¬¡ã€‚
+            truly_unserviceable_now = [
+                t for t in pending
+                if self._deps_satisfied(t)
+                and not any(
+                    self._agent_can_serve(a, t)
+                    for a in self.registry.list_by_run(self.run_id)
+                    if getattr(a.status, "value", a.status)
+                    not in {"stopped", "failed"}
+                )
+            ]
+            self._event("NoEligibleWorkerDeadlock", payload={
+                "pending": pending_detail,
+                "live_agent_capabilities": live_agent_caps,
+                "truly_unserviceable_task_ids": [
+                    t.task_id for t in truly_unserviceable_now
+                ],
+            })
+            # å…³é”®ä¿®å¤ï¼šæŠŠ WAITING_HUMAN / no_eligible_worker æ”¹æˆ FAILEDã€‚
+            # åŸè¯­ä¹‰è®© root_graph èµ° human_interrupt â†’ Command(resume) â†’ dispatch
+            # åˆå›åˆ°åŒä¸€è°ƒåº¦å™¨ï¼Œä½† human æ²¡æœ‰å¯è¡¥çš„è¾“å…¥ï¼Œäºæ˜¯åå¤äº§å‡º
+            # `no_eligible_worker` äº‹ä»¶ï¼Œå•æ¬¡ run ç´¯è®¡å‡ åƒæ¡æ¶ˆæ¯ï¼ˆç”¨æˆ·ç—‡çŠ¶ï¼‰ã€‚
+            return self._finalize(
+                round_n,
+                status=ScheduleStatus.FAILED.value,
+                error=(
+                    "no_eligible_worker:required_capabilities="
+                    f"{[t.required_capabilities for t in truly_unserviceable_now]}"
+                    f";available={live_agent_caps}"
+                ),
+            )
+
+        logger.warning(
+            f"[ParallelSched] run={self.run_id} deadlock: states={states}"
+        )
+        return self._finalize(
+            round_n, status="failed", error="scheduler_deadlock",
+        )
+
+    async def _cancel_running(self, running: dict[asyncio.Future, str]) -> None:
+        """Cancel every in-flight task future and swallow CancelledError."""
+        for fut in running:
+            fut.cancel()
+        if running:
+            await asyncio.gather(*running.keys(), return_exceptions=True)
+        running.clear()
+
+    # ===== å•ä»»åŠ¡è¿è¡Œ =====
+
+    async def _run_one_guarded(self, task: BoardTask, executor: Any, semaphore: Any) -> None:
+        """Hold the concurrency permit for the complete assignment lifetime."""
+        async with semaphore:
+            await self._run_one(task, executor)
+
+    async def _run_one(self, task: BoardTask, executor: Any) -> None:
+        """è®¤é¢†å¹¶æ‰§è¡Œä¸€ä¸ªä»»åŠ¡ã€‚å¦‚æœ task ä»å± PENDING ä¸”æ— äººå ç”¨ï¼Œåˆ™è®¤é¢†å¹¶æ‰§è¡Œã€‚"""
+        if self.cancel_event.is_set():
+            return
+        # Selection and reservation are a single operation.  Do not call
+        # find_idle here: a sibling coroutine can otherwise steal the same
+        # worker before this task changes its status.
+        agent = self.registry.reserve_idle_agent(
+            self.run_id,
+            set(task.required_capabilities),
+            task.task_id,
+            preferred_agent_id=self._dispatch_agent_hints.pop(task.task_id, None),
+        )
+        if agent is None:
+            # æ²¡æœ‰ç©ºé—² worker â†’ è§¦å‘ Mailbox.wake_idle_agents æç¤ºæ­£åœ¨è¿è¡Œçš„
+            # åŒ capability Agent è®©å‡ºèµ„æºï¼ˆä»»åŠ¡ä¹¦ Â§12ï¼‰ã€‚è¿™æ˜¯æç¤ºè€Œéé˜»å¡ RPCï¼š
+            # ä¸é˜»å¡è°ƒåº¦å¾ªç¯ï¼Œä¸‹ä¸€ round ä»ä¼šæœ‰æœºä¼šé‡è¯•ã€‚
+            logger.info(
+                f"[ParallelSched] no idle worker for task={task.task_id} "
+                f"required={task.required_capabilities} â€“ è§¦å‘ wakeup"
+            )
+            try:
+                from app.multiagent.mailbox import get_mailbox
+                from app.multiagent.agent_instance import AgentStatus
+                busy = [
+                    a.agent_id for a in self.registry.list_by_run(self.run_id)
+                    if a.status == AgentStatus.RUNNING
+                    and any(c in a.capabilities for c in task.required_capabilities)
+                ]
+                if busy:
+                    get_mailbox().wake_idle_agents(
+                        run_id=self.run_id,
+                        agent_ids=busy,
+                        hint=f"task={task.task_id} ç­‰å¾…ç©ºé—² workerï¼Œè¯·å°½å¿«å®Œæˆæˆ–è®©å‡ºã€‚",
+                    )
+            except Exception as exc:
+                logger.debug(f"[ParallelSched] wake_idle_agents å¤±è´¥ï¼ˆå¿½ç•¥ï¼‰: {exc}")
+            return
+
+        try:
+            from app.multiagent.teammate_session import (
+                TeammateLifecycle, get_teammate_supervisor,
+            )
+            teammate_actor = get_teammate_supervisor().actor_for(agent)
+            session = teammate_actor.session
+            if session.lifecycle_state == TeammateLifecycle.IDLE:
+                session.transition(TeammateLifecycle.CLAIMING)
+                get_teammate_supervisor().persist(session)
+            claim = self.board.claim(task.task_id, agent.agent_id, run_id=self.run_id)
+            if not claim.success:
+                # å·²è¢«å…¶ä»–åç¨‹æŠ¢èµ°
+                logger.debug(
+                    f"[ParallelSched] claim failed for task={task.task_id} "
+                    f"agent={agent.agent_id}: {claim.reason}"
+                )
+                self.registry.release_reservation(agent.agent_id, task.task_id)
+                return
+
+            task = claim.task
+            from app.multiagent.lifecycle_hooks import LifecycleEvent, get_lifecycle_hook_engine
+            claim_hook = await get_lifecycle_hook_engine().emit_async(
+                LifecycleEvent.TASK_CLAIMED,
+                {"run_id": self.run_id, "agent_id": agent.agent_id,
+                 "task_id": task.task_id},
+            )
+            if claim_hook.block or not claim_hook.allow:
+                self.board.release(task.task_id, agent.agent_id,
+                                   claim_hook.feedback or "TaskClaimed hook blocked",
+                                   run_id=self.run_id)
+                self.registry.release_reservation(agent.agent_id, task.task_id)
+                return
+            if not self.board.start(task.task_id, agent.agent_id, run_id=self.run_id):
+                # çŠ¶æ€æœºå¼‚å¸¸ï¼Œé‡Šæ”¾å¹¶æ”¾å¼ƒ
+                self.board.release(task.task_id, agent.agent_id, "start_failed", run_id=self.run_id)
+                self.registry.release_reservation(agent.agent_id, task.task_id)
+                return
+            start_hook = await get_lifecycle_hook_engine().emit_async(
+                LifecycleEvent.TASK_STARTED,
+                {"run_id": self.run_id, "agent_id": agent.agent_id,
+                 "task_id": task.task_id},
+            )
+            if start_hook.block or not start_hook.allow:
+                self.board.release(task.task_id, agent.agent_id,
+                                   start_hook.feedback or "TaskStarted hook blocked",
+                                   run_id=self.run_id)
+                self.registry.release_reservation(agent.agent_id, task.task_id)
+                return
+
+            node_for_plan = self.task_graph.nodes.get(task.task_id) if self.task_graph else None
+            if node_for_plan is not None and node_for_plan.metadata.get("require_plan_approval"):
+                from app.multiagent.plan_approval import (
+                    PlanApprovalService, PlanStatus, TeammatePlan,
+                )
+                existing_plan_id = task.metadata.get("plan_id")
+                service = PlanApprovalService()
+                existing_plan = service.get(existing_plan_id) if existing_plan_id else None
+                if existing_plan is None:
+                    session.transition(TeammateLifecycle.PLANNING)
+                    plan = service.submit(TeammatePlan(
+                        run_id=self.run_id, agent_id=agent.agent_id, task_id=task.task_id,
+                        files=list(node_for_plan.metadata.get("plan_files", [])),
+                        steps=list(node_for_plan.metadata.get("plan_steps", [node_for_plan.objective])),
+                        test_strategy=list(node_for_plan.output_contract.acceptance_criteria or
+                                           ["run task-specific verification"]),
+                        risks=list(node_for_plan.metadata.get("plan_risks", [])),
+                        rollback=node_for_plan.metadata.get("rollback", "revert task commit"),
+                    ))
+                    task.metadata["plan_id"] = plan.plan_id
+                    self.board.add(task)
+                    existing_plan = plan
+                if existing_plan.status != PlanStatus.PLAN_APPROVED:
+                    if session.lifecycle_state == TeammateLifecycle.PLANNING:
+                        session.transition(TeammateLifecycle.WAITING_PLAN_APPROVAL)
+                    task.status = BoardTaskStatus.BLOCKED
+                    task.last_error = existing_plan.feedback or "waiting_plan_approval"
+                    self.board.add(task)
+                    get_teammate_supervisor().persist(session)
+                    self.registry.release_reservation(agent.agent_id, task.task_id)
+                    return
+
+            # Agent çŠ¶æ€æœºï¼šIDLE â†’ RUNNING
+            from app.multiagent.agent_instance import AgentStatus
+            if not self.registry.transition(agent.agent_id, AgentStatus.RUNNING):
+                self.board.release(task.task_id, agent.agent_id, "agent_transition_failed", run_id=self.run_id)
+                self.registry.release_reservation(agent.agent_id, task.task_id)
+                return
+            if session.lifecycle_state == TeammateLifecycle.CLAIMING:
+                session.transition(TeammateLifecycle.RUNNING)
+            session.current_task_id = task.task_id
+            session.cancellation_requested = False
+            get_teammate_supervisor().persist(session)
+            # è¿™é‡Œçš„ registry è°ƒç”¨æ˜¯ä¸ºäº†å‘å¿ƒè·³
+
+            # å¿ƒè·³ä»»åŠ¡ï¼ˆæ‰§è¡Œé•¿æ—¶é—´æ—¶è®°å½•è¿›åº¦ï¼‰
+            beat_stop = asyncio.Event()
+            from app.infrastructure.database.run_store import get_agent_run_history, make_task_run_id
+            history = get_agent_run_history()
+            task_run_id = make_task_run_id()
+            history.insert_task_run(
+                task_run_id=task_run_id, task_id=task.task_id, agent_id=agent.agent_id,
+                run_id=self.run_id, attempt=task.attempts + 1, status="running",
+                metadata={"session_id": agent.session_id, "thread_id": agent.thread_id},
+            )
+            assignment_started = time.monotonic()
+
+            async def _heartbeat_loop():
+                last_audit = -self.audit_heartbeat_interval
+                while not beat_stop.is_set():
+                    self.registry.heartbeat(agent.agent_id)
+                    elapsed = time.monotonic() - assignment_started
+                    if elapsed - last_audit >= self.audit_heartbeat_interval:
+                        self._event(
+                            "TaskHeartbeat",
+                            agent_id=agent.agent_id,
+                            task_id=task.task_id,
+                            payload={
+                                "task_run_id": task_run_id,
+                                "attempt": task.attempts + 1,
+                                "elapsed_seconds": round(elapsed, 1),
+                                "message": "Agent is still working",
+                            },
+                        )
+                        last_audit = elapsed
+                    try:
+                        await asyncio.wait_for(
+                            beat_stop.wait(), timeout=self.heartbeat_interval
+                        )
+                    except TimeoutError:
+                        pass
+
+            beat_task = asyncio.create_task(_heartbeat_loop())
+
+            try:
+                # åœ¨çº¿ç¨‹æ± ä¸­è·‘åŒæ­¥ executorï¼ˆæ”¯æŒ DeepAgentExecutor / æ—§å®ç°ï¼‰
+                task_input = {
+                    "run_id": self.run_id,
+                    "agent_id": agent.agent_id,
+                    "profile_id": agent.profile_id,
+                }
+                lease = None
+                if self.worktree_manager is not None:
+                    try:
+                        lease = self.worktree_manager.acquire(self.run_id, agent.agent_id)
+                    except Exception as exc:
+                        from app.multiagent.permission import PermissionRequired
+                        if isinstance(exc, PermissionRequired):
+                            session.transition(TeammateLifecycle.WAITING_PERMISSION)
+                            task.status = BoardTaskStatus.BLOCKED
+                            task.last_error = str(exc)
+                            task.metadata["permission_request_id"] = exc.request.request_id
+                            self.board.add(task)
+                            history.update_task_run_status(
+                                task_run_id, "waiting_permission", error=str(exc),
+                            )
+                            return
+                        raise
+                    task_input["workspace_root"] = lease.worktree_path
+                    task_input["worktree_mode"] = True
+                    agent.workspace_root = lease.worktree_path
+                    agent.worktree_path = lease.worktree_path
+                    agent.metadata["worktree_path"] = lease.worktree_path
+                    agent.metadata["git_branch"] = lease.branch
+                    session.workspace = lease.worktree_path
+                    session.worktree = lease.worktree_path
+                    get_teammate_supervisor().persist(session)
+                task_input.update({
+                    "workspace_root": getattr(agent, "workspace_root", ""),
+                    "agent_id": agent.agent_id,
+                    "session_id": agent.session_id,
+                    "thread_id": agent.thread_id,
+                })
+                artifact_ids, artifact_refs = self._collect_dependency_artifacts(task)
+                task_input["input_artifact_ids"] = artifact_ids
+                task_input["artifact_refs"] = artifact_refs
+                task_input["team_control_plane"] = self.control_plane
+                task_input["permission_broker"] = self.permission_broker
+                task_input["safety_point"] = teammate_actor.safety_point
+                # Mailbox is an execution input, not merely an audit log.
+                # Deliver messages atomically before the worker constructs its
+                # prompt so user/teammate interventions can affect the task.
+                from app.multiagent.mailbox import get_mailbox
+                task_input["mailbox_messages"] = [
+                    message.model_dump(mode="json")
+                    for message in get_mailbox().receive(agent.agent_id, max_count=20)
+                ]
+                dag = self.task_graph or self._task_graph_from_board()
+                assignment_future = asyncio.create_task(
+                    self.runtime_manager.execute_assignment(
+                        executor=executor,
+                        task_graph=dag,
+                        task_id=task.task_id,
+                        task_input=task_input,
+                        cancel_event=self.cancel_event,
+                        agent_registry=self.registry,
+                    )
+                )
+                if self.task_execution_timeout > 0:
+                    # Per-task timeout resolution order:
+                    # 1. node_for_plan.budget.max_seconds (planner-set)
+                    # 2. capability_timeout(required_capabilities) â€” covers
+                    #    repair tasks whose ``add_repair_task`` may not have
+                    #    inherited the budget (defensive), and any node built
+                    #    via ``_task_graph_from_board`` fallback.
+                    # 3. scheduler-wide ``task_execution_timeout`` (300s).
+                    # The previous code skipped step 2, so repair tasks like
+                    # T1__repair_v17 (planning) fell to 300s and were killed
+                    # before the LLM could finish (run_e8587ea68ac64ff5).
+                    effective_timeout = (
+                        node_for_plan.budget.max_seconds
+                        if node_for_plan is not None
+                        and node_for_plan.budget.max_seconds > 0
+                        else capability_timeout(task.required_capabilities)
+                        or self.task_execution_timeout
+                    )
+                    done, _ = await asyncio.wait(
+                        {assignment_future},
+                        timeout=effective_timeout,
+                    )
+                    if not done:
+                        self.runtime_manager.cancel_agent(
+                            self.run_id, agent.agent_id
+                        )
+                        self._event(
+                            "TaskTimedOut",
+                            agent_id=agent.agent_id,
+                            task_id=task.task_id,
+                            payload={
+                                "task_run_id": task_run_id,
+                                "timeout_seconds": effective_timeout,
+                                "attempt": task.attempts + 1,
+                            },
+                        )
+                        assignment_future.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await assignment_future
+                        raise TimeoutError(
+                            "task execution timed out after "
+                            f"{effective_timeout:g}s"
+                        )
+                result = await assignment_future
+
+                if task_input["cancel_event"].is_set():
+                    if self.cancel_event.is_set():
+                        self.board.cancel(task.task_id, "cancelled_during_execution", run_id=self.run_id)
+                    else:
+                        # A stopped teammate must not turn a late success into
+                        # verified completion.  Release its work so another
+                        # compatible teammate can claim it.
+                        self.board.release(task.task_id, agent.agent_id, "agent_stopped", run_id=self.run_id)
+                    history.update_task_run_status(task_run_id, "cancelled", error="cancelled")
+                    return
+
+                if result.success:
+                    commit_sha = None
+                    if lease is not None and self.integration_manager is not None:
+                        try:
+                            commit_sha = self.integration_manager.commit(
+                                lease, f"task {task.task_id}", run_id=self.run_id,
+                                agent_id=agent.agent_id,
+                            )
+                            artifact_store = getattr(self.verifier, "artifact_store", None)
+                            if artifact_store is not None:
+                                artifact_store.bind_commit(list(result.artifact_ids), commit_sha)
+                        except Exception as exc:
+                            from app.multiagent.permission import PermissionRequired
+                            if isinstance(exc, PermissionRequired):
+                                session.transition(TeammateLifecycle.WAITING_PERMISSION)
+                                task.status = BoardTaskStatus.BLOCKED
+                                task.last_error = str(exc)
+                                task.metadata["permission_request_id"] = exc.request.request_id
+                                self.board.add(task)
+                                history.update_task_run_status(task_run_id, "waiting_permission",
+                                                               error=str(exc))
+                                return
+                            raise
+                    # A worker only produces evidence.  It never marks its
+                    # own task succeeded; that transition is verifier-owned.
+                    if not self.board.mark_produced(
+                        task.task_id, agent.agent_id,
+                        artifact_ids=list(result.artifact_ids),
+                        run_id=self.run_id,
+                    ):
+                        self._record_task_state_conflict(
+                            task=task,
+                            agent_id=agent.agent_id,
+                            task_run_id=task_run_id,
+                            history=history,
+                            transition="mark_produced",
+                            expected_statuses=[BoardTaskStatus.RUNNING],
+                            artifact_ids=list(result.artifact_ids),
+                        )
+                        return
+                    await get_lifecycle_hook_engine().emit_async(
+                        LifecycleEvent.TASK_PRODUCED,
+                        {"run_id": self.run_id, "agent_id": agent.agent_id,
+                         "task_id": task.task_id,
+                         "artifact_ids": list(result.artifact_ids)},
+                    )
+                    await get_lifecycle_hook_engine().emit_async(
+                        LifecycleEvent.VERIFICATION_STARTED,
+                        {"run_id": self.run_id, "agent_id": agent.agent_id,
+                         "task_id": task.task_id},
+                    )
+                    # Verification may call an online judge and local checks.
+                    # Keep it off the scheduler loop so one slow judge cannot
+                    # freeze sibling dispatch, heartbeats, pause/cancel
+                    # observation, or SSE-visible progress.
+                    if not self.board.mark_verifying(task.task_id, run_id=self.run_id):
+                        self._record_task_state_conflict(
+                            task=task,
+                            agent_id=agent.agent_id,
+                            task_run_id=task_run_id,
+                            history=history,
+                            transition="mark_verifying",
+                            expected_statuses=[BoardTaskStatus.PRODUCED],
+                            artifact_ids=list(result.artifact_ids),
+                        )
+                        return
+                    if await self._verify_task_async(task):
+                        completed_hook = await get_lifecycle_hook_engine().emit_async(
+                            LifecycleEvent.TASK_COMPLETED,
+                            {"run_id": self.run_id, "agent_id": agent.agent_id,
+                             "task_id": task.task_id,
+                             "artifact_ids": list(result.artifact_ids)},
+                        )
+                        if completed_hook.block or not completed_hook.allow:
+                            current = self.board.get(task.task_id, run_id=self.run_id)
+                            if current is not None:
+                                current.metadata["hook_feedback"] = completed_hook.feedback
+                                self.board.add(current)
+                            if not self.board.mark_repair_required(
+                                task.task_id, run_id=self.run_id,
+                            ):
+                                self._record_task_state_conflict(
+                                    task=task,
+                                    agent_id=agent.agent_id,
+                                    task_run_id=task_run_id,
+                                    history=history,
+                                    transition="mark_repair_required",
+                                    expected_statuses=[BoardTaskStatus.VERIFYING],
+                                    artifact_ids=list(result.artifact_ids),
+                                )
+                                return
+                            history.update_task_run_status(
+                                task_run_id, "failed",
+                                error=completed_hook.feedback or "TaskCompleted hook blocked",
+                            )
+                            await get_lifecycle_hook_engine().emit_async(
+                                LifecycleEvent.VERIFICATION_COMPLETED,
+                                {"run_id": self.run_id, "agent_id": agent.agent_id,
+                                 "task_id": task.task_id, "verdict": "repair",
+                                 "feedback": completed_hook.feedback},
+                            )
+                            return
+                        if commit_sha and self.integration_manager is not None:
+                            from app.multiagent.git_workspace import MergeQueueItem
+                            integrated = self.integration_manager.integrate(MergeQueueItem(
+                                queue_id=f"merge_{task.task_id}_{agent.agent_id}",
+                                run_id=self.run_id, agent_id=agent.agent_id,
+                                commit_sha=commit_sha, branch=lease.branch,
+                            ))
+                            if integrated.status == "conflict":
+                                current = self.board.get(task.task_id, run_id=self.run_id)
+                                current.status = BoardTaskStatus.REPAIR_REQUIRED
+                                current.metadata["merge_conflicts"] = integrated.conflicts
+                                self.board.add(current)
+                                history.update_task_run_status(task_run_id, "failed",
+                                                               error="merge_conflict")
+                                return
+                        artifact_store = getattr(self.verifier, "artifact_store", None)
+                        if artifact_store is not None:
+                            try:
+                                for artifact_id in result.artifact_ids:
+                                    if not artifact_store.mark_verified(artifact_id):
+                                        raise RuntimeError(
+                                            f"artifact status row missing: {artifact_id}"
+                                        )
+                            except Exception as exc:
+                                self._reject_artifacts_fail_closed(
+                                    artifact_store, list(result.artifact_ids),
+                                )
+                                if not self.board.mark_repair_required(
+                                    task.task_id, run_id=self.run_id,
+                                ):
+                                    self._record_task_state_conflict(
+                                        task=task,
+                                        agent_id=agent.agent_id,
+                                        task_run_id=task_run_id,
+                                        history=history,
+                                        transition="artifact_verification_rollback",
+                                        expected_statuses=[BoardTaskStatus.VERIFYING],
+                                        artifact_ids=list(result.artifact_ids),
+                                    )
+                                    return
+                                error = f"artifact_verification_commit_failed: {exc}"
+                                history.update_task_run_status(
+                                    task_run_id, "failed", error=error,
+                                )
+                                self._event(
+                                    "ArtifactVerificationCommitFailed",
+                                    agent_id=agent.agent_id,
+                                    task_id=task.task_id,
+                                    payload={
+                                        "task_run_id": task_run_id,
+                                        "artifact_ids": list(result.artifact_ids),
+                                        "error": str(exc),
+                                    },
+                                )
+                                return
+                        # Board success is the final transition and therefore
+                        # cannot precede governed Git integration.
+                        if not self.board.mark_verified(
+                            task.task_id, run_id=self.run_id,
+                        ):
+                            self._reject_artifacts_fail_closed(
+                                artifact_store, list(result.artifact_ids),
+                            )
+                            self._record_task_state_conflict(
+                                task=task,
+                                agent_id=agent.agent_id,
+                                task_run_id=task_run_id,
+                                history=history,
+                                transition="mark_verified",
+                                expected_statuses=[BoardTaskStatus.VERIFYING],
+                                artifact_ids=list(result.artifact_ids),
+                            )
+                            return
+                        history.update_task_run_status(task_run_id, "succeeded")
+                        await get_lifecycle_hook_engine().emit_async(
+                            LifecycleEvent.VERIFICATION_COMPLETED,
+                            {"run_id": self.run_id, "agent_id": agent.agent_id,
+                             "task_id": task.task_id, "verdict": "pass"},
+                        )
+                    else:
+                        if not self.board.mark_repair_required(
+                            task.task_id, run_id=self.run_id,
+                        ):
+                            self._record_task_state_conflict(
+                                task=task,
+                                agent_id=agent.agent_id,
+                                task_run_id=task_run_id,
+                                history=history,
+                                transition="mark_repair_required",
+                                expected_statuses=[BoardTaskStatus.VERIFYING],
+                                artifact_ids=list(result.artifact_ids),
+                            )
+                            return
+                        history.update_task_run_status(task_run_id, "failed", error="verification_failed")
+                        await get_lifecycle_hook_engine().emit_async(
+                            LifecycleEvent.VERIFICATION_COMPLETED,
+                            {"run_id": self.run_id, "agent_id": agent.agent_id,
+                             "task_id": task.task_id, "verdict": "repair"},
+                        )
+                    # å®æ—¶æ›´æ–° CapabilityRegistry æŒ‡æ ‡ã€‚
+                    try:
+                        from app.multiagent.agent_profile import get_capability_registry
+                        get_capability_registry().record_success(agent.profile_id)
+                    except Exception:
+                        pass
+                    logger.info(
+                        f"[ParallelSched] task={task.task_id} agent={agent.agent_id} succeeded"
+                    )
+                else:
+                    error = result.error or "unknown"
+                    decision = self._record_task_failure(
+                        task=task,
+                        agent_id=agent.agent_id,
+                        error=error,
+                        task_run_id=task_run_id,
+                        history=history,
+                    )
+                    await get_lifecycle_hook_engine().emit_async(
+                        LifecycleEvent.TASK_FAILED,
+                        {"run_id": self.run_id, "agent_id": agent.agent_id,
+                         "task_id": task.task_id, "error": error,
+                         "retry": decision.to_dict()},
+                    )
+                    # å®æ—¶æ›´æ–° CapabilityRegistry æŒ‡æ ‡ã€‚
+                    try:
+                        from app.multiagent.agent_profile import get_capability_registry
+                        get_capability_registry().record_failure(agent.profile_id)
+                    except Exception:
+                        pass
+                    last_state = self.board.get(task.task_id, run_id=self.run_id)
+                    logger.warning(
+                        f"[ParallelSched] task={task.task_id} failed: {result.error} "
+                        f"now status={last_state.status.value}"
+                    )
+            except Exception as exc:
+                logger.error(
+                    f"[ParallelSched] task={task.task_id} agent={agent.agent_id} "
+                    f"raised: {exc}"
+                )
+                decision = self._record_task_failure(
+                    task=task,
+                    agent_id=agent.agent_id,
+                    error=str(exc),
+                    task_run_id=task_run_id,
+                    history=history,
+                )
+                try:
+                    from app.multiagent.lifecycle_hooks import LifecycleEvent, get_lifecycle_hook_engine
+                    await get_lifecycle_hook_engine().emit_async(
+                        LifecycleEvent.TASK_FAILED,
+                        {"run_id": self.run_id, "agent_id": agent.agent_id,
+                         "task_id": task.task_id, "error": str(exc),
+                         "retry": decision.to_dict()},
+                    )
+                except Exception:
+                    pass
+            finally:
+                beat_stop.set()
+                beat_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await beat_task
+                # çŠ¶æ€æ¢å¤
+                self.registry.release_reservation(agent.agent_id, task.task_id)
+                session.current_task_id = None
+                if session.lifecycle_state not in (
+                    TeammateLifecycle.WAITING_PERMISSION, TeammateLifecycle.BLOCKED,
+                    TeammateLifecycle.STOPPED, TeammateLifecycle.FAILED,
+                ):
+                    session.transition(TeammateLifecycle.IDLE)
+                get_teammate_supervisor().persist(session)
+                if session.lifecycle_state == TeammateLifecycle.IDLE:
+                    try:
+                        from app.multiagent.lifecycle_hooks import LifecycleEvent, get_lifecycle_hook_engine
+                        idle_hook = await get_lifecycle_hook_engine().emit_async(
+                            LifecycleEvent.TEAMMATE_IDLE,
+                            {"run_id": self.run_id, "agent_id": agent.agent_id,
+                             "task_id": task.task_id},
+                        )
+                        if idle_hook.request_replan:
+                            self.control_plane.team_request_replan(
+                                self.run_id, agent.agent_id,
+                                idle_hook.feedback or "TeammateIdle hook requested replan",
+                                task_id=task.task_id,
+                            )
+                    except Exception as exc:
+                        logger.warning("[ParallelSched] TeammateIdle hook failed: %s", exc)
+        except Exception:
+            # Reservation occurred before board claim.  Always release it if
+            # a cancellation or unexpected error happens in-between.
+            self.registry.release_reservation(agent.agent_id, task.task_id)
+            raise
+
+    def _record_task_failure(
+        self,
+        *,
+        task: BoardTask,
+        agent_id: str,
+        error: str,
+        task_run_id: str,
+        history: Any,
+    ) -> RetryDecision:
+        """Persist one classified failure and its next recovery action."""
+        decision = self.retry_policy.decide(
+            error,
+            attempt=task.attempts + 1,
+            max_attempts=task.max_attempts,
+        )
+        self.board.fail(
+            task.task_id,
+            agent_id,
+            error,
+            run_id=self.run_id,
+            retryable=decision.retryable,
+            retry_delay_seconds=decision.delay_seconds,
+            failure_category=decision.category.value,
+        )
+        current = self.board.get(task.task_id, run_id=self.run_id)
+        history.update_task_run_status(task_run_id, "failed", error=error)
+        self._event(
+            "TaskRetryScheduled" if decision.retryable else "TaskFailedPermanently",
+            agent_id=agent_id,
+            task_id=task.task_id,
+            payload={
+                "task_run_id": task_run_id,
+                "attempt": current.attempts if current else task.attempts + 1,
+                "max_attempts": current.max_attempts if current else task.max_attempts,
+                "next_attempt_at": (
+                    current.next_attempt_at.isoformat()
+                    if current and current.next_attempt_at
+                    else None
+                ),
+                "error": error,
+                **decision.to_dict(),
+            },
+        )
+        return decision
+
+    @staticmethod
+    def _reject_artifacts_fail_closed(
+        artifact_store: Any,
+        artifact_ids: list[str],
+        *,
+        protected_ids: set[str] | None = None,
+    ) -> None:
+        """Best-effort rollback for evidence that must not remain verified."""
+        if artifact_store is None:
+            return
+        protected = protected_ids or set()
+        for artifact_id in dict.fromkeys(artifact_ids):
+            if artifact_id in protected:
+                continue
+            try:
+                artifact_store.mark_rejected(artifact_id)
+            except Exception as exc:
+                logger.error(
+                    "[ParallelSched] failed to reject artifact=%s: %s",
+                    artifact_id,
+                    exc,
+                )
+
+    def _record_task_state_conflict(
+        self,
+        *,
+        task: BoardTask,
+        agent_id: str,
+        task_run_id: str,
+        history: Any,
+        transition: str,
+        expected_statuses: list[BoardTaskStatus],
+        artifact_ids: list[str] | None = None,
+    ) -> None:
+        """Stop a stale completion path without overwriting newer authority."""
+        current = self.board.get(task.task_id, run_id=self.run_id)
+        actual_status = current.status if current is not None else None
+        protected_ids = (
+            set(current.produced_artifact_ids)
+            if current is not None and current.status == BoardTaskStatus.SUCCEEDED
+            else set()
+        )
+        self._reject_artifacts_fail_closed(
+            getattr(self.verifier, "artifact_store", None),
+            artifact_ids or [],
+            protected_ids=protected_ids,
+        )
+        expected = [status.value for status in expected_statuses]
+        actual = actual_status.value if actual_status is not None else "missing"
+        error = (
+            f"task_state_conflict:{transition}:"
+            f"expected={','.join(expected)}:actual={actual}"
+        )
+        task_run_status = (
+            "succeeded"
+            if actual_status == BoardTaskStatus.SUCCEEDED
+            else "cancelled"
+            if actual_status == BoardTaskStatus.CANCELLED
+            else "failed"
+        )
+        history.update_task_run_status(
+            task_run_id,
+            task_run_status,
+            error=None if task_run_status == "succeeded" else error,
+        )
+        self._event(
+            "TaskStateConflict",
+            agent_id=agent_id,
+            task_id=task.task_id,
+            payload={
+                "task_run_id": task_run_id,
+                "transition": transition,
+                "expected_statuses": expected,
+                "actual_status": actual,
+                "artifact_ids": list(artifact_ids or []),
+            },
+        )
+        logger.warning(
+            "[ParallelSched] stale completion stopped task=%s transition=%s "
+            "expected=%s actual=%s",
+            task.task_id,
+            transition,
+            expected,
+            actual,
+        )
+
+    def _task_graph_from_board(self) -> Any:
+        """Compatibility bridge for legacy callers while never passing None."""
+        from app.multiagent.task_graph import TaskGraph, TaskNode
+        graph = TaskGraph(root_task_id="task_team")
+        for task in self.board.list_by_run(self.run_id):
+            graph.add_node(TaskNode(
+                id=task.task_id, title=task.title, objective=task.objective,
+                dependencies=task.dependencies,
+                required_capabilities=task.required_capabilities,
+            ))
+        self.task_graph = graph
+        return graph
+
+    def _refresh_task_graph(self) -> None:
+        """Consume durable control-plane graph mutations before dispatch.
+
+        Teammates may create tasks while the scheduler is already running.
+        The TaskBoard mutation is durable, but an executor must receive the
+        matching latest TaskGraph as well; otherwise it rejects the new task
+        as ``task not in dag``.  The persisted snapshot is the versioned
+        authority, so refreshing it is safe across both in-process mutations
+        and process recovery.
+        """
+        from app.infrastructure.database.run_store import get_agent_run_history
+        from app.multiagent.task_graph import TaskGraph
+
+        payload = get_agent_run_history().load_task_graph(self.run_id)
+        if payload is None:
+            return
+        latest_version = int(payload.get("version", 0))
+        current_version = int(getattr(self.task_graph, "version", -1))
+        if self.task_graph is not None and latest_version <= current_version:
+            return
+        graph = TaskGraph.model_validate(payload)
+        graph.validate()
+        self.task_graph = graph
+        self._event("TaskGraphReloaded", payload={
+            "previous_version": current_version,
+            "version": latest_version,
+            "task_count": len(graph.nodes),
+        })
+
+    async def _verify_task_async(self, task: BoardTask) -> bool:
+        return await asyncio.to_thread(self._verify_task, task)
+
+    def _verify_task(self, task: BoardTask) -> bool:
+        """Verifier-owned per-task completion gate.
+
+        Legacy callers without a Verifier retain a compatibility approval
+        gate, but the TASK_TEAM facade always injects the real Verifier and
+        ArtifactStore, so production never treats executor success as proof.
+        """
+        if self.verifier is None:
+            return True
+        store = getattr(self.verifier, "artifact_store", None)
+        artifacts: dict[str, dict[str, Any]] = {}
+        if store is not None:
+            # Recompute the on-disk hash for every produced artifact before
+            # handing it to the verifier.  ``_collect_dependency_artifacts``
+            # already called ``verify_integrity`` on upstream evidence, but
+            # the task's *own* outputs were never re-hashed, so a tampered
+            # artifact (post-``mark_produced`` edit, symlink swap, partial
+            # write after a crash) would pass verification.  Fail closed: a
+            # single integrity failure rejects the whole task.
+            tampered: list[str] = []
+            for artifact in store.list_by_task(task.task_id):
+                if artifact.run_id != self.run_id:
+                    continue
+                try:
+                    if not store.verify_integrity(artifact.id):
+                        tampered.append(artifact.id)
+                        continue
+                except Exception as exc:
+                    logger.warning(
+                        "[ParallelSched] integrity probe failed task=%s art=%s: %s",
+                        task.task_id, artifact.id, exc,
+                    )
+                    tampered.append(artifact.id)
+                    continue
+                content = store.read(artifact.id)
+                artifacts[artifact.id] = {"artifact_id": artifact.id,
+                                          "content": content or "", "path": artifact.path}
+            if tampered:
+                current = self.board.get(task.task_id, run_id=self.run_id)
+                if current is not None:
+                    current.metadata["verification"] = {
+                        "verdict": "repair",
+                        "summary": "artifact integrity check failed",
+                        "tampered_artifact_ids": tampered,
+                    }
+                    self.board.add(current)
+                logger.warning(
+                    "[ParallelSched] integrity check failed task=%s arts=%s",
+                    task.task_id, tampered,
+                )
+                return False
+        node = self.task_graph.nodes.get(task.task_id) if self.task_graph else None
+        requires_artifact = bool(node and getattr(node, "output_contract", None)
+                                 and getattr(node.output_contract, "artifact_type", "any") != "any")
+        if requires_artifact and not artifacts:
+            return False
+        try:
+            checks = None
+            if node is not None:
+                from app.multiagent.verifier import VerificationPlan
+                checks = VerificationPlan.from_output_contract(
+                    node.output_contract, workspace_root=(store.root_path if store else None),
+                ).to_checks()
+            result = self.verifier.validate(goal=task.objective, artifacts=artifacts,
+                                            checks=checks)
+            from dataclasses import asdict, is_dataclass
+            current = self.board.get(task.task_id, run_id=self.run_id)
+            if current is not None:
+                def dump(value: Any) -> Any:
+                    if is_dataclass(value):
+                        return asdict(value)
+                    if hasattr(value, "model_dump"):
+                        return value.model_dump(mode="json")
+                    return value
+                current.metadata["verification"] = {
+                    "verdict": result.verdict.value,
+                    "summary": result.summary,
+                    "failed_criteria": [dump(item) for item in result.failed_criteria],
+                    "evidence": [dump(item) for item in result.evidence],
+                    "proposed_tasks": [dump(item) for item in result.proposed_tasks],
+                }
+                self.board.add(current)
+            return result.verdict.value == "pass"
+        except Exception as exc:
+            logger.warning("[ParallelSched] verifier failed task=%s: %s", task.task_id, exc)
+            return False
+
+    def _collect_dependency_artifacts(self, task: BoardTask) -> tuple[list[str], list[dict[str, Any]]]:
+        """Resolve verified dependencies plus explicit repair source evidence."""
+        store = getattr(self.verifier, "artifact_store", None)
+        if store is None:
+            return [], []
+        ids: list[str] = []
+        refs: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def append_artifact(
+            artifact_id: str,
+            *,
+            purpose: str,
+            require_verified: bool,
+        ) -> None:
+            if artifact_id in seen:
+                return
+            artifact = store.get(artifact_id)
+            if artifact is None:
+                raise RuntimeError(f"artifact_not_found:{artifact_id}")
+            if artifact.run_id != self.run_id:
+                raise RuntimeError(f"artifact_wrong_run:{artifact_id}")
+            status = getattr(artifact.status, "value", artifact.status)
+            if require_verified and status != "verified":
+                raise RuntimeError(f"artifact_not_verified:{artifact_id}")
+            if not store.verify_integrity(artifact_id):
+                raise RuntimeError(f"artifact_integrity_failed:{artifact_id}")
+            seen.add(artifact_id)
+            ids.append(artifact_id)
+            refs.append({
+                "artifact_id": artifact.id,
+                "task_id": artifact.task_id,
+                "producing_agent_id": artifact.produced_by,
+                "type": artifact.type.value,
+                "path": artifact.path,
+                "content_hash": artifact.content_hash,
+                "version": artifact.version,
+                "commit_sha": artifact.commit_sha or artifact.metadata.get("commit_sha"),
+                "verification_state": status,
+                "purpose": purpose,
+                "created_at": artifact.created_at.isoformat(),
+                "summary": artifact.metadata.get("summary", ""),
+            })
+
+        for dependency_id in task.dependencies:
+            dependency = self.board.get(dependency_id, run_id=self.run_id)
+            if dependency is None or dependency.status != BoardTaskStatus.SUCCEEDED:
+                raise RuntimeError(f"dependency_not_verified:{dependency_id}")
+            for artifact_id in dependency.produced_artifact_ids:
+                append_artifact(
+                    artifact_id,
+                    purpose="dependency",
+                    require_verified=True,
+                )
+        for artifact_id in task.metadata.get("source_artifact_ids", []):
+            append_artifact(
+                str(artifact_id),
+                purpose="repair_source",
+                require_verified=False,
+            )
+        return ids, refs
+
+    # ===== å·¥å…· =====
+
+    def _event(
+        self,
+        event_type: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        agent_id: str | None = None,
+        task_id: str | None = None,
+    ) -> None:
+        from app.infrastructure.database.run_store import (
+            get_agent_run_history,
+            make_run_event_id,
+        )
+
+        get_agent_run_history().record_event(
+            event_id=make_run_event_id(),
+            run_id=self.run_id,
+            event_type=event_type,
+            agent_id=agent_id,
+            task_id=task_id,
+            timestamp=datetime.now(UTC),
+            payload=payload or {},
+        )
+
+    def _finalize(
+        self, rounds: int, status: str, error: str | None = None,
+    ) -> ParallelRunResult:
+        summarize = self.board.summary(self.run_id)
+        result = ParallelRunResult(
+            status=status,
+            rounds=rounds,
+            total_tasks=summarize.get("total", 0),
+            # Scheduler completion counts produced tasks; final verified
+            # completion remains visible separately in ``summary``.
+            succeeded=summarize.get(BoardTaskStatus.SUCCEEDED.value, 0),
+            failed=summarize.get(BoardTaskStatus.FAILED.value, 0),
+            error=error,
+            summary=summarize,
+        )
+        self._event("SchedulerStopped", payload=result.to_dict())
+        return result
+
+    def _finalize_verified_run(self, rounds: int) -> ParallelRunResult:
+        """Apply run-level gates after every task is verifier-owned SUCCEEDED."""
+        pending_permissions = self.permission_broker.list_pending(self.run_id)
+        if pending_permissions:
+            return self._finalize(rounds, ScheduleStatus.WAITING_HUMAN.value,
+                                  "pending_high_risk_permissions")
+        if any(task.metadata.get("merge_conflicts")
+               for task in self.board.list_by_run(self.run_id)):
+            return self._finalize(rounds, ScheduleStatus.FAILED.value,
+                                  "unresolved_merge_conflicts")
+        if self.integration_manager is not None:
+            root = self.task_graph.nodes.get(self.task_graph.root_task_id) if self.task_graph else None
+            plan = self._integration_verification_plan(root)
+            for check in plan.checks:
+                payload = check.observable_payload()
+                self._event("IntegrationVerificationStarted", payload=payload)
+                try:
+                    result = self.integration_manager.verify_check(check)
+                except Exception as exc:
+                    self._event("IntegrationVerificationUnavailable", payload={
+                        **payload,
+                        "error": str(exc),
+                    })
+                    return self._finalize(
+                        rounds,
+                        ScheduleStatus.WAITING_HUMAN.value,
+                        "integration_verification_unavailable",
+                    )
+                self._event("IntegrationVerificationCompleted", payload={
+                    **payload,
+                    "returncode": result.returncode,
+                    "cancelled": result.cancelled,
+                    "timed_out": result.timed_out,
+                    "duration_seconds": result.duration_seconds,
+                    "stdout_preview": result.stdout[-2_000:],
+                    "stderr_preview": result.stderr[-2_000:],
+                })
+                if result.returncode != 0 or result.cancelled or result.timed_out:
+                    return self._finalize(
+                        rounds,
+                        ScheduleStatus.FAILED.value,
+                        f"integration_verification_failed:{check.label}",
+                    )
+            if plan.missing_requirements:
+                self._event("IntegrationVerificationUnavailable", payload={
+                    "missing_requirements": list(plan.missing_requirements),
+                    "source": plan.source,
+                })
+                return self._finalize(
+                    rounds,
+                    ScheduleStatus.WAITING_HUMAN.value,
+                    "integration_verification_requirements_missing",
+                )
+        return self._finalize(rounds, ScheduleStatus.COMPLETED.value)
+
+    def _integration_verification_plan(self, root: Any) -> Any:
+        from app.multiagent.git_workspace import (
+            IntegrationVerificationCheck,
+            IntegrationVerificationPlan,
+        )
+
+        metadata = root.metadata if root is not None else {}
+        configured = metadata.get("integration_test_commands")
+        if configured is None and metadata.get("integration_test_argv"):
+            configured = [metadata["integration_test_argv"]]
+        if configured is None:
+            return self.integration_manager.discover_verification_plan()
+        if not isinstance(configured, list):
+            return IntegrationVerificationPlan(
+                missing_requirements=("invalid_integration_test_commands",),
+                source="configured",
+            )
+        checks: list[IntegrationVerificationCheck] = []
+        missing: list[str] = []
+        for index, item in enumerate(configured):
+            if isinstance(item, list):
+                argv = item
+                label = f"Configured check {index + 1}"
+                cwd = "."
+                timeout = 300.0
+            elif isinstance(item, dict):
+                argv = item.get("argv")
+                label = str(item.get("label") or f"Configured check {index + 1}")
+                cwd = str(item.get("cwd") or ".")
+                try:
+                    timeout = float(item.get("timeout_seconds") or 300.0)
+                except (TypeError, ValueError):
+                    missing.append(
+                        f"configured_check_{index + 1}:invalid_timeout"
+                    )
+                    continue
+            else:
+                missing.append(f"configured_check_{index + 1}:invalid_shape")
+                continue
+            relative_cwd = Path(cwd.replace("\\", "/"))
+            if (
+                len(cwd) > 512
+                or relative_cwd.is_absolute()
+                or ".." in relative_cwd.parts
+                or (
+                    relative_cwd.parts
+                    and ":" in relative_cwd.parts[0]
+                )
+            ):
+                missing.append(f"configured_check_{index + 1}:unsafe_cwd")
+                continue
+            if not math.isfinite(timeout):
+                missing.append(f"configured_check_{index + 1}:invalid_timeout")
+                continue
+            if (
+                not isinstance(argv, list)
+                or not argv
+                or not all(isinstance(part, str) and part for part in argv)
+            ):
+                missing.append(f"configured_check_{index + 1}:invalid_argv")
+                continue
+            if not self._safe_integration_argv(argv):
+                missing.append(f"configured_check_{index + 1}:unsafe_argv")
+                continue
+            dependency_source = None
+            executable = self._integration_executable(argv[0])
+            dependency_resolver = getattr(
+                self.integration_manager,
+                "node_dependency_source",
+                None,
+            )
+            if (
+                executable in {"npm", "pnpm", "yarn"}
+                and callable(dependency_resolver)
+            ):
+                dependency_source = dependency_resolver(
+                    relative_cwd.as_posix()
+                )
+                if dependency_source is None:
+                    missing.append(
+                        f"configured_check_{index + 1}:"
+                        "node_dependencies_missing"
+                    )
+                    continue
+            checks.append(IntegrationVerificationCheck(
+                label=label,
+                argv=tuple(argv),
+                cwd_relative=relative_cwd.as_posix(),
+                timeout_seconds=max(1.0, min(timeout, 3_600.0)),
+                dependency_source=(
+                    str(dependency_source)
+                    if dependency_source is not None
+                    else None
+                ),
+            ))
+        if not checks and not missing:
+            missing.append("configured_integration_checks_empty")
+        return IntegrationVerificationPlan(
+            checks=tuple(checks),
+            missing_requirements=tuple(missing),
+            source="configured",
+        )
+
+    @staticmethod
+    def _integration_executable(value: str) -> str:
+        executable = value.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        for suffix in (".exe", ".cmd", ".bat"):
+            executable = executable.removesuffix(suffix)
+        return executable
+
+    @classmethod
+    def _safe_integration_argv(cls, argv: list[str]) -> bool:
+        executable = cls._integration_executable(argv[0])
+        args = [part.lower() for part in argv[1:]]
+        if executable in {"pytest"}:
+            return True
+        if executable in {"python", "python3"}:
+            return len(args) >= 2 and args[0] == "-m" and args[1] in {
+                "pytest",
+                "unittest",
+                "compileall",
+            }
+        if executable in {"npm", "pnpm", "yarn"}:
+            scripts = {"test", "build", "lint", "typecheck", "check"}
+            return bool(args) and (
+                args[0] in scripts
+                or len(args) >= 2 and args[0] == "run" and args[1] in scripts
+            )
+        if executable == "cargo":
+            return bool(args) and args[0] in {"test", "check", "clippy"}
+        if executable == "go":
+            return bool(args) and args[0] == "test"
+        if executable in {"mvn", "gradle", "gradlew"}:
+            return any(arg in {"test", "check", "verify"} for arg in args)
+        if executable == "make":
+            return bool(args) and args[0] in {"test", "check", "verify", "lint"}
+        return False
+
+    # ===== ä»»åŠ¡æ¿ä¸ DAG åŒæ­¥ =====
+
+    @classmethod
+    def sync_from_task_graph(
+        cls, dag: Any, board: TaskBoard, run_id: str,
+    ) -> None:
+        """æŠŠ TaskGraph çš„èŠ‚ç‚¹åŒæ­¥åˆ° TaskBoardï¼ˆä»…åŒæ­¥ PENDING èŠ‚ç‚¹ï¼‰ã€‚
+
+        åœ¨å¹¶è¡Œè°ƒåº¦å¼€å§‹å‰è°ƒç”¨ï¼Œè®© BoardTask ä¸ TaskNode 1:1 å¯¹åº”ã€‚
+        """
+        for node_id, node in dag.nodes.items():
+            existing = board.get(node_id, run_id=run_id)
+            if existing is not None:
+                continue
+            board.create_task(
+                task_id=node_id,
+                run_id=run_id,
+                title=node.title or node_id,
+                objective=node.objective,
+                dependencies=list(node.dependencies),
+                required_capabilities=list(node.required_capabilities),
+                priority=getattr(node, "priority", 0),
+                max_attempts=getattr(node, "max_attempts", 3),
+            )
+
+    @staticmethod
+    def sync_back_to_dag(dag: Any, board: TaskBoard, run_id: str) -> None:
+        """æŠŠ BoardTask çš„æœ€ç»ˆçŠ¶æ€å›å†™åˆ° TaskGraphã€‚
+
+        èµ°åˆæ³•è½¬æ¢é“¾ï¼šPENDING â†’ READY â†’ RUNNING â†’ SUCCEEDED/FAILEDã€‚
+        """
+        from app.multiagent.task_graph import TaskNodeStatus
+        for t in board.list_by_run(run_id):
+            node = dag.nodes.get(t.task_id)
+            if node is None:
+                continue
+            target = None
+            if t.status == BoardTaskStatus.SUCCEEDED:
+                target = TaskNodeStatus.SUCCEEDED
+            elif t.status == BoardTaskStatus.FAILED:
+                target = TaskNodeStatus.FAILED
+            elif t.status in (BoardTaskStatus.RUNNING, BoardTaskStatus.CLAIMED):
+                target = TaskNodeStatus.RUNNING
+            else:
+                continue
+            # ç”¨ _step_to æ¨è¿›åˆ° target
+            _step_to(dag, t.task_id, target)
+            for art in t.produced_artifact_ids:
+                node = dag.nodes.get(t.task_id)
+                if art not in node.output_artifact_ids:
+                    dag.accept_artifact(t.task_id, art)
+
+
+def _step_to(dag: Any, node_id: str, target: Any) -> None:
+    """æŒ‰åˆæ³•è½¬æ¢é“¾æ¨è¿›èŠ‚ç‚¹çŠ¶æ€åˆ° targetã€‚
+
+    é“¾ï¼šPENDING â†’ READY â†’ RUNNING â†’ SUCCEEDED/FAILED
+    """
+    from app.multiagent.task_graph import TaskNodeStatus
+    node = dag.nodes.get(node_id)
+    if node is None or node.status == target:
+        return
+    # PENDING â†’ READY
+    if node.status == TaskNodeStatus.PENDING:
+        dag.update_status(node_id, TaskNodeStatus.READY)
+    # READY â†’ RUNNING
+    node = dag.nodes.get(node_id)
+    if node.status == TaskNodeStatus.READY and target != TaskNodeStatus.READY:
+        dag.update_status(node_id, TaskNodeStatus.RUNNING)
+    node = dag.nodes.get(node_id)
+    # RUNNING â†’ target (SUCCEEDED/FAILED)
+    if node.status == TaskNodeStatus.RUNNING and target in (
+        TaskNodeStatus.SUCCEEDED, TaskNodeStatus.FAILED
+    ):
+        dag.update_status(node_id, target)
