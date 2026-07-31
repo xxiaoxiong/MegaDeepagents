@@ -27,6 +27,52 @@ export class ApiError extends Error {
   }
 }
 
+export interface TextContentChunk {
+  path: string;
+  content: string;
+  encoding: "utf-8";
+  truncated: boolean;
+  offset: number;
+  next_offset: number | null;
+  total_bytes: number;
+  complete: boolean;
+}
+
+export interface CompleteTextContent {
+  path: string;
+  content: string;
+  totalBytes: number;
+}
+
+async function readCompleteText(
+  loadChunk: (offset: number) => Promise<TextContentChunk>,
+  onProgress?: (loadedBytes: number, totalBytes: number) => void,
+): Promise<CompleteTextContent> {
+  const parts: string[] = [];
+  let offset = 0;
+  let path = "";
+  let totalBytes = 0;
+
+  for (;;) {
+    const chunk = await loadChunk(offset);
+    if (chunk.offset !== offset) {
+      throw new ApiError(502, "文件分块游标不连续，已停止读取");
+    }
+    path ||= chunk.path;
+    totalBytes = chunk.total_bytes;
+    parts.push(chunk.content);
+    const loaded = chunk.next_offset ?? totalBytes;
+    onProgress?.(loaded, totalBytes);
+    if (chunk.complete || chunk.next_offset == null) break;
+    if (chunk.next_offset <= offset) {
+      throw new ApiError(502, "文件分块游标未前进，已停止读取");
+    }
+    offset = chunk.next_offset;
+  }
+
+  return { path, content: parts.join(""), totalBytes };
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const base = configuredBase();
   if (
@@ -93,9 +139,47 @@ export const api = {
     request<RunExecution>(`/api/v1/runs/${runId}/execution`),
   listArtifacts: (runId: string) =>
     request<Artifact[]>(`/api/v1/runs/${runId}/artifacts`),
-  artifactContent: (runId: string, artifactId: string) =>
-    request<{ content: string; truncated: boolean; path: string }>(
-      `/api/v1/runs/${runId}/artifacts/${artifactId}/content`,
+  artifactContent: (
+    runId: string,
+    artifactId: string,
+    offset = 0,
+    limit = 256 * 1024,
+    signal?: AbortSignal,
+  ) =>
+    request<TextContentChunk & { artifact_id: string }>(
+      `/api/v1/runs/${runId}/artifacts/${artifactId}/content?offset=${offset}&limit=${limit}`,
+      { signal },
+    ),
+  artifactTextContent: (
+    runId: string,
+    artifactId: string,
+    signal?: AbortSignal,
+    onProgress?: (loadedBytes: number, totalBytes: number) => void,
+  ) =>
+    readCompleteText(
+      (offset) => api.artifactContent(runId, artifactId, offset, 256 * 1024, signal),
+      onProgress,
+    ),
+  workspaceFileContent: (
+    runId: string,
+    path: string,
+    offset = 0,
+    limit = 256 * 1024,
+    signal?: AbortSignal,
+  ) =>
+    request<TextContentChunk>(
+      `/api/v1/runs/${runId}/files/content?path=${encodeURIComponent(path)}&offset=${offset}&limit=${limit}`,
+      { signal },
+    ),
+  workspaceFileTextContent: (
+    runId: string,
+    path: string,
+    signal?: AbortSignal,
+    onProgress?: (loadedBytes: number, totalBytes: number) => void,
+  ) =>
+    readCompleteText(
+      (offset) => api.workspaceFileContent(runId, path, offset, 256 * 1024, signal),
+      onProgress,
     ),
   artifactLineage: (runId: string, artifactId: string) =>
     request<Artifact[]>(

@@ -274,7 +274,7 @@ class GovernedRunGraph:
                     time.sleep(decision.delay_seconds)
             if graph is None:
                 # Degradation path: when the LLM Planner exhausts all retries,
-                # fall back to a minimal two-step plan (plan → execute) instead
+                # fall back to a minimal role-safe plan (plan → execute → verify) instead
                 # of killing the Run.  This gives the runtime a chance to make
                 # progress even when the model produces unparseable output.
                 from app.multiagent.planner import build_fallback_plan

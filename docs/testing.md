@@ -7,6 +7,7 @@ python -m compileall -q app
 pytest -m "not live_model and not real_langsmith"
 npm --prefix frontend test
 npm --prefix frontend run build
+npx playwright test
 ```
 
 ## 覆盖重点
@@ -18,6 +19,8 @@ npm --prefix frontend run build
 - 取消：迟到结果、停止 Agent、冷取消和冷恢复。
 - Git：worktree 隔离、commit/integration 门禁、仓库清单自动发现、验证命令白名单与环境缺失恢复。
 - 前端：API 序列化与错误、SSE reducer 去重排序、流式消息、集成验证状态渲染、生产构建。
+- 视觉 E2E：GitHub Actions 中的真实 Chromium 覆盖桌面与移动视口、并行 Agent 状态、
+  紧凑工具/产物活动、完整 Artifact 分块预览和 `read_file` 完整内容，并上传截图证据。
 
 `live_model` 和 `real_langsmith` 需要外部凭证，默认跳过。测试专用 Executor 只能通过依赖
 注入进入 Root Graph；生产代码没有 FakeExecutor fallback。

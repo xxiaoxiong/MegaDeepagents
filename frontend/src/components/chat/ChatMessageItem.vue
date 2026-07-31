@@ -5,6 +5,7 @@ import type {
   ApprovalChatMessage,
   ArtifactChatMessage,
   AssistantChatMessage,
+  Artifact,
   ChatMessage,
   CollaborationChatMessage,
   StatusChatMessage,
@@ -22,6 +23,7 @@ import { stripThinkBlocks } from "@/lib/sanitize";
 const props = defineProps<{
   message: ChatMessage;
   runId: string;
+  artifact?: Artifact | null;
 }>();
 
 // 产出卡片点击不再跳转，而是冒泡到 ChatView 由右侧抽屉展示文件内容。
@@ -122,6 +124,7 @@ const collaborationMsg = computed(() =>
   <!-- 工具调用卡片：占满宽度 -->
   <div v-else-if="toolCallMsg" class="msg-row inline">
     <ToolCallCard
+      :run-id="runId"
       :tool-name="toolCallMsg.toolName"
       :args="toolCallMsg.args"
       :status="toolCallMsg.status"
@@ -137,6 +140,9 @@ const collaborationMsg = computed(() =>
     <ArtifactCard
       :run-id="runId"
       :artifact-id="artifactMsg.artifactId"
+      :path="artifact?.path || artifactMsg.path"
+      :artifact-type="artifact?.type"
+      :size-bytes="artifact?.size_bytes"
       :task-id="artifactMsg.taskId"
       :produced-by="artifactMsg.producedBy"
       @open="emit('open-artifact', $event)"

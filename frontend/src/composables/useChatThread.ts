@@ -228,6 +228,10 @@ function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex)
         id: env.event_id,
         type: "artifact",
         artifactId,
+        path:
+          (p.path as string | null) ??
+          (p.relative_path as string | null) ??
+          null,
         taskId:
           (env.task_id as string | null) ??
           (p.task_id as string | null) ??
@@ -276,6 +280,7 @@ function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex)
           id: `${env.event_id}:artifact:${artifactId}`,
           type: "artifact",
           artifactId,
+          path: null,
           taskId:
             (env.task_id as string | null) ??
             (p.task_id as string | null) ??
@@ -305,6 +310,53 @@ function applyOne(messages: ChatMessage[], env: EventEnvelope, idx: ThreadIndex)
         type: "status",
         tone: "error",
         text: `${agentLabel(env, p)} 的任务执行失败${taskId ? ` · ${String(taskId)}` : ""}${error ? `：${error}` : ""}`,
+        createdAt: env.timestamp,
+      });
+      break;
+    }
+    case "taskretryscheduled": {
+      const taskId = env.task_id ?? p.task_id;
+      const attempt = Number(p.attempt ?? 0);
+      const maxAttempts = Number(p.max_attempts ?? 0);
+      const error = String(p.error ?? p.message ?? "").trim();
+      messages.push({
+        id: env.event_id,
+        type: "status",
+        tone: "warn",
+        text: `${agentLabel(env, p)} 遇到临时问题，正在自动重试${attempt ? `（${attempt}/${maxAttempts || "?"}）` : ""}${taskId ? ` · ${String(taskId)}` : ""}${error ? `：${error}` : ""}`,
+        createdAt: env.timestamp,
+      });
+      break;
+    }
+    case "taskfailedpermanently": {
+      const taskId = env.task_id ?? p.task_id;
+      const error = String(p.error ?? p.message ?? "").trim();
+      messages.push({
+        id: env.event_id,
+        type: "status",
+        tone: "error",
+        text: `${agentLabel(env, p)} 的任务已停止重试${taskId ? ` · ${String(taskId)}` : ""}${error ? `：${error}` : ""}`,
+        createdAt: env.timestamp,
+      });
+      break;
+    }
+    case "tasktimedout": {
+      const taskId = env.task_id ?? p.task_id;
+      messages.push({
+        id: env.event_id,
+        type: "status",
+        tone: "warn",
+        text: `${agentLabel(env, p)} 本轮执行超时，运行时正在回收并判断是否重试${taskId ? ` · ${String(taskId)}` : ""}`,
+        createdAt: env.timestamp,
+      });
+      break;
+    }
+    case "planningdegraded": {
+      messages.push({
+        id: env.event_id,
+        type: "status",
+        tone: "warn",
+        text: "规划模型返回异常，已切换到安全降级计划继续执行",
         createdAt: env.timestamp,
       });
       break;

@@ -39,8 +39,14 @@ Git 路径；浏览器路径本身不会上传仓库。
   `/runs/{run_id}/worktrees`、`/runs/{run_id}/git`。
 - Settings：`GET /settings`，密钥只返回是否已配置。
 
-Artifact content 最大预览 512 KiB；二进制返回 415；download 与 content 都会校验解析后
-路径仍位于 Run workspace 内。
+Artifact content 使用 `offset` / `limit`（单块最大 512 KiB）分页返回，响应包含
+`next_offset`、`total_bytes` 与 `complete`；前端会连续读取到 `complete=true`，因此不再
+静默截断大文本。二进制返回 415；download 与 content 都会校验解析后路径仍位于 Run
+workspace 内。
+
+`GET /runs/{run_id}/files/content?path=...` 为工具活动提供同样的分页文本读取能力。
+它只接受相对路径，并在解析 symlink 后再次验证文件仍位于该 Run workspace；绝对路径、
+路径逃逸和跨 Run 读取会被拒绝。
 
 ### Execution intelligence
 

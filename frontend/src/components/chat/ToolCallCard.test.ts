@@ -1,6 +1,7 @@
 import { createApp, h, nextTick } from "vue";
 import { describe, expect, it, vi } from "vitest";
 import ToolCallCard from "@/components/chat/ToolCallCard.vue";
+import { api } from "@/lib/api";
 
 describe("ToolCallCard", () => {
   it("stays a compact one-line summary until the user expands details", async () => {
@@ -8,6 +9,7 @@ describe("ToolCallCard", () => {
     const app = createApp({
       render: () =>
         h(ToolCallCard, {
+          runId: "run_1",
           toolName: "read_file",
           args: { file_path: "README.md" },
           status: "ok",
@@ -19,22 +21,31 @@ describe("ToolCallCard", () => {
     });
 
     try {
+      vi.spyOn(api, "workspaceFileTextContent").mockResolvedValue({
+        path: "README.md",
+        content: "# MegaDeepagents\ncomplete file",
+        totalBytes: 31,
+      });
       app.mount(container);
       const details = container.querySelector("details");
       const summary = container.querySelector("summary");
       expect(details?.open).toBe(false);
-      expect(summary?.textContent).toContain("read_file");
+      expect(summary?.textContent).toContain("读取 README.md");
       expect(summary?.textContent).toContain("Coder");
-      expect(summary?.textContent).toContain("已完成");
+      expect(summary?.textContent).toContain("完成");
       expect(summary?.textContent).toContain("125ms");
       expect(container.querySelector(".tool-details")).not.toBeNull();
 
-      summary?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      if (details) {
+        details.open = true;
+        details.dispatchEvent(new Event("toggle"));
+      }
       await nextTick();
       expect(details?.open).toBe(true);
       expect(container.textContent).toContain("# MegaDeepagents");
     } finally {
       app.unmount();
+      vi.restoreAllMocks();
     }
   });
 
@@ -45,6 +56,7 @@ describe("ToolCallCard", () => {
     const app = createApp({
       render: () =>
         h(ToolCallCard, {
+          runId: "run_1",
           toolName: "read_file",
           args: {},
           status: "running",
@@ -58,6 +70,49 @@ describe("ToolCallCard", () => {
     } finally {
       app.unmount();
       vi.useRealTimers();
+    }
+  });
+
+  it("loads the complete governed workspace file when a read tool is expanded", async () => {
+    const fullContent = "line\n".repeat(2_000);
+    const loader = vi.spyOn(api, "workspaceFileTextContent").mockResolvedValue({
+      path: "src/large.ts",
+      content: fullContent,
+      totalBytes: fullContent.length,
+    });
+    const container = document.createElement("div");
+    const app = createApp({
+      render: () =>
+        h(ToolCallCard, {
+          runId: "run_full",
+          toolName: "read_file",
+          args: { file_path: "src/large.ts" },
+          status: "ok",
+          resultPreview: "line",
+        }),
+    });
+
+    try {
+      app.mount(container);
+      const details = container.querySelector("details");
+      if (details) {
+        details.open = true;
+        details.dispatchEvent(new Event("toggle"));
+      }
+      await nextTick();
+      await Promise.resolve();
+      await nextTick();
+      expect(loader).toHaveBeenCalledWith(
+        "run_full",
+        "src/large.ts",
+        expect.any(AbortSignal),
+        expect.any(Function),
+      );
+      expect(container.querySelector(".tool-result-text")?.textContent).toBe(fullContent);
+      expect(container.textContent).toContain("src/large.ts");
+    } finally {
+      app.unmount();
+      vi.restoreAllMocks();
     }
   });
 });

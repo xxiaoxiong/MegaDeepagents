@@ -110,6 +110,7 @@ New clients should use `/api/v1` only.
 | Tasks / graph | `GET /api/v1/runs/{id}/tasks`, `task-graph` |
 | Agents / messages | `GET /api/v1/runs/{id}/agents`, `POST .../messages` |
 | Artifacts | `GET /api/v1/runs/{id}/artifacts`, `.../content`, `.../download` |
+| Workspace files | `GET /api/v1/runs/{id}/files/content?path=...` (Run-scoped) |
 | Approvals | `GET/POST .../permissions`, `.../plans` |
 | Verification / errors / Git | `GET .../verification`, `errors`, `git`, `worktrees` |
 

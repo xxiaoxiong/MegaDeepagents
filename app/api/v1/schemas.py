@@ -235,6 +235,21 @@ class ArtifactContentResponse(ApiModel):
     content: str
     encoding: Literal["utf-8"]
     truncated: bool = False
+    offset: int = 0
+    next_offset: int | None = None
+    total_bytes: int = 0
+    complete: bool = True
+
+
+class WorkspaceFileContentResponse(ApiModel):
+    path: str
+    content: str
+    encoding: Literal["utf-8"]
+    truncated: bool = False
+    offset: int = 0
+    next_offset: int | None = None
+    total_bytes: int = 0
+    complete: bool = True
 
 
 class TaskGraphResponse(ApiModel):

@@ -33,6 +33,7 @@ from app.api.v1.schemas import (
     SettingsResponse,
     TaskGraphResponse,
     TaskResponse,
+    WorkspaceFileContentResponse,
 )
 from app.application.runs.service import get_run_service
 from app.core.config import settings
@@ -478,20 +479,79 @@ def _artifact_path(run: dict, artifact: dict) -> Path:
     return candidate
 
 
-def _artifact_content(artifact_id: str, run: dict, artifact: dict):
+_TEXT_CHUNK_BYTES = 256 * 1024
+_MAX_TEXT_CHUNK_BYTES = 512 * 1024
+
+
+def _read_text_chunk(
+    candidate: Path,
+    *,
+    display_path: str,
+    offset: int,
+    limit: int,
+) -> dict:
+    """Read one bounded UTF-8 chunk without clipping a multibyte character.
+
+    Large text files are intentionally paged instead of loaded into the API
+    process in one allocation.  The UI follows ``next_offset`` until
+    ``complete`` so users still see the whole file.
+    """
+    total_bytes = candidate.stat().st_size
+    if offset > total_bytes:
+        raise HTTPException(status_code=416, detail="Content offset is past end of file")
+
+    chunk_limit = min(max(4, limit), _MAX_TEXT_CHUNK_BYTES)
+    with candidate.open("rb") as handle:
+        handle.seek(offset)
+        raw = handle.read(chunk_limit)
+
+    if b"\x00" in raw:
+        raise HTTPException(status_code=415, detail="Binary file has no text preview")
+
+    # ``offset`` always comes from the previous response, so it is a UTF-8
+    # boundary.  Trim only an incomplete trailing code point and return that
+    # byte position as the next cursor.
+    consumed = len(raw)
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        if exc.reason == "unexpected end of data" and exc.start >= len(raw) - 4:
+            consumed = exc.start
+            content = raw[:consumed].decode("utf-8")
+        else:
+            content = raw.decode("utf-8", errors="replace")
+
+    next_offset = offset + consumed
+    complete = next_offset >= total_bytes
+    return {
+        "path": display_path,
+        "content": content,
+        "encoding": "utf-8",
+        "truncated": not complete,
+        "offset": offset,
+        "next_offset": None if complete else next_offset,
+        "total_bytes": total_bytes,
+        "complete": complete,
+    }
+
+
+def _artifact_content(
+    artifact_id: str,
+    run: dict,
+    artifact: dict,
+    *,
+    offset: int,
+    limit: int,
+):
     candidate = _artifact_path(run, artifact)
-    max_bytes = 512 * 1024
-    raw = candidate.read_bytes()
-    truncated = len(raw) > max_bytes
-    sample = raw[:max_bytes]
-    if b"\x00" in sample:
-        raise HTTPException(status_code=415, detail="Binary artifact has no text preview")
     return {
         "artifact_id": artifact_id,
-        "path": artifact["path"],
-        "content": sample.decode("utf-8", errors="replace"),
-        "encoding": "utf-8",
-        "truncated": truncated,
+        **_read_text_chunk(
+            candidate,
+            display_path=artifact["path"],
+            offset=offset,
+            limit=limit,
+        ),
     }
 
 
@@ -499,17 +559,62 @@ def _artifact_content(artifact_id: str, run: dict, artifact: dict):
     "/runs/{run_id}/artifacts/{artifact_id}/content",
     response_model=ArtifactContentResponse,
 )
-def get_artifact_content(run_id: str, artifact_id: str):
+def get_artifact_content(
+    run_id: str,
+    artifact_id: str,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=_TEXT_CHUNK_BYTES, ge=4, le=_MAX_TEXT_CHUNK_BYTES),
+):
     run, artifact = _artifact(run_id, artifact_id)
-    return _artifact_content(artifact_id, run, artifact)
+    return _artifact_content(artifact_id, run, artifact, offset=offset, limit=limit)
 
 
 @router.get(
     "/artifacts/{artifact_id}/content", response_model=ArtifactContentResponse
 )
-def get_artifact_content_by_id(artifact_id: str):
+def get_artifact_content_by_id(
+    artifact_id: str,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=_TEXT_CHUNK_BYTES, ge=4, le=_MAX_TEXT_CHUNK_BYTES),
+):
     run, artifact = _global_artifact(artifact_id)
-    return _artifact_content(artifact_id, run, artifact)
+    return _artifact_content(artifact_id, run, artifact, offset=offset, limit=limit)
+
+
+def _workspace_file_path(run: dict, relative_path: str) -> Path:
+    requested = Path(relative_path)
+    if requested.is_absolute():
+        raise HTTPException(status_code=403, detail="Workspace file path must be relative")
+    workspace = Path(run["workspace_root"]).resolve()
+    candidate = (workspace / requested).resolve()
+    try:
+        candidate.relative_to(workspace)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="Workspace file path escaped workspace") from exc
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail="Workspace file is missing")
+    return candidate
+
+
+@router.get(
+    "/runs/{run_id}/files/content",
+    response_model=WorkspaceFileContentResponse,
+)
+def get_workspace_file_content(
+    run_id: str,
+    path: str = Query(min_length=1),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=_TEXT_CHUNK_BYTES, ge=4, le=_MAX_TEXT_CHUNK_BYTES),
+):
+    """Return text read by a governed file tool, scoped to this Run only."""
+    run = _require_run(run_id)
+    candidate = _workspace_file_path(run, path)
+    return _read_text_chunk(
+        candidate,
+        display_path=path.replace("\\", "/"),
+        offset=offset,
+        limit=limit,
+    )
 
 
 @router.get(

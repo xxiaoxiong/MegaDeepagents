@@ -41,7 +41,8 @@ SQLite + replayable Event Envelope
 - SQLite 使用统一连接、WAL、busy timeout 和事务，支持进程重启后的 Run 恢复。
 - 生命周期、工具、心跳、验证、重试和失败都会进入可重放审计流；控制台可查看完整 payload。
 - Mission Control 将持久事件重放为每个 Agent 的执行泳道、关键路径、并行效率和注意项。
-- Artifact 可直接预览、下载、追溯版本，并通过深链接交付给用户。
+- Artifact 以文件名紧凑呈现，可分块加载完整文本、下载、追溯版本，并通过深链接交付给用户。
+- 工具活动默认保持单行；展开 `read_file` 时会在 Run 工作区边界内读取完整文件，参数降为次级信息。
 - 失败按限流、超时、网络、权限、契约等分类，有界指数退避；操作者可恢复单个或全部失败 Task。
 - Run 健康诊断会明确标记正常、待处理、卡住、失败和完成，不再依赖“盯着页面猜”。
 - 代码任务可以绑定 Git 仓库，每个 Agent 使用独立 worktree，集成通过受治理队列完成。
@@ -101,6 +102,7 @@ docker compose up --build
 | Task / Graph | `GET /api/v1/runs/{id}/tasks`、`task-graph` |
 | Agent / 消息 | `GET /api/v1/runs/{id}/agents`、`POST .../messages` |
 | Artifact | `GET /api/v1/runs/{id}/artifacts`、`.../content`、`.../download` |
+| 工作区文件 | `GET /api/v1/runs/{id}/files/content?path=...`（受 Run 边界保护） |
 | 审批 | `GET/POST .../permissions`、`.../plans` |
 | 验证 / 错误 / Git | `GET .../verification`、`errors`、`git`、`worktrees` |
 

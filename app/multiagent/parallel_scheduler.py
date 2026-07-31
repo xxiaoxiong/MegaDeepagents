@@ -452,14 +452,17 @@ class ParallelTeamScheduler:
             if not self._task_allows_parallel(item[0].task_id)
         ]
         if running:
-            # An exclusive task waits for the current parallel wave to drain.
-            # BUT: parallel-capable tasks (allow_parallel=True) CAN start
-            # alongside a running exclusive task.  The old code returned []
-            # entirely when any running task was exclusive, which incorrectly
-            # blocked independent parallel tasks (e.g. task_3 frontend coding
-            # blocked by task_2 backend coding with allow_parallel=False —
-            # run_b5f932e160884113).  Now we only filter out OTHER exclusive
-            # tasks; parallel tasks proceed normally.
+            # ``allow_parallel=False`` is a full barrier: once such a task is
+            # running, no sibling may enter; likewise a new exclusive task
+            # waits for the current parallel wave to drain.  The previous
+            # asymmetric implementation admitted parallel siblings beside an
+            # already-running exclusive task, contradicting the contract and
+            # the regression test below.
+            if any(
+                not self._task_allows_parallel(task_id)
+                for task_id in running.values()
+            ):
+                return []
             ordered = [
                 item for item in ordered
                 if self._task_allows_parallel(item[0].task_id)

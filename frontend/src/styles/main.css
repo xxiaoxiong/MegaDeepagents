@@ -2939,7 +2939,11 @@ select:focus-visible {
 
 .artifact-preview {
   position: relative;
+  display: flex;
+  flex-direction: column;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
   background: white;
 }
 
@@ -2955,9 +2959,17 @@ select:focus-visible {
 
 .artifact-preview header strong {
   display: block;
-  margin-top: 3px;
+  margin-top: 0;
+  overflow: hidden;
   color: var(--ink-soft);
-  font-size: 10px;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.artifact-preview-title {
+  min-width: 0;
+  flex: 1;
 }
 
 .artifact-preview header small {
@@ -3005,17 +3017,31 @@ select:focus-visible {
   border-color: #d8d2f4;
 }
 
-.artifact-preview pre {
-  max-height: 540px;
+.artifact-preview-content {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  background: #fbfbfc;
+}
+
+.artifact-preview-content > pre {
+  min-height: 100%;
+  max-height: none;
   padding: 13px;
   border: 0;
   border-radius: 0;
+  color: var(--ink-soft);
+  background: #fbfbfc;
+  font-size: 11px;
+  line-height: 1.62;
+  white-space: pre;
 }
 
 .artifact-markdown-preview {
-  max-height: 540px;
+  max-height: none;
+  min-height: 100%;
   padding: 20px 24px;
-  overflow: auto;
 }
 
 .artifact-markdown-preview .markdown-body {
@@ -3036,12 +3062,19 @@ select:focus-visible {
 }
 
 .preview-loading,
-.preview-placeholder {
+.preview-placeholder,
+.preview-error {
   display: grid;
   min-height: 280px;
   place-items: center;
   color: var(--muted);
   font-size: 10px;
+}
+
+.preview-error {
+  padding: 24px;
+  color: var(--danger);
+  text-align: center;
 }
 
 .preview-loading {
@@ -3596,7 +3629,7 @@ select:focus-visible {
 
 .chat-layout {
   display: grid;
-  grid-template-columns: 280px minmax(0, 1fr);
+  grid-template-columns: 260px minmax(0, 1fr);
   height: 100vh;
   margin: 0;
   padding: 0;
@@ -3605,7 +3638,7 @@ select:focus-visible {
 
 /* 右侧产出文件抽屉：第三列，对齐 codex 聊天 + 文件面板体验 */
 .chat-layout.has-drawer {
-  grid-template-columns: 280px minmax(0, 1fr) 460px;
+  grid-template-columns: 260px minmax(440px, 1fr) clamp(480px, 40vw, 720px);
 }
 
 .chat-drawer {
@@ -3613,8 +3646,9 @@ select:focus-visible {
   flex-direction: column;
   min-height: 0;
   border-left: 1px solid var(--line);
-  background: var(--surface, #fff);
+  background: var(--surface-solid, #fff);
   overflow: hidden;
+  min-width: 0;
 }
 
 .chat-drawer-head {
@@ -3637,6 +3671,42 @@ select:focus-visible {
   flex: 1;
   min-height: 0;
   overflow: hidden;
+}
+
+.chat-drawer .artifact-grid {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+  min-height: 0;
+  border: 0;
+  border-radius: 0;
+}
+
+.chat-drawer .artifact-list-pane {
+  max-height: 188px;
+  border-right: 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.chat-drawer .artifact-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  max-height: 132px;
+}
+
+.chat-drawer .artifact-list button {
+  padding: 8px 10px;
+  border-right: 1px solid var(--line);
+}
+
+.chat-drawer .artifact-file-icon {
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+}
+
+.chat-drawer .artifact-preview {
+  min-height: 0;
 }
 
 .chat-drawer-badge {
@@ -4011,7 +4081,7 @@ select:focus-visible {
 }
 
 .msg-row.inline {
-  justify-content: stretch;
+  justify-content: flex-start;
 }
 
 .msg-avatar {
@@ -4226,17 +4296,22 @@ select:focus-visible {
 
 /* 工具调用卡片 */
 .tool-call-card {
-  width: 100%;
+  width: fit-content;
+  max-width: min(100%, 760px);
   color: var(--ink-soft);
+}
+
+.tool-call-card[open] {
+  width: min(100%, 760px);
 }
 
 .tool-head {
   display: flex;
   align-items: center;
   gap: 7px;
-  width: 100%;
-  min-height: 32px;
-  padding: 5px 8px;
+  width: auto;
+  min-height: 30px;
+  padding: 4px 7px;
   overflow: hidden;
   background: rgba(255, 255, 255, 0.72);
   border: 1px solid var(--line);
@@ -4244,6 +4319,16 @@ select:focus-visible {
   cursor: pointer;
   list-style: none;
   transition: 120ms ease;
+}
+
+.tool-action {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--ink-soft);
+  font-size: 10.5px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .tool-head::-webkit-details-marker {
@@ -4293,9 +4378,9 @@ select:focus-visible {
 .tool-agent-name {
   max-width: 120px;
   overflow: hidden;
-  color: var(--primary-deep);
-  font-size: 9px;
-  font-weight: 750;
+  color: var(--muted-light);
+  font-size: 8.5px;
+  font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -4368,6 +4453,30 @@ select:focus-visible {
   border-top: 1px solid var(--line);
 }
 
+.tool-args-disclosure {
+  border-top: 1px solid var(--line);
+}
+
+.tool-args-disclosure > summary {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 10px;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 9px;
+  list-style: none;
+}
+
+.tool-args-disclosure > summary::-webkit-details-marker {
+  display: none;
+}
+
+.tool-args-disclosure > summary code {
+  color: var(--muted-light);
+  font-size: 8.5px;
+}
+
 .tool-arg {
   display: flex;
   gap: 8px;
@@ -4402,27 +4511,57 @@ select:focus-visible {
 }
 
 .tool-result {
-  padding: 6px 10px 8px;
-  border-top: 1px solid var(--line);
+  padding: 0;
 }
 
 .tool-result.error {
   background: var(--danger-soft);
 }
 
+.tool-result > header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 7px 10px;
+  color: var(--muted);
+  background: var(--surface-muted);
+  border-bottom: 1px solid var(--line);
+  font-size: 9px;
+}
+
+.tool-result > header strong {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: var(--ink-soft);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 9.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .tool-result-text {
   margin: 0;
-  padding: 8px 10px;
-  max-height: 180px;
+  padding: 11px 12px;
+  max-height: min(56vh, 620px);
   overflow: auto;
   color: var(--ink-soft);
   background: var(--surface-muted);
-  border-radius: 8px;
+  border-radius: 0;
   font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
   font-size: 9.5px;
   line-height: 1.55;
-  white-space: pre-wrap;
-  word-break: break-word;
+  white-space: pre;
+  word-break: normal;
+}
+
+.tool-detail-error {
+  margin: 0;
+  padding: 9px 11px;
+  color: var(--danger);
+  background: var(--danger-soft);
+  font-size: 9.5px;
 }
 
 .tool-result.error .tool-result-text {
@@ -4434,12 +4573,13 @@ select:focus-visible {
 .artifact-card {
   display: flex;
   align-items: center;
-  gap: 12px;
-  width: 100%;
-  padding: 11px 14px;
+  gap: 8px;
+  width: fit-content;
+  max-width: min(100%, 460px);
+  padding: 7px 9px;
   background: white;
   border: 1px solid var(--line);
-  border-radius: 11px;
+  border-radius: 8px;
   cursor: pointer;
   text-align: left;
   transition: 120ms ease;
@@ -4454,22 +4594,26 @@ select:focus-visible {
 .artifact-icon {
   display: grid;
   place-items: center;
-  width: 34px;
-  height: 34px;
+  width: 26px;
+  height: 26px;
   color: var(--cyan);
   background: var(--cyan-soft);
-  border-radius: 10px;
+  border-radius: 7px;
 }
 
 .artifact-meta {
   display: grid;
   flex: 1;
   min-width: 0;
+  max-width: 370px;
   gap: 2px;
 }
 
 .artifact-meta strong {
-  font-size: 12px;
+  overflow: hidden;
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .artifact-meta code {
@@ -4482,7 +4626,7 @@ select:focus-visible {
 
 .artifact-meta small {
   color: var(--muted-light);
-  font-size: 9px;
+  font-size: 8.5px;
 }
 
 .artifact-go {
@@ -4934,23 +5078,54 @@ select:focus-visible {
 
 @media (max-width: 720px) {
   .chat-layout {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
+    width: 100%;
+    max-width: 100vw;
+    overflow: hidden;
   }
 
   .chat-layout.has-drawer {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .chat-drawer {
+    left: 0;
+    right: auto;
     width: 100vw;
+    max-width: none;
   }
 
   .chat-sidebar {
     display: none;
   }
 
+  .chat-main {
+    width: 100%;
+    min-width: 0;
+    overflow-x: hidden;
+  }
+
   .chat-header {
+    min-width: 0;
+    gap: 8px;
     padding: 12px 16px;
+  }
+
+  .chat-header-actions {
+    flex: 0 0 auto;
+    gap: 2px;
+  }
+
+  .chat-header-actions .chat-stream-state {
+    display: none;
+  }
+
+  .chat-header-actions .btn {
+    width: 32px;
+    min-width: 32px;
+    padding: 0;
+    overflow: hidden;
+    font-size: 0;
   }
 
   .chat-team-pulse {
@@ -4967,4 +5142,3 @@ select:focus-visible {
     max-width: 88%;
   }
 }
-
