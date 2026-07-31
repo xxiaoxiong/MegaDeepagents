@@ -143,12 +143,19 @@ class GovernedRunGraph:
         resume: bool = False,
         resume_decision: dict[str, Any] | None = None,
     ) -> OrchestrationResult:
+        # 每个 root graph 节点切换会消耗 2 个 recursion step（super-step boundary）
+        # 一轮正常流水线 intake→router→supervisor→build_team→dispatch→collect→
+        # verify→finalize 至少 ~16 步；每多一轮 repair 多 ~8 步。
+        # 原来 100 的上限在 max_repair_rounds=3 + 多次 dispatch retry 下会触发
+        # GraphRecursionError（run agent_7dc8e85d9ec6 / task_1__repair_v8）。
+        # 抬到 200 让有限轮次 repair / 重 dispatch 都能完成；上限仍然存在
+        # 是为了防止真正的死循环把进程卡死。
         config = {
             "configurable": {
                 "thread_id": self.ctx.run_id,
                 "checkpoint_ns": self.ctx.checkpoint_namespace,
             },
-            "recursion_limit": 100,
+            "recursion_limit": 200,
         }
         try:
             if resume:
@@ -179,6 +186,7 @@ class GovernedRunGraph:
                 "dispatch_status": "",
                 "dispatch_rounds": 0,
                 "repair_round": 0,
+                "repair_rounds_by_task": {},
                 "final_output": None,
                 "error": None,
                 "status": "created",
@@ -494,8 +502,45 @@ class GovernedRunGraph:
         from app.multiagent.task_board import BoardTaskStatus, get_task_board
         from app.multiagent.transactional_task_service import TransactionalTaskService
 
+        # 全局安全网：总修复轮次超过 max_repair_rounds * 3 时直接失败，防止
+        # per-task 计数逻辑有 bug 时进入死循环。正常情况下 per-task 限制会先触发。
+        current_repair_round = int(state.get("repair_round", 0))
+        global_limit = self.max_repair_rounds * 3
+        if current_repair_round >= global_limit:
+            self._event("repair_round_exhausted", {
+                "repair_round": current_repair_round,
+                "global_limit": global_limit,
+            })
+            return {
+                "phase": "repair_exhausted",
+                "status": "failed",
+                "error": (
+                    f"global_repair_round_exhausted:{current_repair_round}/"
+                    f"{global_limit}"
+                ),
+            }
+
+        # Per-task 修复轮次计数器：每个原始任务链（以 base id 为 key）单独计数。
+        # 旧逻辑用单一全局 ``repair_round`` 计数器，导致一个任务的修复链就能
+        # 耗尽全局预算（run_55507ebfce5744e8: task_1 用了 3/5 轮，task_2 和
+        # task_3 只能共享剩余 2 轮，即使 v15 和 v33 都成功了 run 仍然失败）。
+        rounds_by_task: dict[str, int] = dict(state.get("repair_rounds_by_task") or {})
+
         created: list[str] = []
         board = get_task_board()
+        # 候选 = 所有 REPAIR_REQUIRED 且未被替代的 task。
+        #
+        # 注意：这里**故意允许**对修复任务（id 形如 task_1__repair_vN）再创建修复。
+        # 早先版本用 ``"__repair_v" not in task.task_id`` 和 ``repair_of is None``
+        # 把修复任务一律排除，导致一个修复任务自身 per-task 验证失败（→REPAIR_REQUIRED）
+        # 后无法再被修复：第一个 filter 排除它，fallback 只看 SUCCEEDED 叶子也拿不到它
+        # （它是 REPAIR_REQUIRED 不是 SUCCEEDED），最终 ``repair_requested_without_repairable_tasks``
+        # 把整个 run 判失败（observed: agent_c321b21ed4c6 / 1__repair_v8）。
+        #
+        # 链式递归（v1→v2→…）由本方法顶部的全局安全网和下面的 per-task
+        # ``rounds_by_task[base_id] >= max_repair_rounds`` 守卫共同兜底。
+        # ``superseded_by_repair`` 标记确保我们只修"当前最新版本"，不重复修
+        # 已被替代的旧版本。
         candidates = [
             task for task in board.list_by_run(self.ctx.run_id)
             if task.status == BoardTaskStatus.REPAIR_REQUIRED
@@ -511,6 +556,14 @@ class GovernedRunGraph:
                 for node in graph.nodes.values()
                 for dependency in node.dependencies
             }
+            # 注意：这里允许对"最近一次成功的 repair task"再创建修复。
+            # 早先的 ``__repair_v`` / ``repair_of is None`` 过滤会把已经修过
+            # 一次的任务全部排除，导致 verifier 在首次 repair 仍未达标时拿不到
+            # 任何候选 → ``repair_requested_without_repairable_tasks``，整 run
+            # 失败（observed: agent_c321b21ed4c6）。现在改为：只要该 task 未被
+            # ``superseded_by_repair`` 标记（即它是当前最新的成功产出，而非已
+            # 被新修复替代的旧版本），就允许再修一次。链式递归由 per-task
+            # ``rounds_by_task`` 守卫 + 顶部全局安全网兜底，不会再无限 v1→v8。
             candidates = [
                 task for task in board.list_by_run(self.ctx.run_id)
                 if task.status == BoardTaskStatus.SUCCEEDED
@@ -518,15 +571,103 @@ class GovernedRunGraph:
                 and not task.metadata.get("superseded_by_repair")
                 and not task.metadata.get("superseded_by_plan_revision")
             ]
+
+        # Per-task 修复预算过滤：每个原始任务链最多修 max_repair_rounds 次。
+        # base id = task_id 中第一个 ``__repair_v`` 之前的部分（与
+        # task_graph.add_repair_task 的 id 生成逻辑一致）。修复任务
+        # ``task_2__repair_v23`` 的 base id 是 ``task_2``，所以它和原任务
+        # task_2 共享同一个预算计数器。
+        exhausted_chains: list[str] = []
+        eligible: list[Any] = []
         for task in candidates:
+            base_id = (
+                task.task_id.split("__repair_v", 1)[0]
+                if "__repair_v" in task.task_id
+                else task.task_id
+            )
+            if rounds_by_task.get(base_id, 0) >= self.max_repair_rounds:
+                exhausted_chains.append(
+                    f"{base_id}({rounds_by_task.get(base_id, 0)}/"
+                    f"{self.max_repair_rounds})"
+                )
+                continue
+            eligible.append(task)
+
+        if not eligible:
+            if exhausted_chains:
+                # 所有候选任务的修复链都已耗尽 per-task 预算。
+                self._event("repair_round_exhausted", {
+                    "exhausted_chains": exhausted_chains,
+                    "max_repair_rounds": self.max_repair_rounds,
+                    "repair_rounds_by_task": rounds_by_task,
+                })
+                return {
+                    "phase": "repair_exhausted",
+                    "status": "failed",
+                    "error": (
+                        f"all_repair_chains_exhausted:"
+                        f"{exhausted_chains}"
+                    ),
+                }
+            # 真正无可修复任务：所有 task 都已失败/取消，或全部已被替代。
+            # 给出诊断信息而不是干巴巴的错误码，便于排查。
+            board_snapshot = [
+                {"task_id": t.task_id, "status": t.status.value,
+                 "superseded": bool(t.metadata.get("superseded_by_repair"))}
+                for t in board.list_by_run(self.ctx.run_id)
+            ]
+            self._event("repair_no_candidates", {"board": board_snapshot})
+            return {
+                "status": "failed",
+                "error": (
+                    "repair_requested_without_repairable_tasks: "
+                    f"board={board_snapshot}"
+                ),
+            }
+
+        for task in eligible:
+            # 递增该任务链的 per-task 修复计数器
+            base_id = (
+                task.task_id.split("__repair_v", 1)[0]
+                if "__repair_v" in task.task_id
+                else task.task_id
+            )
+            rounds_by_task[base_id] = rounds_by_task.get(base_id, 0) + 1
+            # Use the per-task verification result stored in the board task's
+            # metadata as the primary feedback source.  When repair is
+            # triggered by per-task verification (via _route_after_dispatch
+            # → "repair"), the state's verification_summary is stale/empty
+            # because the _verify node was skipped.  The per-task
+            # verification result (stored by parallel_scheduler._verify_task
+            # in task.metadata["verification"]) contains the actual
+            # failed_criteria that the repair agent needs to know what to
+            # fix.  Without this, the repair agent gets an empty feedback
+            # dict and has no idea what was wrong, causing the repair chain
+            # to never converge (run_a3a9f8e5f5004e21: task_2__repair_v11
+            # still got "repair" because the agent didn't know what to fix).
+            per_task_verification = task.metadata.get("verification", {})
+            feedback = (
+                per_task_verification
+                if per_task_verification
+                else state.get("verification_summary", {})
+            )
             before = set(graph.nodes)
+            # Strip any existing "Repair " prefixes so the objective stays
+            # flat across re-repair chains.  Without this, re-repairing a
+            # repair task compounds the prefix:
+            #   v1: "Repair 开发后端接口" → v2: "Repair Repair 开发后端接口"
+            #   → v3: "Repair Repair Repair 开发后端接口" …  The LLM sees a
+            # garbled objective and loses sight of the actual goal.
+            base_objective = task.objective
+            while base_objective.startswith("Repair "):
+                base_objective = base_objective[len("Repair "):]
             mutation = TransactionalTaskService().create_repair(
                 self.ctx.run_id,
                 task.task_id,
-                objective=f"Repair {task.objective}",
+                objective=f"Repair {base_objective}",
                 required_capabilities=list(task.required_capabilities),
                 source_artifact_ids=list(task.produced_artifact_ids),
-                verification_feedback=state.get("verification_summary", {}),
+                verification_feedback=feedback,
             )
             graph = mutation.graph
             created.extend(sorted(set(graph.nodes) - before))
@@ -538,16 +679,33 @@ class GovernedRunGraph:
                     # next whole-run PASS decision.
                     artifact_store.mark_rejected(artifact_id)
         if not created:
-            return {"status": "failed", "error": "repair_requested_without_repairable_tasks"}
+            # eligible 非空但没有创建出任何 repair task —— 理论上不应发生
+            # （create_repair 内部异常才会走到这里），给出诊断信息便于排查。
+            board_snapshot = [
+                {"task_id": t.task_id, "status": t.status.value,
+                 "superseded": bool(t.metadata.get("superseded_by_repair"))}
+                for t in board.list_by_run(self.ctx.run_id)
+            ]
+            self._event("repair_no_candidates", {"board": board_snapshot})
+            return {
+                "status": "failed",
+                "error": (
+                    "repair_created_no_tasks: "
+                    f"eligible={[t.task_id for t in eligible]}, "
+                    f"board={board_snapshot}"
+                ),
+            }
         self._persist_graph(graph)
         self._event("repair_planned", {
             "repair_round": int(state.get("repair_round", 0)) + 1,
+            "repair_rounds_by_task": rounds_by_task,
             "created_task_ids": created,
             "verification": state.get("verification_summary", {}),
         })
         return {
             "phase": "repair_planned",
             "repair_round": int(state.get("repair_round", 0)) + 1,
+            "repair_rounds_by_task": rounds_by_task,
             "task_graph_json": graph.model_dump_json(),
             "task_graph_version": graph.version,
             "error": None,
@@ -567,6 +725,9 @@ class GovernedRunGraph:
             "phase": "replanning",
             "task_graph_json": "",
             "repair_round": int(state.get("repair_round", 0)) + 1,
+            # Replan 重置 per-task 计数器：新 plan 产生全新的 task id，
+            # 旧计数器不再适用。全局 repair_round 继续累积作为安全网。
+            "repair_rounds_by_task": {},
             "error": None,
         }
 
@@ -653,12 +814,17 @@ class GovernedRunGraph:
         verdict = state.get("verification_summary", {}).get("verdict", "fail")
         if verdict == "pass":
             return "finalize"
+        # 全局安全网：总修复轮次达到 max_repair_rounds * 3 时不再路由到
+        # repair/replan，直接 fail。per-task 的修复预算检查在 _repair / _replan
+        # 节点内部执行，那里会精确控制每条任务链的修复上限。这里只做粗粒度的
+        # 全局兜底，防止 per-task 逻辑有 bug 时无限循环。
+        global_limit = self.max_repair_rounds * 3
         if verdict == "repair":
-            if int(state.get("repair_round", 0)) < self.max_repair_rounds:
+            if int(state.get("repair_round", 0)) < global_limit:
                 return "repair"
             return "fail"
         if verdict == "replan":
-            if int(state.get("repair_round", 0)) < self.max_repair_rounds:
+            if int(state.get("repair_round", 0)) < global_limit:
                 return "replan"
             return "fail"
         if verdict == "human_required":
@@ -839,6 +1005,7 @@ def run_governed(
     resume: bool = False,
     resume_decision: dict[str, Any] | None = None,
     max_rounds: int = 30,
+    max_repair_rounds: int | None = None,
 ) -> OrchestrationResult:
     return GovernedRunGraph(
         ctx=ctx,
@@ -848,6 +1015,7 @@ def run_governed(
         cancel_event=cancel_event,
         task_graph=task_graph,
         max_rounds=max_rounds,
+        max_repair_rounds=max_repair_rounds,
     ).invoke(
         goal=goal,
         requested_mode=requested_mode,

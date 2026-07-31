@@ -252,3 +252,189 @@ def test_fallback_plan_can_be_scheduled():
 def test_fallback_root_task_id_set():
     graph = build_fallback_plan("test")
     assert graph.root_task_id == "plan"
+
+
+# ===== 启发式能力纠错：planning→coding/testing =====
+#
+# 锁定"我发布的任务是构建一个前后端项目，但是整个过程我只看到 planner
+# 智能体在干活"根因：LLM 对构建类目标常把所有子任务标成 ["planning"]，
+# TeamBuilder 只生成 Planner agent，Planner 凭 file_write 自己实现一切。
+# 解析层对仅声明 planning 的 task 扫描文本：命中实现关键词→coding；
+# 命中测试关键词→testing；纯规划/设计/架构保留 planning。
+
+
+def test_planning_task_with_impl_keywords_becomes_coding(caplog):
+    """声明 planning 但文本含实现关键词（前端/后端/构建）→ 改写为 coding。"""
+    import logging
+    caplog.set_level(logging.WARNING)
+    json_output = {
+        "tasks": [
+            {
+                "id": "frontend",
+                "title": "构建前端项目",
+                "objective": "实现前端页面与组件",
+                "description": "用 Vue 构建前端",
+                "dependencies": [],
+                "required_capabilities": ["planning", "file_write", "shell_execute"],
+            },
+        ]
+    }
+    graph = _llm_plan_to_taskgraph(json_output, goal="构建一个前后端项目")
+    caps = graph.nodes["frontend"].required_capabilities
+    assert caps[0] == "coding"  # 主角色被改写
+    # 工具能力保留
+    assert "file_write" in caps
+    assert "shell_execute" in caps
+    assert "planning" not in caps
+    assert any("改写主角色能力为 coding" in r.message for r in caplog.records)
+
+
+def test_planning_task_with_test_keywords_becomes_testing(caplog):
+    """声明 planning 但文本含测试关键词（测试/pytest）→ 改写为 testing。"""
+    import logging
+    caplog.set_level(logging.WARNING)
+    json_output = {
+        "tasks": [
+            {
+                "id": "tests",
+                "title": "编写单元测试",
+                "objective": "为后端 API 编写 pytest 测试",
+                "dependencies": [],
+                "required_capabilities": ["planning", "shell_execute"],
+            },
+        ]
+    }
+    graph = _llm_plan_to_taskgraph(json_output, goal="构建一个前后端项目")
+    caps = graph.nodes["tests"].required_capabilities
+    assert caps[0] == "testing"
+    assert "shell_execute" in caps
+    assert "planning" not in caps
+    assert any("改写主角色能力为 testing" in r.message for r in caplog.records)
+
+
+def test_planning_task_with_english_impl_keyword_becomes_coding():
+    """英文实现关键词 build/implement/api 也触发改写（词边界匹配）。"""
+    json_output = {
+        "tasks": [
+            {
+                "id": "api",
+                "title": "Implement backend API",
+                "objective": "build the REST api service",
+                "dependencies": [],
+                "required_capabilities": ["planning"],
+            },
+        ]
+    }
+    graph = _llm_plan_to_taskgraph(json_output, goal="build fullstack")
+    assert graph.nodes["api"].required_capabilities[0] == "coding"
+
+
+def test_pure_planning_task_stays_planning():
+    """纯架构/设计/规划类 task 保留 planning，不被误改。"""
+    json_output = {
+        "tasks": [
+            {
+                "id": "design",
+                "title": "架构设计",
+                "objective": "设计系统架构与技术选型",
+                "description": "输出架构设计文档",
+                "dependencies": [],
+                "required_capabilities": ["planning"],
+            },
+        ]
+    }
+    graph = _llm_plan_to_taskgraph(json_output, goal="构建一个前后端项目")
+    assert graph.nodes["design"].required_capabilities == ["planning"]
+
+
+def test_design_task_mentions_frontend_still_stays_planning():
+    """设计类 task 即使提到"前后端"（含"后端"子串）也保留 planning。
+
+    回归锁定：早期 heuristic 用子串匹配，"设计前后端架构"因含"后端"被误判为
+    coding。现 design 关键词（设计/架构/规划/方案）优先，保护架构任务。
+    """
+    json_output = {
+        "tasks": [
+            {
+                "id": "arch",
+                "title": "架构设计",
+                "objective": "设计前后端架构与技术选型",
+                "dependencies": [],
+                "required_capabilities": ["planning"],
+            },
+        ]
+    }
+    graph = _llm_plan_to_taskgraph(json_output, goal="构建一个前后端项目")
+    assert graph.nodes["arch"].required_capabilities == ["planning"]
+
+
+def test_planning_task_with_secondary_primary_cap_still_rewritten():
+    """多主角色先被裁剪为第一个 planning（coding 被丢），随后启发式仍会改写。
+
+    裁剪后 caps=["planning"]，caps[1:] 为空，启发式条件成立；文本含实现
+    关键词→最终改写为 coding。这符合用户意图：实现类任务就该由 Coder 接管。
+    """
+    json_output = {
+        "tasks": [
+            {
+                "id": "mixed",
+                "title": "实现前端",
+                "objective": "构建前端页面",
+                "dependencies": [],
+                "required_capabilities": ["planning", "coding"],
+            },
+        ]
+    }
+    graph = _llm_plan_to_taskgraph(json_output, goal="build")
+    # 多主角色裁剪丢掉 coding，启发式再据"实现/构建"改写为 coding
+    assert graph.nodes["mixed"].required_capabilities[0] == "coding"
+
+
+def test_fullstack_project_decomposition_produces_multiple_roles():
+    """端到端：构建前后端项目的计划应产生 planning + coding + testing 多角色。
+
+    这是用户报告的核心症状回归测试——之前所有 task 都是 planning 导致
+    只有 Planner agent 在干活。
+    """
+    json_output = {
+        "tasks": [
+            {
+                "id": "task_1",
+                "title": "架构设计",
+                "objective": "设计前后端架构",
+                "dependencies": [],
+                "required_capabilities": ["planning"],
+            },
+            {
+                "id": "task_2",
+                "title": "实现前端",
+                "objective": "构建前端页面与组件",
+                "dependencies": ["task_1"],
+                "required_capabilities": ["planning", "file_write", "shell_execute"],
+            },
+            {
+                "id": "task_3",
+                "title": "实现后端 API",
+                "objective": "开发后端接口",
+                "dependencies": ["task_1"],
+                "required_capabilities": ["planning", "file_write", "shell_execute"],
+            },
+            {
+                "id": "task_4",
+                "title": "编写并运行测试",
+                "objective": "为前后端编写 pytest 测试",
+                "dependencies": ["task_2", "task_3"],
+                "required_capabilities": ["planning", "shell_execute"],
+            },
+        ]
+    }
+    graph = _llm_plan_to_taskgraph(json_output, goal="构建一个前后端项目")
+    primary_caps = {
+        graph.nodes[f"task_{i}"].required_capabilities[0] for i in range(1, 5)
+    }
+    # 应该有 planning（架构）+ coding（前端/后端）+ testing（测试）多角色
+    assert "planning" in primary_caps
+    assert "coding" in primary_caps
+    assert "testing" in primary_caps
+    # 不应全是 planning
+    assert primary_caps != {"planning"}

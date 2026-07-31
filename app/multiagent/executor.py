@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -28,10 +29,282 @@ from app.core.logging import logger
 from app.multiagent.agent_profile import AgentProfile, get_capability_registry
 from app.multiagent.task_graph import TaskGraph, TaskNode
 
+
+# ===== 思考链剥离 =====
+#
+# DeepSeek-R1 / DeepSeek-Reasoner / Doubao-1.5-reasoning 等模型会把推理过程
+# 包在 think / reasoning 标签内再给最终答案。若不剥离，前端会把整段思考链
+# （含其内空白、换行、思考草稿）当成正文渲染，呈现出"消息框里全是闭标签
+# 字符 / 几千条空消息"。
+#
+# 流式增量也需要剥离：因为标签可能跨 token 切片到达，这里用一个轻量状态机
+# 缓冲模式在 _AssistantStreamCallback 内对每个 token 在线过滤。
+_THINK_OPEN_RE = re.compile(r"<(think|reasoning)\b[^>]*>", re.IGNORECASE)
+_THINK_CLOSE_RE = re.compile(r"</(think|reasoning)\s*>", re.IGNORECASE)
+# 孤立的 think / reasoning 标签（开或闭）。流式中若开标签被 token 切片切断后
+# 漏出，残留的孤立闭标签需用此正则兜底清理。
+_THINK_STRAY_RE = re.compile(r"</?(think|reasoning)\b[^>]*>", re.IGNORECASE)
+
+
+def _strip_think_blocks(text: str) -> str:
+    """移除 think / reasoning 思考链整段内容（含开闭标签与中间文字）。
+
+    闭合标签缺失时（流末尾或被并发切断），剥到字符串末尾；不应保留半截思考链
+    泄漏到正文。最后再扫一遍孤立的开/闭标签（开标签可能在前一条消息或被 token
+    切片丢失，留下无配对的闭标签）。一切解析失败时退化为返回原文，避免影响主链路。
+    """
+    if not text:
+        return text
+    try:
+        pattern = re.compile(
+            r"<(think|reasoning)\b[^>]*>.*?</\1\s*>",
+            re.IGNORECASE | re.DOTALL,
+        )
+        cleaned = pattern.sub("", text)
+        # 末尾未闭合的开标签：剥到结尾
+        cleaned = re.sub(
+            r"<(think|reasoning)\b[^>]*>.*$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        # 兜底：移除残留的孤立标签（无配对开标签的闭标签、或零散开标签本身）
+        cleaned = _THINK_STRAY_RE.sub("", cleaned)
+        return cleaned
+    except Exception:
+        return text
+
 try:  # langchain 可能在部分测试环境缺失；缺失时回调降级为空操作
     from langchain_core.callbacks import BaseCallbackHandler
 except Exception:  # pragma: no cover
     BaseCallbackHandler = object  # type: ignore[assignment, misc]
+
+try:  # deepagents / langchain 1.x middleware 可能在部分环境缺失
+    from langchain.agents.middleware.types import AgentMiddleware
+except Exception:  # pragma: no cover
+    AgentMiddleware = None  # type: ignore[assignment, misc]
+
+
+# ===== 工具调用 id 守卫中间件 =====
+#
+# 部分 OpenAI 兼容端点（含 agnes / 某些网关代理）在返回 tool_calls 时偶尔
+# 不带 ``id`` 字段。LangGraph 的 ToolNode 会据此构造
+# ``ToolMessage(tool_call_id=None)``，触发 Pydantic 校验失败：
+#   1 validation error for ToolMessage tool_call_id Input should be a valid string
+# 该异常会直接杀掉整个 worker 任务（observed: agent_c321b21ed4c6 /
+# 1__repair_v8），进而触发 ``repair_requested_without_repairable_tasks``。
+# 此中间件在模型响应进入 state 之前，给任何缺 id 的 tool_call 补一个生成 id。
+
+
+def _ensure_tool_call_ids(message: Any) -> Any:
+    """Return ``message`` with every tool_call id guaranteed non-None.
+
+    AIMessage 在 langchain 1.x 是 pydantic 模型；优先 ``model_copy`` 生成新
+    实例，失败时退化为就地改写。无 tool_calls 或 id 均非空时原样返回。
+    """
+    tool_calls = getattr(message, "tool_calls", None)
+    if not tool_calls:
+        return message
+    if all(tc.get("id") for tc in tool_calls):
+        return message
+    patched = []
+    for tc in tool_calls:
+        new_tc = dict(tc)
+        if not new_tc.get("id"):
+            new_tc["id"] = f"call_{uuid.uuid4().hex[:24]}"
+        patched.append(new_tc)
+    try:
+        return message.model_copy(update={"tool_calls": patched})
+    except Exception:
+        try:
+            message.tool_calls = patched  # type: ignore[misc]
+        except Exception:  # pragma: no cover - 极端不可变场景
+            pass
+        return message
+
+
+def _patch_model_response_result(response: Any) -> Any:
+    """Patch a wrap_model_call response (ModelResponse / AIMessage / list)."""
+    if response is None:
+        return response
+    # ModelResponse dataclass: result is list[BaseMessage]
+    result = getattr(response, "result", None)
+    if isinstance(result, list):
+        response.result = [_ensure_tool_call_ids(m) for m in result]
+        return response
+    # Bare AIMessage
+    if hasattr(response, "tool_calls"):
+        return _ensure_tool_call_ids(response)
+    return response
+
+
+if AgentMiddleware is not None:
+
+    class _ToolCallIdGuardMiddleware(AgentMiddleware):
+        """Ensure every AIMessage tool_call has a non-None string id."""
+
+        def wrap_model_call(self, request, handler):  # type: ignore[override]
+            response = handler(request)
+            return _patch_model_response_result(response)
+
+        async def awrap_model_call(self, request, handler):  # type: ignore[override]
+            response = await handler(request)
+            return _patch_model_response_result(response)
+
+else:  # pragma: no cover - middleware 不可用时降级为空对象
+
+    class _ToolCallIdGuardMiddleware:  # type: ignore[no-redef]
+        """No-op fallback when AgentMiddleware is unavailable."""
+
+        def wrap_model_call(self, request, handler):
+            return handler(request)
+
+        async def awrap_model_call(self, request, handler):
+            return await handler(request)
+
+
+# ===== deepagents 默认工具排除中间件 =====
+#
+# ``create_deep_agent`` 会通过 middleware 注入自带工具（``glob`` / ``grep`` /
+# ``ls`` / ``read_file`` / ``write_file`` / ``edit_file`` / ``execute`` /
+# ``task``）。这些工具直接操作宿主文件系统，不受我们的 workspace 沙箱约束：
+# - ``glob`` 在整个文件系统根 ``/`` 下搜索，返回 workspace 之外的文件
+#   （如 ``/backend_arch.md``），agent 随后用沙箱化的 ``read_file`` 读取时
+#   报"文件不存在"，陷入 40 次工具调用全白跑的超时循环
+#   （run_69aefad3ac6a4029 task_1 attempt 1/2）。
+# - ``read_file`` / ``write_file`` 与我们的同名工具冲突，LLM 看到两个
+#   ``read_file`` 可能调用不安全的那一个。
+#
+# 解决方案：在 middleware 栈末尾排除这些冲突工具，只保留我们的沙箱版工具
+# + ``write_todos``（planning 有用）。
+#
+# 需要排除的 deepagents 默认工具名：
+_DEEPAGENTS_TOOLS_TO_EXCLUDE = frozenset({
+    "glob", "grep", "ls",
+    "read_file", "write_file", "edit_file",
+    "execute", "task",
+})
+
+
+def _tool_name(tool: Any) -> str:
+    """Extract the name from a tool-like object (BaseTool, dict, or callable)."""
+    return getattr(tool, "name", None) or (
+        tool.get("name") if isinstance(tool, dict) else getattr(tool, "__name__", "")
+    )
+
+
+if AgentMiddleware is not None:
+
+    class _DeepAgentsToolExclusionMiddleware(AgentMiddleware):
+        """Remove deepagents' built-in filesystem/search tools before the model sees them.
+
+        Our executor already builds sandboxed equivalents (``read_file`` /
+        ``create_file`` / ``edit_file`` / ``list_dir`` / ``execute``) that are
+        scoped to the task workspace via ``_safe_workspace_path``.  The
+        deepagents SDK injects its own un-sandboxed versions (``glob`` /
+        ``grep`` / ``ls`` / ``read_file`` / ``write_file`` / ``edit_file`` /
+        ``execute`` / ``task``) through filesystem middleware.  Left unfiltered,
+        the LLM sees duplicate tool names and can call ``glob`` to discover
+        files outside the workspace, then loop trying to read them — burning
+        the entire tool-call budget on phantom paths
+        (run_69aefad3ac6a4029 task_1: 40/40 calls wasted, 1200s timeout).
+        """
+
+        def wrap_model_call(self, request, handler):  # type: ignore[override]
+            filtered = [
+                t for t in request.tools
+                if _tool_name(t) not in _DEEPAGENTS_TOOLS_TO_EXCLUDE
+            ]
+            if len(filtered) != len(request.tools):
+                request = request.override(tools=filtered)
+            return handler(request)
+
+        async def awrap_model_call(self, request, handler):  # type: ignore[override]
+            filtered = [
+                t for t in request.tools
+                if _tool_name(t) not in _DEEPAGENTS_TOOLS_TO_EXCLUDE
+            ]
+            if len(filtered) != len(request.tools):
+                request = request.override(tools=filtered)
+            return await handler(request)
+
+else:  # pragma: no cover
+
+    class _DeepAgentsToolExclusionMiddleware:  # type: ignore[no-redef]
+        """No-op fallback when AgentMiddleware is unavailable."""
+
+        def wrap_model_call(self, request, handler):
+            return handler(request)
+
+        async def awrap_model_call(self, request, handler):
+            return await handler(request)
+
+
+# ===== 工具预算硬停中间件 =====
+#
+# ``_TaskToolBudgetGuard.checkpoint()`` 在工具函数内部 raise
+# ``RuntimeError("tool_call_budget_exceeded")``，但 LangGraph ToolNode 会
+# 捕获工具异常并转成 ToolMessage error 内容喂回 agent。agent 看到错误后
+# 继续尝试下一个工具 → 又超预算 → 又被捕获 → 循环到 recursion_limit /
+# timeout 耗尽（run_69aefad3ac6a4029: budget 40/40 后 agent 又跑了 20+
+# 次 read_file 全部返回 budget_exceeded error，直到 1200s 超时）。
+#
+# 修复：在 ``wrap_model_call`` 中检查预算，超限时直接返回一条 AIMessage
+# 指示 agent 停止工具调用并输出摘要，不再调用底层模型。这样 agent 不会
+# 继续尝试工具调用。
+
+if AgentMiddleware is not None:
+
+    class _BudgetStopMiddleware(AgentMiddleware):
+        """Hard-stop the agent when the tool-call budget is exhausted.
+
+        Checks ``budget_guard.is_exceeded`` before every model call.  When
+        exceeded, returns a final AIMessage telling the agent to summarize
+        and stop, bypassing the LLM entirely.  This prevents the
+        budget-exceeded → ToolNode-catches-error → agent-retries loop that
+        burned through 1200s timeouts.
+        """
+
+        def __init__(self, budget_guard: "_TaskToolBudgetGuard | None") -> None:
+            self._budget_guard = budget_guard
+
+        def wrap_model_call(self, request, handler):  # type: ignore[override]
+            if self._budget_guard and self._budget_guard.is_exceeded:
+                from langchain_core.messages import AIMessage
+                return AIMessage(
+                    content=(
+                        "工具调用预算已耗尽。请立即停止调用工具，"
+                        "根据已完成的操作输出任务结果摘要。"
+                    ),
+                    tool_calls=[],
+                )
+            return handler(request)
+
+        async def awrap_model_call(self, request, handler):  # type: ignore[override]
+            if self._budget_guard and self._budget_guard.is_exceeded:
+                from langchain_core.messages import AIMessage
+                return AIMessage(
+                    content=(
+                        "工具调用预算已耗尽。请立即停止调用工具，"
+                        "根据已完成的操作输出任务结果摘要。"
+                    ),
+                    tool_calls=[],
+                )
+            return await handler(request)
+
+else:  # pragma: no cover
+
+    class _BudgetStopMiddleware:  # type: ignore[no-redef]
+        """No-op fallback when AgentMiddleware is unavailable."""
+
+        def __init__(self, budget_guard: Any | None) -> None:
+            pass
+
+        def wrap_model_call(self, request, handler):
+            return handler(request)
+
+        async def awrap_model_call(self, request, handler):
+            return await handler(request)
 
 
 # ===== 数据模型 =====
@@ -187,12 +460,53 @@ class ModelDecisionExecutor:
 
 
 def _safe_workspace_path(root: str, requested: str) -> Path:
-    """Resolve a tool path without allowing traversal or symlink escape."""
+    """Resolve a tool path without allowing traversal or symlink escape.
+
+    LLM 驱动的工具调用经常传入带前导斜杠的"绝对"路径（如 ``/src/App.tsx``）
+    或照抄系统提示里的 workspace 全路径。在 Linux 容器内这类路径会被
+    ``Path.is_absolute()`` 判为绝对路径、落在 workspace 之外而被拒绝，导致
+    ``create_file``/``edit_file``/``read_file`` 批量失败（前端显示"执行失败"）。
+    这里先接受真正落在 workspace 内的绝对路径；否则剥离盘符 / 前导分隔符 /
+    重复的 workspace 根前缀，作为相对路径处理；``..`` 逃逸仍被拒绝。
+    """
     base = Path(root).resolve()
-    candidate = (base / requested).resolve() if not Path(requested).is_absolute() else Path(requested).resolve()
+    raw = requested.strip()
+    # 真正落在 workspace 内的绝对路径直接接受
+    if Path(raw).is_absolute():
+        abs_candidate = Path(raw).resolve()
+        if abs_candidate.is_relative_to(base):
+            return abs_candidate
+    # 规范化：去盘符 + 去前导分隔符，把 "/src/App.tsx" 当作相对路径
+    req = raw.replace("\\", "/")
+    req = re.sub(r"^[a-zA-Z]:", "", req).lstrip("/")
+    # 去掉 LLM 偶尔带上的 workspace 根前缀（照抄系统提示里的全路径）
+    base_rel = str(base).replace("\\", "/").rstrip("/")
+    if req.startswith(base_rel + "/"):
+        req = req[len(base_rel) + 1:]
+    elif req.rstrip("/") == base_rel:
+        req = ""
+    candidate = (base / req).resolve()
     if not candidate.is_relative_to(base):
         raise ValueError(f"path escapes workspace: {requested}")
     return candidate
+
+
+def _recursion_limit_for(max_tool_calls: int) -> int:
+    """Compute the LangGraph ``recursion_limit`` for a task tool-call budget.
+
+    Historical formula ``max_tool_calls * 2 + 4`` capped at 44 with the old
+    default ``max_tool_calls=20``, which killed repair tasks like
+    ``1__repair_v8`` with ``Recursion limit of 44 reached``.  Each tool round
+    trip consumes 2 graph steps (model node + tool node) plus a few for the
+    agent loop bookkeeping, so the limit must scale with the budget.  We use
+    ``max_tool_calls * 3 + 20`` to leave headroom for multi-step reasoning,
+    floored at 80 (small budgets) and capped at 500 ( runaway guard).
+    """
+    try:
+        budget = int(max_tool_calls)
+    except (TypeError, ValueError):
+        budget = 40
+    return max(80, min(500, budget * 3 + 20))
 
 
 def _tool_boundary(cancel_event: Any | None, safety_point: Callable[[], Any] | None) -> None:
@@ -294,6 +608,49 @@ class _TaskToolBudgetGuard:
                     "limit": self.max_tool_calls,
                 },
             )
+
+    @property
+    def is_exceeded(self) -> bool:
+        """True when the tool-call budget has been fully consumed.
+
+        Read by ``_BudgetStopMiddleware.wrap_model_call`` to short-circuit
+        the next model invocation before the LLM can request another tool
+        call that would just be rejected by ``checkpoint()``.
+        """
+        with self._lock:
+            return self._used >= self.max_tool_calls
+
+
+class _RepromptBudgetGuard:
+    """Lightweight non-persistent budget guard for the no-artifact re-prompt.
+
+    Unlike ``_TaskToolBudgetGuard``, this guard does NOT persist consumed
+    counts to the database — it exists only to give the re-prompt agent a
+    small dedicated tool-call allowance (default 10) that is independent of
+    the main task budget.  This ensures the re-prompt can actually call
+    ``create_file`` even when the original budget was exhausted by a glob
+    loop or other wasteful exploration.
+    """
+
+    def __init__(self, *, max_calls: int = 10) -> None:
+        self.max_tool_calls = max(1, int(max_calls))
+        self._used = 0
+        self._lock = threading.Lock()
+        self._exceeded = False
+
+    def checkpoint(self) -> None:
+        with self._lock:
+            if self._used >= self.max_tool_calls:
+                self._exceeded = True
+                raise RuntimeError(
+                    f"reprompt_budget_exceeded:{self.max_tool_calls}"
+                )
+            self._used += 1
+
+    @property
+    def is_exceeded(self) -> bool:
+        with self._lock:
+            return self._used >= self.max_tool_calls
 
 
 # ===== 工具调用事件追踪（供前端 ToolCallCard 实时展示）=====
@@ -471,6 +828,30 @@ def _atomic_write(path: Path, content: str, cancel_event: Any | None = None) -> 
             pass
 
 
+def _list_workspace_files(base: Path, max_depth: int = 2) -> list[str]:
+    """List file paths under ``base`` (relative to ``base``) up to ``max_depth``.
+
+    Used by ``read_file`` / ``list_dir`` error paths to give the LLM a concrete
+    list of available files instead of a bare "不存在" — which otherwise sends
+    the agent into a guessing loop (run_de866d4e976b4c3a: 38 failed read_file
+    calls guessing wrong filenames inside ``.inputs/art_xxx/``).
+    """
+    results: list[str] = []
+    try:
+        for entry in sorted(base.rglob("*")):
+            if not entry.is_file():
+                continue
+            rel = entry.relative_to(base).as_posix()
+            if rel.count("/") > max_depth:
+                continue
+            results.append(rel)
+            if len(results) >= 50:
+                break
+    except Exception:
+        pass
+    return results
+
+
 def _make_read_file_tool(
     task_workspace: str, cancel_event: Any | None = None,
     safety_point: Callable[[], Any] | None = None,
@@ -495,9 +876,43 @@ def _make_read_file_tool(
             except ValueError as exc:
                 audit["error"] = str(exc)
                 return f"错误: {exc}"
+            # 关键修复：路径存在但是目录（agent 把 .inputs/art_xxx 当文件读）。
+            # 返回目录内的文件列表，引导 agent 用正确路径
+            # read_file('.inputs/art_xxx/App.jsx') 而非循环猜测。
+            if path.is_dir():
+                files = _list_workspace_files(path)
+                audit["error"] = f"路径是目录不是文件 {file_path}"
+                listing = "\n".join(f"  - {f}" for f in files) if files else "  (空目录)"
+                return (
+                    f"错误: '{file_path}' 是一个目录，不是文件。"
+                    f"请用 read_file 读取目录下的具体文件。"
+                    f"该目录包含以下文件：\n{listing}\n"
+                    f"例如：read_file('{file_path.rstrip('/')}/{files[0]}')"
+                    if files else
+                    f"错误: '{file_path}' 是一个空目录。"
+                )
             if not path.is_file():
+                # 文件确实不存在 —— 检查父目录是否有同名前缀的文件，
+                # 或列出 .inputs/ 下可用文件，帮助 agent 定位正确路径。
                 audit["error"] = f"文件不存在 {file_path}"
-                return f"错误: 文件不存在 {file_path}"
+                hints: list[str] = []
+                parent = path.parent
+                if parent.is_dir():
+                    siblings = _list_workspace_files(parent, max_depth=1)
+                    if siblings:
+                        hints.append(f"目录 {parent.relative_to(Path(task_workspace).resolve()).as_posix()} 下的文件：")
+                        hints.extend(f"  - {s}" for s in siblings[:20])
+                inputs_dir = Path(task_workspace).resolve() / ".inputs"
+                if inputs_dir.is_dir() and parent != inputs_dir:
+                    input_files = _list_workspace_files(inputs_dir, max_depth=2)
+                    if input_files:
+                        hints.append(".inputs/ 下的可用文件：")
+                        hints.extend(f"  - {f}" for f in input_files[:15])
+                hint_text = "\n".join(hints) if hints else ""
+                return (
+                    f"错误: 文件不存在 {file_path}。"
+                    + (f"\n可用文件参考：\n{hint_text}" if hint_text else "")
+                )
             with path.open("r", encoding="utf-8") as f:
                 content = f.read()
             audit["size"] = len(content)
@@ -531,8 +946,32 @@ def _make_list_dir_tool(
                 audit["error"] = str(exc)
                 return f"错误: {exc}"
             if not resolved.is_dir():
+                # 目录不存在 —— 列出父目录和 .inputs/ 内容帮助 agent 定位。
                 audit["error"] = f"目录不存在 {path}"
-                return f"错误: 目录不存在 {path}"
+                hints: list[str] = []
+                base = Path(task_workspace).resolve()
+                parent = resolved.parent
+                if parent.is_dir() and parent != resolved:
+                    try:
+                        items = sorted(entry.name for entry in parent.iterdir())
+                        rel_parent = parent.relative_to(base).as_posix()
+                        hints.append(f"目录 {rel_parent}/ 下的内容：")
+                        hints.extend(f"  - {i}" for i in items[:20])
+                    except Exception:
+                        pass
+                inputs_dir = base / ".inputs"
+                if inputs_dir.is_dir():
+                    try:
+                        input_items = sorted(entry.name for entry in inputs_dir.iterdir())
+                        hints.append(".inputs/ 下的内容：")
+                        hints.extend(f"  - {i}" for i in input_items[:15])
+                    except Exception:
+                        pass
+                hint_text = "\n".join(hints) if hints else ""
+                return (
+                    f"错误: 目录不存在 {path}。"
+                    + (f"\n可用目录参考：\n{hint_text}" if hint_text else "")
+                )
             items = [entry.name for entry in resolved.iterdir()]
             audit["count"] = len(items)
             return json.dumps(items, ensure_ascii=False)
@@ -777,7 +1216,74 @@ class _AssistantStreamCallback(BaseCallbackHandler):
     节流策略：token 累积满 throttle_s 秒 flush 一次，``on_llm_end`` 时强制 flush 并
     发 ``assistant_message``。用 ``message_id`` 把多个 token chunk 与最终消息关联，
     前端据此累积成同一个流式气泡。回调失败不影响 LLM 主流程。
+
+    ``<think>...</think>`` / ``<reasoning>...</reasoning>`` 思考链块在 token 进入即丢弃
+    （用类内 ``_ThinkFilter`` 状态机避免半截标签跨 chunk 泄漏）。最终 ``assistant_message``
+    再用 ``_strip_think_blocks`` 兜底一遍，对尾段未闭合情况保证零残留。
     """
+
+    class _ThinkFilter:
+        """流式 <think> 状态机：跨 token 边界累积，匹配开标签后丢弃直至闭标签。"""
+
+        __slots__ = ("_buf", "_dropping", "_open_re", "_close_re")
+
+        def __init__(self) -> None:
+            self._buf = ""
+            self._dropping = False
+            self._open_re = _THINK_OPEN_RE
+            self._close_re = _THINK_CLOSE_RE
+
+        def push(self, text: str) -> str:
+            """输入 token 增量，返回允许写到 buffer 的可见字符。
+
+            关键：开/闭标签可能跨 token 边界到达（如 "<thi" + "nk>..."）。
+            若把半截开标签当普通文本立即输出，下一 chunk 的 "nk>..." 就再也
+            匹配不到开标签，整段思考链（含闭标签）会泄漏到前端消息气泡——
+            这正是用户报告"消息框里出现闭标签字符"的根因。
+            因此：
+            - 未匹配到完整开标签时，尾部若有未闭合的 '<'（可能是半截开标签），
+              只输出到该 '<' 之前，把 '<' 起始的尾巴留在 buffer 等下一 chunk。
+            - 丢弃态下未匹配到闭标签时，保留整个剩余 buffer（可能含半截闭
+              标签），不清空，等下一 chunk 补全。
+            - 最后对可见输出再扫一遍 _THINK_STRAY_RE，清掉漏网的孤立标签。
+            """
+            if not text:
+                return ""
+            self._buf += text
+            out_parts: list[str] = []
+            cursor = 0
+            while cursor < len(self._buf):
+                if self._dropping:
+                    close = self._close_re.search(self._buf, cursor)
+                    if close is None:
+                        # 闭标签未到：保留剩余 buffer（可能含半截闭标签），
+                        # 不输出、不清空，等下一 chunk 补全。
+                        break
+                    cursor = close.end()
+                    self._dropping = False
+                    continue
+                open_match = self._open_re.search(self._buf, cursor)
+                if open_match is None:
+                    # 无完整开标签。尾部可能含半截开标签（如 "<thi" / "<reaso"）：
+                    # 找最后一个 '<'，若其后没有 '>'（即未闭合的标签起始），
+                    # 只输出到该 '<' 之前，把它留在 buffer 等下一 chunk。
+                    # 否则标签已完整且非 think 标签，直接输出全部。
+                    tail_start = self._buf.rfind("<", cursor)
+                    if tail_start != -1 and ">" not in self._buf[tail_start:]:
+                        out_parts.append(self._buf[cursor:tail_start])
+                        cursor = tail_start
+                    else:
+                        out_parts.append(self._buf[cursor:])
+                        cursor = len(self._buf)
+                    break
+                if open_match.start() > cursor:
+                    out_parts.append(self._buf[cursor:open_match.start()])
+                cursor = open_match.end()
+                self._dropping = True
+            self._buf = self._buf[cursor:]
+            # 兜底：清掉漏网的孤立 think/reasoning 标签（开标签在上一条消息
+            # 或被切片丢失后，残留的无配对闭标签等）
+            return _THINK_STRAY_RE.sub("", "".join(out_parts))
 
     def __init__(
         self,
@@ -795,6 +1301,7 @@ class _AssistantStreamCallback(BaseCallbackHandler):
         self._full: list[str] = []
         self._last_flush = 0.0
         self._ended = False
+        self._think_filter = self._ThinkFilter()
 
     def on_llm_start(self, serialized, prompts, **kwargs):
         self._reset_message()
@@ -808,15 +1315,18 @@ class _AssistantStreamCallback(BaseCallbackHandler):
         self._full = []
         self._last_flush = time.monotonic()
         self._ended = False
+        self._think_filter = self._ThinkFilter()
 
     def on_llm_new_token(self, token, **kwargs):
         if not token:
             return
         if self._message_id is None or self._ended:
             self._reset_message()
-        text = str(token)
-        self._buffer.append(text)
-        self._full.append(text)
+        visible = self._think_filter.push(str(token))
+        if not visible:
+            return
+        self._buffer.append(visible)
+        self._full.append(visible)
         if time.monotonic() - self._last_flush >= self.throttle_s:
             self._flush(final=False)
 
@@ -866,7 +1376,9 @@ class _AssistantStreamCallback(BaseCallbackHandler):
                     )
                 if content:
                     candidates.append(content)
-        return candidates[-1] if candidates else ""
+        raw = candidates[-1] if candidates else ""
+        # 兜底：即便流式过滤漏过，最终消息也强制剥离 think 块
+        return _strip_think_blocks(raw)
 
     def _flush(
         self,
@@ -892,6 +1404,14 @@ class _AssistantStreamCallback(BaseCallbackHandler):
                 })
             if final:
                 content = authoritative_content or "".join(self._full)
+                # 二次兜底：authoritative_content 已被 _response_content 剥过；
+                # 但当走 fallback "".join(self._full) 时再剥一次，避免流态漏网
+                content = _strip_think_blocks(content)
+                # 若剥完为空（极端：整段都是 think），不发射空 assistant_message
+                # 防止前端出现成千上万"空消息气泡"
+                if not content.strip() and not error:
+                    self._ended = True
+                    return
                 get_event_emitter().emit(self.run_id, EventType.ASSISTANT_MESSAGE, {
                     "run_id": self.run_id, "agent_id": self.agent_id,
                     "agent_name": self.agent_name, "message_id": self._message_id,
@@ -1130,7 +1650,7 @@ class DeepAgentExecutor:
             allowed_tools = profile.tool_policy.allowed_tools
             deny_default = profile.tool_policy.deny_all_by_default
             task_budget = assignment.metadata.get("budget", {})
-            max_tool_calls = int(task_budget.get("max_tool_calls") or 20)
+            max_tool_calls = int(task_budget.get("max_tool_calls") or 40)
             tool_budget = _TaskToolBudgetGuard(
                 run_id=context.run_id,
                 task_id=assignment.task_id,
@@ -1167,12 +1687,26 @@ class DeepAgentExecutor:
                 + "\n\n"
                 f"你必须使用可用工具完成任务。工具受限，越权调用将被拒绝。\n"
                 f"所有产物必须写入工作目录 {task_workspace}。\n"
+                f"工作目录初始为空——不要试图读取已有文件，直接使用 create_file 创建交付产物。\n"
             )
             system_prompt += (
                 "\n## Execution budget (hard limit)\n"
                 f"- Maximum tool calls for this task: {max_tool_calls}\n"
-                "Inspect first, batch related work, and do not repeat failed "
-                "calls without changing the approach.\n"
+                "重要提示：工作目录是空的，不需要用 read_file / list_dir 去探查。"
+                "直接用 create_file 创建任务要求的交付文件即可。"
+                "不要反复读取不存在的文件——如果 read_file 返回'文件不存在'，"
+                "说明文件确实不存在，应立即用 create_file 创建它，而不是换路径重试。\n"
+                "\n## 工具调用规则（必须遵守）\n"
+                "1. **不要在消息中描述文件内容**。文件内容必须通过 create_file 工具调用"
+                "的 content 参数写入，绝不能在 assistant 消息正文中粘贴或描述。\n"
+                "2. **每次 create_file 调用必须同时提供 file_path 和 content 两个参数**。"
+                "如果你发现自己在消息中写了'让我创建文件…'但没有实际触发工具调用，"
+                "说明你犯了错误——立即在下一条消息中发起真正的 create_file 工具调用。\n"
+                "3. **大文件拆分**：如果单个文件内容超过 3000 字，拆成多个较小的文件"
+                "（如 architecture.md / api-spec.yaml / database-design.md），"
+                "每次 create_file 只写一个文件。不要试图在一次调用中写入超长内容。\n"
+                "4. **先创建再完善**：先用 create_file 创建包含核心内容的文件，"
+                "再用 edit_file 逐步补充细节。不要等'想清楚全部内容'才动手。\n"
             )
             contract = assignment.output_contract
             if contract:
@@ -1226,17 +1760,107 @@ class DeepAgentExecutor:
                     f"summary={item.get('summary', '')}"
                     for item in artifact_refs
                 ) + "\n"
+                system_prompt += (
+                    "\n**如何读取上游产物（重要）：**\n"
+                    "1. 上游产物已复制到工作目录的 `.inputs/` 子目录下。\n"
+                    "2. 每个产物路径形如 `.inputs/art_xxx/Filename.ext`——"
+                    "**必须使用完整的 local_path 调用 read_file**，例如 "
+                    "`read_file('.inputs/art_xxx/Filename.ext')`。\n"
+                    "3. **不要**只读目录 `.inputs/art_xxx`（它是目录不是文件），"
+                    "也**不要**省略 `.inputs/` 前缀。\n"
+                    "4. 如果不确定 `.inputs/` 下有哪些文件，先调用 "
+                    "`list_dir('.inputs')` 查看可用的产物目录。\n"
+                )
             task_metadata = assignment.metadata.get("task_metadata", {})
             if task_metadata.get("repair_of"):
+                vf = task_metadata.get("verification_feedback", {})
+                vf_failed = vf.get("failed_criteria", []) if isinstance(vf, dict) else []
+                vf_summary = vf.get("summary", "") if isinstance(vf, dict) else ""
                 system_prompt += (
                     "\n## 修复上下文（必须针对失败证据修复）\n"
                     f"- 原任务：{task_metadata.get('repair_of')}\n"
                     f"- 原产物 IDs："
                     f"{', '.join(task_metadata.get('source_artifact_ids', [])) or '(无)'}\n"
-                    "- 验证反馈："
-                    f"{json.dumps(task_metadata.get('verification_feedback', {}), ensure_ascii=False)}\n"
-                    "先读取上方 local_path 指向的原产物，再逐项修复失败条件；"
-                    "不要脱离原产物重新猜测实现。\n"
+                    f"- 验证摘要：{vf_summary}\n"
+                    "- 验证失败项：\n"
+                )
+                if isinstance(vf_failed, list) and vf_failed:
+                    for fc in vf_failed:
+                        if isinstance(fc, dict):
+                            system_prompt += (
+                                f"  • [{fc.get('criterion', '?')}] "
+                                f"{fc.get('detail', '')}\n"
+                            )
+                        else:
+                            system_prompt += f"  • {str(fc)}\n"
+                else:
+                    system_prompt += "  (无具体失败项)\n"
+
+                # ===== 技术栈一致性约束 =====
+                #
+                # 修复链不收敛的头号根因：修复代理无视原产物的技术栈，每次
+                # 修复都从零生成代码并切换框架（run_c120c3aa38dd426d task_2:
+                # v11=.jsx → v19=.jsx → v27=.vue → v31=.vue → v35=.tsx，
+                # v35 甚至同时包含 Navbar.vue 和 App.tsx）。LLM 看到"import
+                # 路径不一致"的验证反馈后，不是修路径而是换整个框架，导致
+                # 每轮修复都引入新的不一致。
+                #
+                # 这里从 repair_source 类型的 artifact_refs 中提取源文件扩展名，
+                # 在提示中明确列出原技术栈，并强制代理使用相同框架。
+                repair_source_refs = [
+                    ref for ref in artifact_refs
+                    if ref.get("purpose") == "repair_source"
+                ]
+                if repair_source_refs:
+                    from collections import Counter
+                    ext_counter: Counter[str] = Counter()
+                    source_file_list: list[str] = []
+                    for ref in repair_source_refs:
+                        src_path = ref.get("path") or ref.get("source_path") or ""
+                        local_path = ref.get("local_path") or "(unavailable)"
+                        fname = Path(src_path).name if src_path else ref.get("artifact_id", "?")
+                        ext = Path(fname).suffix.lower() if fname else ""
+                        if ext:
+                            ext_counter[ext] += 1
+                        source_file_list.append(
+                            f"  • {fname} ({local_path})"
+                        )
+                    dominant_exts = ", ".join(
+                        ext for ext, _ in ext_counter.most_common(3)
+                    ) if ext_counter else "(未知)"
+                    system_prompt += (
+                        f"\n### 原产物技术栈（必须保持一致）\n"
+                        f"源产物文件扩展名：{dominant_exts}\n"
+                        f"源产物文件列表（共 {len(repair_source_refs)} 个）：\n"
+                        + "\n".join(source_file_list) + "\n"
+                    )
+                    system_prompt += (
+                        f"\n**⚠️ 技术栈一致性要求（违反将导致修复失败）：**\n"
+                        f"1. 必须使用与原产物**相同的框架和语言**。原产物使用 "
+                        f"{dominant_exts} 文件，修复后的文件必须使用相同扩展名。\n"
+                        f"   - 如果原产物是 .jsx → 必须产出 .jsx（React JavaScript）\n"
+                        f"   - 如果原产物是 .vue → 必须产出 .vue（Vue）\n"
+                        f"   - 如果原产物是 .tsx → 必须产出 .tsx（React TypeScript）\n"
+                        f"   - 如果原产物是 .py → 必须产出 .py（Python）\n"
+                        f"2. **禁止切换框架**（如从 React 切到 Vue，或从 Vue 切到 React）。\n"
+                        f"3. **禁止混合框架**（如同时包含 .vue 和 .tsx 文件）。\n"
+                        f"4. 如果原产物使用 react-router-dom，修复后必须继续使用\n"
+                        f"   react-router-dom，不得切换到 vue-router 或其他路由库。\n"
+                    )
+
+                system_prompt += (
+                    "\n**修复要求（必须遵守）：**\n"
+                    "1. **第一步必须**用 read_file 读取上方 local_path 指向的每个"
+                    "原产物文件，了解现有实现的技术栈、目录结构和代码风格。\n"
+                    "2. 针对每个验证失败项，用 edit_file 或 create_file 修改/创建"
+                    "实际的代码文件。**禁止只写报告、总结或说明文档**——必须"
+                    "产出可执行的代码/配置。\n"
+                    "3. **在原代码基础上做最小修改**——只修改验证失败项涉及的"
+                    "部分，不要重写整个项目，不要切换框架或语言。\n"
+                    "4. 如果原产物文件路径为 .inputs/art_xxx/Filename.ext，"
+                    "读取时必须包含文件名，例如 read_file('.inputs/art_xxx/App.jsx')，"
+                    "不要只读目录 .inputs/art_xxx。\n"
+                    "5. 修复完成后确认每个失败项都已解决，且没有引入新的不一致。\n"
                 )
 
             # Always build a fresh DeepAgent graph per assignment.
@@ -1258,22 +1882,47 @@ class DeepAgentExecutor:
                 name=f"{profile.id}:{context.thread_id or assignment.task_id}",
                 model=model, tools=tools, system_prompt=system_prompt,
                 checkpointer=checkpointer, debug=False,
+                middleware=(
+                    _ToolCallIdGuardMiddleware(),
+                    _DeepAgentsToolExclusionMiddleware(),
+                    _BudgetStopMiddleware(tool_budget),
+                ),
             )
 
-            response = agent.invoke({
-                "messages": [
-                    ("user",
-                     f"目标：{assignment.objective}\n\n"
-                     f"描述：{assignment.description}\n\n"
-                     f"请使用可用工具完成此任务，并逐项满足系统消息中的交付契约。"
-                     f"所有产物必须写入工作目录。"
-                     f"完成后返回结果摘要。")
-                ]
-            }, config={
-                "configurable": {"thread_id": getattr(context, "thread_id", None) or f"{context.run_id}:{assignment.task_id}"},
-                "recursion_limit": max(4, min(500, max_tool_calls * 2 + 4)),
+            _thread_id = getattr(context, "thread_id", None) or f"{context.run_id}:{assignment.task_id}"
+            _invoke_config = {
+                "configurable": {"thread_id": _thread_id},
+                "recursion_limit": _recursion_limit_for(max_tool_calls),
                 "callbacks": [_AssistantStreamCallback(context.run_id, context.agent_id or "", profile.name)],
-            })
+            }
+
+            # Catch budget-exceeded / timeout from the first invoke so we can
+            # still attempt a no-artifact re-prompt below.  Without this, the
+            # RuntimeError propagates straight to the outer except and the
+            # agent never gets a second chance to create files.
+            _first_invoke_failed = False
+            try:
+                response = agent.invoke({
+                    "messages": [
+                        ("user",
+                         f"目标：{assignment.objective}\n\n"
+                         f"描述：{assignment.description}\n\n"
+                         f"请使用可用工具完成此任务，并逐项满足系统消息中的交付契约。"
+                         f"所有产物必须写入工作目录。"
+                         f"完成后返回结果摘要。")
+                    ]
+                }, config=_invoke_config)
+            except RuntimeError as _exc:
+                _msg = str(_exc)
+                if "tool_call_budget_exceeded" in _msg or "cancelled" in _msg:
+                    _first_invoke_failed = True
+                    logger.warning(
+                        f"[DeepAgentExecutor] task={assignment.task_id} first invoke "
+                        f"failed ({_msg}); will attempt re-prompt if no files produced"
+                    )
+                    response = {"messages": [{}]}
+                else:
+                    raise
 
             elapsed = time.time() - start
             if context.cancel_event is not None and context.cancel_event.is_set():
@@ -1284,27 +1933,119 @@ class DeepAgentExecutor:
                 ".git", ".inputs", "__pycache__", ".pytest_cache",
                 ".mypy_cache", ".cache",
             }
-            if assignment.metadata.get("worktree_mode"):
-                import subprocess
-                status = subprocess.run(
-                    ["git", "-C", str(task_workspace), "status", "--porcelain"],
-                    shell=False, capture_output=True, text=True,
-                )
-                changed_paths = []
-                for line in status.stdout.splitlines():
-                    raw = line[3:].strip()
-                    if " -> " in raw:
-                        raw = raw.split(" -> ", 1)[1]
-                    candidate = _safe_workspace_path(str(task_workspace), raw)
-                    if candidate.is_file():
-                        changed_paths.append(candidate)
-                produced_files = changed_paths
-            else:
-                produced_files = [
+
+            def _scan_produced_files() -> list[Path]:
+                if assignment.metadata.get("worktree_mode"):
+                    import subprocess
+                    status = subprocess.run(
+                        ["git", "-C", str(task_workspace), "status", "--porcelain"],
+                        shell=False, capture_output=True, text=True,
+                    )
+                    changed_paths: list[Path] = []
+                    for line in status.stdout.splitlines():
+                        raw = line[3:].strip()
+                        if " -> " in raw:
+                            raw = raw.split(" -> ", 1)[1]
+                        candidate = _safe_workspace_path(str(task_workspace), raw)
+                        if candidate.is_file():
+                            changed_paths.append(candidate)
+                    return changed_paths
+                return [
                     file_path for file_path in task_workspace.rglob("*")
                     if file_path.is_file() and not file_path.name.startswith(".")
                     and not any(part in ignored_parts for part in file_path.parts)
                 ]
+
+            produced_files = _scan_produced_files()
+
+            # ---- 无产出再提示（no-artifact re-prompt）----
+            # 弱模型（agnes-2.5-flash）首轮常以"目录为空，我需要更多信息"结束
+            # 而不实际调用 create_file。executor 此前直接返回 success=True +
+            # 空 artifacts → verifier 判 REPAIR → repair task 重跑同样行为 →
+            # 3 轮 repair 耗尽 → run 失败（run_745f55688e1348f3）。
+            # 利用 LangGraph checkpointer（thread_id 保持对话连续性），给 agent
+            # 一次明确"必须立即创建文件"的后续提示，再扫描一次。
+            #
+            # 关键：re-prompt 必须使用**全新的 budget guard + 全新 agent**。
+            # 原始 agent 的预算可能已耗尽（尤其是 glob 循环耗尽场景），
+            # ``_BudgetStopMiddleware`` 会直接拦截 model call 导致 re-prompt
+            # 也无法执行任何工具调用。给 re-prompt 一个小专用预算（10 次），
+            # 只用于 create_file，不持久化到 DB（不影响重试计数）。
+            if (
+                not produced_files
+                and not (context.cancel_event is not None and context.cancel_event.is_set())
+            ):
+                logger.warning(
+                    f"[DeepAgentExecutor] task={assignment.task_id} agent finished "
+                    f"without producing any files; re-prompting to create deliverables"
+                )
+                # Fresh budget guard for re-prompt: 10 calls, not persisted.
+                _reprompt_budget = _RepromptBudgetGuard(max_calls=10)
+                _reprompt_tools = _build_restricted_tools(
+                    allowed_tools, deny_default, task_workspace=str(task_workspace),
+                    allow_file_read=profile.tool_policy.allow_file_read,
+                    allow_file_write=profile.tool_policy.allow_file_write,
+                    allow_shell=profile.tool_policy.allow_shell,
+                    cancel_event=context.cancel_event,
+                    safety_point=_reprompt_budget.checkpoint,
+                    permission_broker=context.permission_broker,
+                    run_id=context.run_id,
+                    agent_id=context.agent_id or "",
+                    task_id=assignment.task_id,
+                    team_tools=self._build_team_tools(
+                        assignment,
+                        context,
+                        safety_point=_reprompt_budget.checkpoint,
+                    ),
+                    allow_team_tools=profile.tool_policy.allow_team_tools,
+                )
+                _reprompt_agent = create_deep_agent(
+                    name=f"{profile.id}:reprompt:{assignment.task_id}",
+                    model=model, tools=_reprompt_tools,
+                    system_prompt=system_prompt,
+                    checkpointer=checkpointer, debug=False,
+                    middleware=(
+                        _ToolCallIdGuardMiddleware(),
+                        _DeepAgentsToolExclusionMiddleware(),
+                        _BudgetStopMiddleware(_reprompt_budget),
+                    ),
+                )
+                thread_id = (
+                    getattr(context, "thread_id", None)
+                    or f"{context.run_id}:{assignment.task_id}"
+                )
+                invoke_config = {
+                    "configurable": {"thread_id": thread_id},
+                    "recursion_limit": _recursion_limit_for(10),
+                    "callbacks": [_AssistantStreamCallback(
+                        context.run_id, context.agent_id or "", profile.name,
+                    )],
+                }
+                try:
+                    response = _reprompt_agent.invoke({
+                        "messages": [
+                            ("user",
+                             "你上一轮结束时没有在工作目录中创建任何文件，任务无法通过验证。"
+                             f"请**立即**使用 create_file 工具将交付产物写入工作目录 {task_workspace}。"
+                             "不要只在消息中描述或粘贴内容，必须实际调用 create_file 创建文件。"
+                             "若不确定文件名，请根据任务目标自行确定合理的文件名与格式"
+                             "（如 .md / .py / .ts / .json 等）。现在就开始创建文件。")
+                        ]
+                    }, config=invoke_config)
+                except RuntimeError as _exc:
+                    logger.warning(
+                        f"[DeepAgentExecutor] task={assignment.task_id} re-prompt "
+                        f"failed: {_exc}"
+                    )
+                    response = {"messages": [{}]}
+                if context.cancel_event is not None and context.cancel_event.is_set():
+                    elapsed = time.time() - start
+                    return AgentExecutionResult(
+                        success=False, error="cancelled", execution_time=elapsed,
+                    )
+                tool_calls.extend(_extract_tool_calls(response))
+                produced_files = _scan_produced_files()
+
             produced_artifact_ids = []
             # 移除"兼容回退"伪 ID：所有 artifact ID 必须来自真实 ArtifactStore.create
             if self._artifact_store is not None and context.run_id:

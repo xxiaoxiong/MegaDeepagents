@@ -17,11 +17,15 @@ import ArtifactCard from "./ArtifactCard.vue";
 import ApprovalCard from "./ApprovalCard.vue";
 import CollaborationCard from "./CollaborationCard.vue";
 import StatusPill from "./StatusPill.vue";
+import { stripThinkBlocks } from "@/lib/sanitize";
 
 const props = defineProps<{
   message: ChatMessage;
   runId: string;
 }>();
+
+// 产出卡片点击不再跳转，而是冒泡到 ChatView 由右侧抽屉展示文件内容。
+const emit = defineEmits<{ "open-artifact": [artifactId: string] }>();
 
 // ChatMessage 联合有两个判别字段（user/assistant 用 role，其余用 type），
 // 模板里直接 v-if="message.type" 会被 vue-tsc 拒绝（联合窄化），改用类型守卫 computed。
@@ -53,6 +57,12 @@ const userMsg = computed(() =>
 const assistantMsg = computed(() =>
   isAssistant(props.message) ? props.message : null,
 );
+// Sanitize LLM reasoning-chain tags (think / reasoning) before rendering.
+// Covers historical DB messages already carrying leaked tags and any residual
+// backend bypass path. Empty after sanitize => treated as no visible content.
+const assistantContent = computed(() =>
+  assistantMsg.value ? stripThinkBlocks(assistantMsg.value.content) : "",
+);
 const toolCallMsg = computed(() =>
   isToolCall(props.message) ? props.message : null,
 );
@@ -80,7 +90,7 @@ const collaborationMsg = computed(() =>
 
   <!-- 助手气泡：空内容非 streaming 不渲染；空内容 streaming 显示"正在思考..." -->
   <div
-    v-else-if="assistantMsg && (assistantMsg.content.trim() || assistantMsg.streaming)"
+    v-else-if="assistantMsg && (assistantContent.trim() || assistantMsg.streaming)"
     class="msg-row assistant"
   >
     <div
@@ -95,14 +105,14 @@ const collaborationMsg = computed(() =>
       </span>
       <div class="msg-bubble assistant-bubble">
         <span
-          v-if="!assistantMsg.content.trim() && assistantMsg.streaming"
+          v-if="!assistantContent.trim() && assistantMsg.streaming"
           class="thinking-dots"
         >
           正在思考
         </span>
         <MarkdownMessage
           v-else
-          :content="assistantMsg.content"
+          :content="assistantContent"
           :streaming="assistantMsg.streaming"
         />
       </div>
@@ -129,6 +139,7 @@ const collaborationMsg = computed(() =>
       :artifact-id="artifactMsg.artifactId"
       :task-id="artifactMsg.taskId"
       :produced-by="artifactMsg.producedBy"
+      @open="emit('open-artifact', $event)"
     />
   </div>
 

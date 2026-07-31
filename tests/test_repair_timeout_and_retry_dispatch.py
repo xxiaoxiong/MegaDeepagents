@@ -52,26 +52,30 @@ from app.multiagent.agent_registry import (
 class TestCapabilityTimeout:
     """Verify the shared capability→timeout lookup used by planner, repair, and scheduler."""
 
-    def test_planning_returns_900(self):
-        assert capability_timeout(["planning"]) == 900.0
+    def test_planning_returns_1200(self):
+        assert capability_timeout(["planning"]) == 1200.0
 
-    def test_coding_returns_600(self):
-        assert capability_timeout(["coding"]) == 600.0
+    def test_coding_returns_900(self):
+        # coding was 600, bumped to 900 for multi-file projects
+        # (run_72df9e9852a64998 observed 19+ file writes).
+        assert capability_timeout(["coding"]) == 900.0
 
-    def test_testing_returns_300(self):
-        assert capability_timeout(["testing"]) == 300.0
+    def test_testing_returns_600(self):
+        # testing was 300, bumped to 600 — task_4__repair_v29 timed out at
+        # 300s while authoring+running e2e tests (run_3fb3c2572f1348b0).
+        assert capability_timeout(["testing"]) == 600.0
 
     def test_summarization_returns_600(self):
         assert capability_timeout(["summarization"]) == 600.0
 
     def test_picks_first_primary_capability(self):
         # planning comes before file_read in the list; planning wins.
-        assert capability_timeout(["planning", "file_read"]) == 900.0
+        assert capability_timeout(["planning", "file_read"]) == 1200.0
 
     def test_skips_tool_capabilities(self):
         # file_read/shell_execute are tool caps, not in CAPABILITY_TIMEOUTS;
         # the lookup should skip them and find 'coding'.
-        assert capability_timeout(["file_read", "shell_execute", "coding"]) == 600.0
+        assert capability_timeout(["file_read", "shell_execute", "coding"]) == 900.0
 
     def test_unknown_capability_returns_zero(self):
         assert capability_timeout(["unknown_cap"]) == 0.0
@@ -113,16 +117,16 @@ def _make_graph_with_node(
 class TestRepairTaskTimeoutInheritance:
     """Verify repair tasks inherit the per-capability timeout from their target."""
 
-    def test_planning_repair_inherits_900s(self):
-        """A repair of a planning task must get 900s, not the 300s global default.
+    def test_planning_repair_inherits_1200s(self):
+        """A repair of a planning task must get 1200s, not the 300s global default.
 
         Regression: run_e8587ea68ac64ff5 T1__repair_v17 was killed at 300s.
         """
         graph = _make_graph_with_node(
-            "T1", ["planning"], TaskBudget(max_attempts=4, max_seconds=900.0),
+            "T1", ["planning"], TaskBudget(max_attempts=4, max_seconds=1200.0),
         )
         repair = graph.add_repair_task("T1", "repair the plan", required_capabilities=["planning"])
-        assert repair.budget.max_seconds == 900.0
+        assert repair.budget.max_seconds == 1200.0
         assert repair.max_attempts >= 4
 
     def test_coding_repair_inherits_600s(self):

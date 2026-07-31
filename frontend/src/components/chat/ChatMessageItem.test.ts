@@ -57,4 +57,49 @@ describe("ChatMessageItem multi-agent identity", () => {
       app.unmount();
     }
   });
+
+  it("scrubs reasoning-chain tags from assistant content before rendering", () => {
+    // Historical DB messages may carry leaked think/reasoning tags; the
+    // component must strip them client-side so the UI never shows the raw
+    // closing tag characters the user reported.
+    const { app, container } = render({
+      id: "message_3",
+      role: "assistant",
+      content: "可见答案<reasoning>秘密推理</reasoning>收尾",
+      streaming: false,
+      agentId: "agent_coder",
+      agentName: "Coder",
+      createdAt: "2026-07-24T10:00:02Z",
+    });
+    try {
+      const text = container.textContent || "";
+      expect(text).toContain("可见答案");
+      expect(text).toContain("收尾");
+      expect(text).not.toContain("<reasoning>");
+      expect(text).not.toContain("</reasoning>");
+      expect(text).not.toContain("秘密推理");
+    } finally {
+      app.unmount();
+    }
+  });
+
+  it("scrubs an orphan closing tag from assistant content", () => {
+    const { app, container } = render({
+      id: "message_4",
+      role: "assistant",
+      content: "答案</reasoning>更多",
+      streaming: false,
+      agentId: "agent_coder",
+      agentName: "Coder",
+      createdAt: "2026-07-24T10:00:03Z",
+    });
+    try {
+      const text = container.textContent || "";
+      expect(text).toContain("答案");
+      expect(text).toContain("更多");
+      expect(text).not.toContain("</reasoning>");
+    } finally {
+      app.unmount();
+    }
+  });
 });

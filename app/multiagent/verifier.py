@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import shlex
 import tempfile
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -28,6 +29,55 @@ from pathlib import Path
 from typing import Any, Callable, Literal
 
 from app.core.logging import logger
+
+
+# ===== Verifier LLM 调用重试 =====
+#
+# ``LLMRubricVerifier._call_rubric_llm`` 在 run 期间会与多个 worker agent 的
+# LLM 调用并发抢额度。OpenAI 兼容端点（agnes / 其它代理）在并发压力下频繁返回
+# 429 / 网关超时，导致 verifier 的单次 invoke 失败 → ``_fallback_verify`` →
+# fail-closed REPAIR → 触发新一轮 repair（更多 LLM 调用）→ 更多 429，形成死循环
+# （run_3fb3c2572f1348b0 task_3__repair_v15 / v19：agent 实际已修复产物，但
+# verifier LLM 调用 429 失败 → 假 REPAIR → 无意义修复两轮）。
+#
+# 修复：对 verifier 的 LLM 调用做有限次指数退避重试（base 15s，上限 300s，符合
+# 项目约定），仅在重试耗尽后才回退到 fail-closed。这把"瞬时 429"和"真的没模型"
+# 区分开，避免一次抖动就判 REPAIR。
+_VERIFIER_LLM_MAX_RETRIES = 3
+_VERIFIER_LLM_BASE_DELAY = 15.0
+_VERIFIER_LLM_MAX_DELAY = 300.0
+
+# ===== 产物内容预览上限 =====
+#
+# ``enrich_with_artifact_store`` 读取 artifact 文件并截取前 N 字符存入
+# ``entry["content"]``；``_build_rubric_prompt`` 再把这个字符串展示给 LLM。
+# 两个阈值必须一致，否则 enrich 保留了 24000 字符但 prompt builder 只展示
+# 6000 字符，中间的代码对 LLM 不可见 → LLM 幻觉出 correctness 失败
+# （run_55507ebfce5744e8 task_2__repair_v31：22441 字符的 index.html，
+# head 3000 + tail 3000 展示，中间 16441 字符被省略，LLM 看不到
+# Notifications 组件的 default case 和 LoginPage，幻觉出"未闭合条件判断"
+# 和"缺少 strict 属性"——后者甚至不是 React Router v6 的真实 API）。
+_RUBRIC_CONTENT_PREVIEW_LIMIT = 24000
+
+
+def _is_transient_llm_error(exc: BaseException) -> bool:
+    """Return True for transient LLM errors worth retrying (429/timeout/connection)."""
+    msg = str(exc).lower()
+    if any(k in msg for k in ("429", "rate limit", "rate_limit", "too many requests")):
+        return True
+    if any(k in msg for k in ("timeout", "timed out", "connection", "socket",
+                              "temporarily", "unavailable", "503", "502", "500",
+                              "retry", "overloaded")):
+        return True
+    # langchain/openai exception types (if importable)
+    try:
+        from openai import RateLimitError, APITimeoutError, APIConnectionError, InternalServerError
+        if isinstance(exc, (RateLimitError, APITimeoutError, APIConnectionError,
+                            InternalServerError)):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 class Verdict(str, Enum):
@@ -395,36 +445,126 @@ class LLMRubricVerifier:
 
         LLM 调用本身失败时（网络/解析异常），用真实 (goal, artifacts) 走
         _fallback_verify，而非历史上的 (prompt, {})，避免假 REPAIR。
+
+        对瞬时错误（429 / 超时 / 连接）做有限次指数退避重试，避免一次抖动就
+        fail-closed REPAIR 触发 repair 死循环。
         """
+        from app.llm_factory import build_model
+        # 使用低成本模型做评估
+        llm = build_model()
+        # NB: 示例必须用双引号的标准 JSON。早期版本在 prompt 里写了
+        # ``{'scores': ...}`` 单引号 Python dict，LLM 照抄导致 json.loads
+        # 失败 → _fallback_verify → fail_closed REPAIR（run_e9adbc33570a4243）。
+        # 解析器现已兼容 Python dict 字面量（ast.literal_eval），但 prompt
+        # 仍应示范正确 JSON 以减少 fallback。
+        messages = [
+            ("system", "你是一个严格的验证评估员。评估后只输出一个 JSON 对象"
+                      "（不要输出任何解释文字、不要用 Markdown 代码块），"
+                      "用双引号，格式为："
+                      '{"scores": {"completeness": 0~1, "correctness": 0~1, '
+                      '"consistency": 0~1, "evidence": 0~1}, '
+                      '"failed_criteria": [{"criterion": "...", "detail": "...", '
+                      '"severity": "low|medium|high"}], '
+                      '"verdict": "pass|repair|replan|human_required|fail", '
+                      '"summary": "..."}。'
+                      "\n\n重要：failed_criteria 中的 criterion 字段只能使用语义"
+                      "评估维度名称（如 completeness/完整性、correctness/正确性、"
+                      "consistency/一致性、evidence/证据性）。禁止使用 json_schema、"
+                      "command、file_hash、files、format 等程序化检查名称——这些"
+                      "由系统自动执行，不需要 LLM 评估。"),
+            ("user", prompt),
+        ]
+        text: str | None = None
+        last_exc: Exception | None = None
+        for attempt in range(_VERIFIER_LLM_MAX_RETRIES + 1):
+            try:
+                response = llm.invoke(messages)
+                text = getattr(response, "content", str(response))
+                break
+            except Exception as exc:
+                last_exc = exc
+                if attempt < _VERIFIER_LLM_MAX_RETRIES and _is_transient_llm_error(exc):
+                    delay = min(
+                        _VERIFIER_LLM_BASE_DELAY * (2 ** attempt),
+                        _VERIFIER_LLM_MAX_DELAY,
+                    )
+                    logger.warning(
+                        "[LLMRubricVerifier] LLM 调用瞬时失败（第 %d 次），"
+                        "%.1f 秒后重试: %s",
+                        attempt + 1, delay, exc,
+                    )
+                    time.sleep(delay)
+                    continue
+                # 非瞬时错误或重试耗尽：走 fallback
+                logger.warning(
+                    "[LLMRubricVerifier] LLM rubric 调用失败（不再重试）: %s", exc
+                )
+                return self._fallback_verify(goal, artifacts)
+
+        if text is None:
+            # 所有重试都失败
+            logger.warning(
+                "[LLMRubricVerifier] LLM rubric 调用 %d 次重试均失败: %s",
+                _VERIFIER_LLM_MAX_RETRIES, last_exc,
+            )
+            return self._fallback_verify(goal, artifacts)
+
+        import json
         try:
-            from app.llm_factory import build_model
-            # 使用低成本模型做评估
-            llm = build_model()
-            response = llm.invoke([
-                ("system", "你是一个严格的验证评估员。评估后输出 JSON，格式为："
-                          "{'scores': {'completeness': 0~1, ...}, "
-                          "'failed_criteria': [{'criterion':..., 'detail':..., 'severity':...}], "
-                          "'verdict': 'pass'|'repair'|'replan'|'human_required'|'fail', "
-                          "'summary': '...'}。"),
-                ("user", prompt),
-            ])
-            text = getattr(response, "content", str(response))
-            import json
             parsed = self._parse_rubric_json(text) if isinstance(text, str) else text
         except Exception as exc:
-            logger.warning(f"[LLMRubricVerifier] LLM rubric 调用失败: {exc}")
+            logger.warning(
+                "[LLMRubricVerifier] rubric JSON 解析失败，回退规则评分: %s", exc
+            )
             # 关键修复：传真实 (goal, artifacts) 而非 (prompt, {})
             return self._fallback_verify(goal, artifacts)
 
-        failed = [
-            CriterionFailure(criterion=c["criterion"], detail=c["detail"], severity=c.get("severity", "medium"))
-            for c in parsed.get("failed_criteria", [])
-        ]
+        # 过滤 LLM 幻觉产生的程序化检查名称。LLM 偶尔会在 failed_criteria
+        # 中使用 "json_schema"/"command"/"file_hash" 等保留名称（observed:
+        # run_bc2472cb08354dd4 task_1 验证返回 criterion="json_schema"
+        # detail="argument of type 'NoneType' is not iterable"），这些名称
+        # 是 ProgrammaticVerifier 的专属检查项，LLM 不应使用。保留它们会导致
+        # 假失败（verdict 被拉高到 replan/repair）+ 误导开发者以为是代码 bug。
+        _RESERVED_PROGRAMMATIC_CRITERIA = frozenset({
+            "json_schema", "command", "file_hash", "files", "format",
+            "diff_scope", "forbidden_changes",
+        })
+        failed: list[CriterionFailure] = []
+        for c in parsed.get("failed_criteria", []):
+            if not isinstance(c, dict):
+                continue
+            crit_name = c.get("criterion", "")
+            if not isinstance(crit_name, str) or not crit_name.strip():
+                continue
+            if crit_name.lower().strip() in _RESERVED_PROGRAMMATIC_CRITERIA:
+                logger.info(
+                    "[LLMRubricVerifier] 过滤 LLM 幻觉的程序化检查名称 %r",
+                    crit_name,
+                )
+                continue
+            detail = c.get("detail", "")
+            if not isinstance(detail, str):
+                detail = str(detail)
+            failed.append(CriterionFailure(
+                criterion=crit_name,
+                detail=detail,
+                severity=c.get("severity", "medium"),
+            ))
         verdict_str = parsed.get("verdict", "repair")
         try:
             verdict = Verdict(verdict_str)
         except ValueError:
             verdict = Verdict.REPAIR
+
+        # 如果所有 failed_criteria 都是被过滤掉的程序化检查名称幻觉，
+        # 把 verdict 降级为 PASS——没有真正的语义失败就不应触发 repair/replan。
+        if not failed and verdict in (Verdict.REPAIR, Verdict.REPLAN, Verdict.FAIL):
+            logger.info(
+                "[LLMRubricVerifier] 所有 failed_criteria 均为幻觉程序化检查，"
+                "verdict %s → PASS", verdict.value,
+            )
+            verdict = Verdict.PASS
+
         return ValidationResult(
             verdict=verdict,
             scores=parsed.get("scores", {}),
@@ -439,14 +579,44 @@ class LLMRubricVerifier:
         兼容：
         1. 标准 JSON（如响应中直接给出 ``{"scores": ...}``）；
         2. Markdown 代码块包裹（如 `` ```json\\n{"scores": ...}\\n``` ``）；
-        3. 内嵌于中文说明文字中的 JSON（提取首个 ``{...}`` 块）。
+        3. 内嵌于中文说明文字中的 JSON（提取首个 ``{...}`` 块）；
+        4. Python dict 字面量（单引号 / ``True`` / ``False`` / ``None``）——
+           某些 LLM 端点即使被要求输出 JSON 也会返回 Python repr 风格的 dict
+           （如 ``{'scores': {'completeness': 0.1}, ...}``）。此前这种响应
+           让 ``json.loads`` 全部失败 → ``_fallback_verify`` → ``fail_closed``
+           REPAIR，造成 planning 任务被反复无意义修复（run_e9adbc33570a4243
+           task_1__repair_v7：LLM 实际已给出评分但解析失败，3 轮 repair 全
+           白跑）。``ast.literal_eval`` 只求值字面量，安全且能处理单引号 dict。
         """
+        import ast
         import json
-        # 直接尝试
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
+
+        def _try_loads(s: str) -> dict[str, Any] | None:
+            s = s.strip()
+            if not s:
+                return None
+            # 1. 标准 JSON（双引号、true/false/null）
+            try:
+                result = json.loads(s)
+                if isinstance(result, dict):
+                    return result
+            except (json.JSONDecodeError, ValueError):
+                pass
+            # 2. Python dict 字面量（单引号、True/False/None）—— ast.literal_eval
+            #    只求值字面量（字符串/数字/tuple/list/dict/bool/None），不会执行
+            #    函数调用或属性访问，可安全用于解析 LLM 输出。
+            try:
+                result = ast.literal_eval(s)
+                if isinstance(result, dict):
+                    return result
+            except (ValueError, SyntaxError):
+                pass
+            return None
+
+        # 直接尝试整段
+        parsed = _try_loads(text)
+        if parsed is not None:
+            return parsed
         # 尝试剥离 markdown 代码块
         strip_prefixes = ("```json", "```", "```JSON")
         for prefix in strip_prefixes:
@@ -456,10 +626,9 @@ class LLMRubricVerifier:
                 end = rest.find("```")
                 if end != -1:
                     candidate = rest[:end].strip()
-                    try:
-                        return json.loads(candidate)
-                    except json.JSONDecodeError:
-                        pass
+                    parsed = _try_loads(candidate)
+                    if parsed is not None:
+                        return parsed
                 break
         # 尝试提取首个 { ... } 块
         start = text.find("{")
@@ -467,10 +636,9 @@ class LLMRubricVerifier:
             end = text.rfind("}")
             if end > start:
                 candidate = text[start:end + 1]
-                try:
-                    return json.loads(candidate)
-                except json.JSONDecodeError:
-                    pass
+                parsed = _try_loads(candidate)
+                if parsed is not None:
+                    return parsed
         # raise TypeError，让上层 catch 后走 _fallback_verify
         raise TypeError(f"LLMRubricVerifier 无法解析 rubric JSON: {text[:300]}")
 
@@ -483,8 +651,54 @@ class LLMRubricVerifier:
         lines = [f"目标: {goal}"]
         for path, info in artifacts.items():
             content = info.get("content", "") or info.get("content_preview", "")
-            lines.append(f"\n--- 产物: {path} ---\n{content[:500]}")
+            size = info.get("size_bytes", 0) or len(content)
+            # Show up to _RUBRIC_CONTENT_PREVIEW_LIMIT chars so the LLM can
+            # actually evaluate completeness/correctness.  The previous 500-char
+            # limit meant a 30 KB OpenAPI spec or 13 KB architecture document
+            # had <2% of its content visible, causing the rubric to flag
+            # "completeness" / "evidence" failures on every repair round
+            # (run_8dfe5fb9dae74962 task_1: 3 consecutive repair rounds with no
+            # real progress).
+            #
+            # This must match the cap in ``enrich_with_artifact_store`` — if
+            # enrich keeps 24000 chars but the prompt only shows 6000, the LLM
+            # sees head+tail with a large gap in the middle and hallucinates
+            # correctness failures on the hidden code (run_55507ebfce5744e8
+            # task_2__repair_v31: 22441-char index.html, 16441 chars omitted).
+            preview_limit = _RUBRIC_CONTENT_PREVIEW_LIMIT
+            header = f"--- 产物: {path} (size: {size} bytes)"
+            if len(content) <= preview_limit:
+                # Whole file fits — show it in full.
+                lines.append(f"\n{header} ---\n{content}")
+                continue
+            # Large file: show HEAD + TAIL so the LLM can see the file both
+            # starts and ends properly.  Showing only the head made the rubric
+            # hallucinate "method truncated" / "file incomplete" on every large
+            # artifact (run_3fb3c2572f1348b0 task_4__repair_v29: 18KB test file
+            # was complete at 493 lines, but only the first 6KB was visible so
+            # the LLM falsely claimed TestHealthCheck.run() was truncated).
+            head_len = preview_limit // 2
+            tail_len = preview_limit - head_len
+            head = content[:head_len]
+            tail = content[-tail_len:]
+            omitted = len(content) - head_len - tail_len
+            header += (
+                f", showing first {head_len} chars + last {tail_len} chars "
+                f"({omitted} chars omitted in the middle)"
+            )
+            header += " ---"
+            lines.append(
+                f"\n{header}\n{head}\n"
+                f"\n... [{omitted} chars omitted ] ...\n"
+                f"\n{tail}"
+            )
         lines.append(f"\n评估维度: {', '.join(rubrics)}")
+        lines.append(
+            "\n注意：产物内容可能因长度限制只展示开头和结尾（中间省略）。"
+            "省略不代表产物不完整——文件大小已标注。请基于已展示的开头与结尾"
+            "内容评估质量，不要仅因内容省略而判定 repair。如果产物非空、结构"
+            "完整（有合理的开头和结尾），应视为满足完整性要求。"
+        )
         return "\n".join(lines)
 
     def _fallback_verify(
@@ -621,7 +835,19 @@ class Verifier:
                     entry["integrity_verified"] = bool(integrity_ok)
                     if integrity_ok:
                         text = raw.decode("utf-8", errors="ignore")
-                        entry.setdefault("content", text[:5000])
+                        # Capture both a head window and the full text.  The
+                        # rubric prompt builder (``_build_rubric_prompt``)
+                        # shows head+tail for large files so the LLM can see
+                        # the file ends properly; capping at 8000 chars here
+                        # made the "tail" land in the middle of large files
+                        # (run_3fb3c2572f1348b0 task_4__repair_v29: 18KB test
+                        # file — the real ending was never shown, causing false
+                        # "method truncated" verdicts).  Must stay in sync with
+                        # ``_RUBRIC_CONTENT_PREVIEW_LIMIT`` used by the prompt
+                        # builder — if they diverge the LLM sees a truncated
+                        # view and hallucinates correctness failures
+                        # (run_55507ebfce5744e8 task_2__repair_v31).
+                        entry.setdefault("content", text[:_RUBRIC_CONTENT_PREVIEW_LIMIT])
                     else:
                         entry.setdefault(
                             "content",
@@ -686,11 +912,11 @@ class Verifier:
                     ))
             if checks.get("file_hashes"):
                 all_results.append(self.programmatic.verify_hashes(checks["file_hashes"]))
-            if "json_schema" in checks and "data" in checks:
+            if checks.get("json_schema") is not None and checks.get("data") is not None:
                 all_results.append(self.programmatic.verify_json_schema(
                     checks["data"], checks["json_schema"]
                 ))
-            if "format" in checks:
+            if checks.get("format") is not None:
                 content = checks.get("content", "")
                 all_results.append(self.programmatic.verify_output_format(content, checks["format"]))
             if checks.get("changed_files") is not None and (

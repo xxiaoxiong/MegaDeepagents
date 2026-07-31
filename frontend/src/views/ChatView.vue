@@ -11,6 +11,7 @@ import { useRoute, useRouter } from "vue-router";
 import {
   ArrowRight,
   Bot,
+  FileArchive,
   GitFork,
   ListTree,
   LoaderCircle,
@@ -21,17 +22,20 @@ import {
   Settings,
   Sparkles,
   Square,
+  X,
 } from "@lucide/vue";
 import { api } from "@/lib/api";
 import { useChatThread } from "@/composables/useChatThread";
 import type {
   AgentRun,
+  Artifact,
   CreateRunInput,
   RunExecution,
   RunMode,
 } from "@/types";
 import StatusBadge from "@/components/StatusBadge.vue";
 import ChatMessageItem from "@/components/chat/ChatMessageItem.vue";
+import ArtifactExplorer from "@/components/ArtifactExplorer.vue";
 
 const route = useRoute();
 const router = useRouter();
@@ -90,6 +94,35 @@ const currentRun = computed(() =>
 const execution = ref<RunExecution | null>(null);
 let executionTimer: number | null = null;
 
+// ===== 右侧产出文件抽屉（对齐 codex 聊天 + 文件面板体验）=====
+const drawerOpen = ref(false);
+const selectedArtifactId = ref<string | null>(null);
+const artifacts = ref<Artifact[]>([]);
+
+async function loadArtifacts(id = runIdRef.value) {
+  if (!id) {
+    artifacts.value = [];
+    return;
+  }
+  try {
+    const list = await api.listArtifacts(id);
+    if (runIdRef.value === id) artifacts.value = list;
+  } catch {
+    // 抽屉在产出投影暂时不可用时仍可用，仅保持旧列表
+  }
+}
+
+function toggleDrawer() {
+  drawerOpen.value = !drawerOpen.value;
+  if (drawerOpen.value) void loadArtifacts();
+}
+
+function openArtifact(artifactId: string) {
+  selectedArtifactId.value = artifactId;
+  drawerOpen.value = true;
+  if (!artifacts.value.length) void loadArtifacts();
+}
+
 async function loadExecution(id = runIdRef.value) {
   if (!id) {
     execution.value = null;
@@ -117,11 +150,18 @@ watch(
   runIdRef,
   (id) => {
     execution.value = null;
+    artifacts.value = [];
+    selectedArtifactId.value = null;
     void loadExecution(id);
+    if (drawerOpen.value) void loadArtifacts(id);
   },
   { immediate: true },
 );
-watch(() => thread.messages.value.length, scheduleExecutionRefresh);
+watch(() => thread.messages.value.length, () => {
+  scheduleExecutionRefresh();
+  // 产出文件随事件增长：抽屉打开时同步刷新，关闭时不浪费请求
+  if (drawerOpen.value) void loadArtifacts();
+});
 
 function openAgent(agentId: string) {
   void router.push({
@@ -275,7 +315,7 @@ const examples = [
 </script>
 
 <template>
-  <div class="chat-layout">
+  <div class="chat-layout" :class="{ 'has-drawer': drawerOpen && runIdRef }">
     <!-- 侧边栏：会话列表 -->
     <aside class="chat-sidebar">
       <RouterLink class="chat-brand" to="/chat">
@@ -347,6 +387,17 @@ const examples = [
           >
             {{ streamStateLabel }}
           </span>
+          <button
+            v-if="runIdRef"
+            class="btn btn-ghost btn-small"
+            :class="{ active: drawerOpen }"
+            type="button"
+            :title="drawerOpen ? '收起产出文件面板' : '查看产出文件'"
+            @click="toggleDrawer"
+          >
+            <FileArchive :size="14" /> 文件
+            <span v-if="artifacts.length" class="chat-drawer-badge">{{ artifacts.length }}</span>
+          </button>
           <RouterLink
             class="btn btn-ghost btn-small"
             :to="`/runs/${runIdRef}`"
@@ -421,6 +472,7 @@ const examples = [
             :key="msg.id"
             :message="msg"
             :run-id="runIdRef"
+            @open-artifact="openArtifact"
           />
           <div v-if="!thread.messages.value.length && !thread.loadingHistory.value" class="chat-history-loading">
             还没有事件，向 Agent 发送一条消息开始对话。
@@ -486,5 +538,26 @@ const examples = [
         </div>
       </div>
     </main>
+
+    <!-- 右侧产出文件抽屉：复用 ArtifactExplorer，不跳转、就地预览 -->
+    <aside v-if="drawerOpen && runIdRef" class="chat-drawer">
+      <header class="chat-drawer-head">
+        <strong><FileArchive :size="15" /> 产出文件</strong>
+        <button
+          class="btn btn-ghost btn-small"
+          type="button"
+          title="收起"
+          @click="drawerOpen = false"
+        >
+          <X :size="14" />
+        </button>
+      </header>
+      <ArtifactExplorer
+        :run-id="runIdRef"
+        :artifacts="artifacts"
+        :initial-artifact-id="selectedArtifactId"
+        @selected="(id) => (selectedArtifactId = id)"
+      />
+    </aside>
   </div>
 </template>

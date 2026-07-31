@@ -103,7 +103,7 @@ class Settings(BaseSettings):
     max_concurrency: int = 4
     max_team_size: int = 6
     max_spawn_depth: int = 2
-    max_repair_rounds: int = 3
+    max_repair_rounds: int = 5
     # 900s left planning tasks stuck for 15 min before the scheduler could
     # re-dispatch failed siblings.  300s is long enough for a coding/test
     # turn yet short enough that a stuck task doesn't paralyse the team.

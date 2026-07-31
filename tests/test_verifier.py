@@ -16,6 +16,7 @@ from app.multiagent.verifier import (
     EvidenceRef,
     VerificationCommand,
 )
+from app.multiagent import verifier as verifier_module
 
 
 # ===== ProgrammaticVerifier =====
@@ -144,6 +145,42 @@ def test_llm_rubric_parse_json_handles_plain_codeblock_and_embedded():
     import pytest
     with pytest.raises(TypeError):
         LLMRubricVerifier._parse_rubric_json("not json at all")
+
+
+def test_llm_rubric_parse_json_handles_python_dict_literal():
+    """LLM 返回 Python repr 风格 dict（单引号）也能解析。
+
+    回归锁定 run_e9adbc33570a4243 task_1__repair_v7：agnes 等端点即使被
+    要求输出 JSON 也会返回 ``{'scores': {'completeness': 0.1}, ...}`` 单引号
+    字面量。旧版只试 ``json.loads``，全部失败 → ``_fallback_verify`` →
+    ``fail_closed`` REPAIR，导致 planning 任务被反复无意义修复。现用
+    ``ast.literal_eval`` 兜底，让 LLM 的真实 verdict 通过。
+    """
+    from app.multiagent.verifier import LLMRubricVerifier
+
+    # 真实观测到的响应形态：单引号 dict，含中文 detail
+    py_dict = (
+        "{'scores': {'completeness': 0.1}, "
+        "'failed_criteria': [{'criterion': '修复后必须通过 Verifier', "
+        "'detail': '数据库脚本中存在笔误', 'severity': 'high'}], "
+        "'verdict': 'repair', 'summary': '需要修复'}"
+    )
+    parsed = LLMRubricVerifier._parse_rubric_json(py_dict)
+    assert parsed["verdict"] == "repair"
+    assert parsed["scores"]["completeness"] == 0.1
+    assert parsed["failed_criteria"][0]["criterion"] == "修复后必须通过 Verifier"
+
+    # Python dict 嵌在叙述文字中
+    embedded = "评估完成，结果如下：\n" + py_dict + "\n请据此修复。"
+    parsed2 = LLMRubricVerifier._parse_rubric_json(embedded)
+    assert parsed2["verdict"] == "repair"
+
+    # Python dict 含 True/False/None 也能解析
+    py_bool = "{'scores': {'ok': 1.0}, 'passed': True, 'skipped': None, 'verdict': 'pass'}"
+    parsed3 = LLMRubricVerifier._parse_rubric_json(py_bool)
+    assert parsed3["verdict"] == "pass"
+    assert parsed3["passed"] is True
+    assert parsed3["skipped"] is None
 
 
 # ===== Verifier 顶层 =====
@@ -276,3 +313,129 @@ def test_evidence_ref():
 def test_criterion_failure():
     c = CriterionFailure(criterion="t", detail="d")
     assert c.severity == "medium"  # default
+
+
+# ===== Verifier LLM 重试（避免 429 死循环） =====
+
+
+def test_rubric_retries_transient_errors_then_succeeds(monkeypatch):
+    """瞬时错误（429/超时）应重试，成功后正常返回而非 fail-closed REPAIR。
+
+    锁定 run_3fb3c2572f1348b0 task_3__repair_v15/v19 的回归：verifier LLM
+    调用 429 失败 → _fallback_verify → 假 REPAIR → 触发更多 LLM 调用 → 更多
+    429，形成死循环。
+    """
+    import app.llm_factory as llm_factory
+
+    v = LLMRubricVerifier(model_available=True)
+
+    # 构造一个 mock llm：前两次抛 429，第三次返回 pass
+    class _Resp:
+        content = '{"scores":{"completeness":1.0},"failed_criteria":[],"verdict":"pass","summary":"ok"}'
+
+    class _FlakyLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, messages):
+            self.calls += 1
+            if self.calls < 3:
+                raise ConnectionError("429 Too Many Requests: rate limit exceeded")
+            return _Resp()
+
+    flaky = _FlakyLLM()
+    monkeypatch.setattr(llm_factory, "build_model", lambda: flaky)
+    # 加速重试：不真的 sleep 15s
+    monkeypatch.setattr(verifier_module.time, "sleep", lambda *_a, **_k: None)
+
+    artifacts = {"a.py": {"content": "print(1)"}}
+    result = v.verify("build", artifacts)
+    assert result.verdict == Verdict.PASS
+    assert flaky.calls == 3  # 2 failures + 1 success
+
+
+def test_rubric_falls_back_after_retries_exhausted(monkeypatch):
+    """重试耗尽后才回退到 fail-closed，而非首次失败就判 REPAIR。"""
+    import app.llm_factory as llm_factory
+
+    v = LLMRubricVerifier(model_available=True)
+
+    class _AlwaysFailLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, messages):
+            self.calls += 1
+            raise TimeoutError("request timed out")
+
+    fail_llm = _AlwaysFailLLM()
+    monkeypatch.setattr(llm_factory, "build_model", lambda: fail_llm)
+    monkeypatch.setattr(verifier_module.time, "sleep", lambda *_a, **_k: None)
+
+    artifacts = {"a.py": {"content": "print(1)"}}
+    result = v.verify("build", artifacts)
+    # 重试耗尽 → fallback → REPAIR (fail-closed)
+    assert result.verdict == Verdict.REPAIR
+    # 1 initial + 3 retries = 4 calls
+    assert fail_llm.calls == verifier_module._VERIFIER_LLM_MAX_RETRIES + 1
+
+
+def test_rubric_no_retry_on_non_transient_error(monkeypatch):
+    """非瞬时错误（如 ValueError）不重试，立即回退。"""
+    import app.llm_factory as llm_factory
+
+    v = LLMRubricVerifier(model_available=True)
+
+    class _BadLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, messages):
+            self.calls += 1
+            raise ValueError("invalid api key configuration")
+
+    bad = _BadLLM()
+    monkeypatch.setattr(llm_factory, "build_model", lambda: bad)
+    monkeypatch.setattr(verifier_module.time, "sleep", lambda *_a, **_k: None)
+
+    artifacts = {"a.py": {"content": "print(1)"}}
+    result = v.verify("build", artifacts)
+    assert result.verdict == Verdict.REPAIR
+    # 非瞬时错误 → 只调用 1 次，不重试
+    assert bad.calls == 1
+
+
+# ===== Head+Tail prompt 避免假"截断"判决 =====
+
+
+def test_rubric_prompt_shows_head_and_tail_for_large_files():
+    """大文件应同时展示开头和结尾，让 LLM 看到文件正常结束。
+
+    锁定 run_3fb3c2572f1348b0 task_4__repair_v29 回归：18KB 完整测试文件
+    只展示前 6KB，LLM 幻觉"TestHealthCheck.run() 方法实现被截断"。
+
+    注意：``_RUBRIC_CONTENT_PREVIEW_LIMIT`` 为 24000，所以测试文件必须
+    超过 24000 字符才会触发 head+tail 拆分。
+    """
+    from app.multiagent.verifier import _RUBRIC_CONTENT_PREVIEW_LIMIT
+    v = LLMRubricVerifier(model_available=True)
+    # 造一个 > _RUBRIC_CONTENT_PREVIEW_LIMIT 字符的产物
+    big_content = "def start():\n    pass\n" + ("x = 1\n" * (_RUBRIC_CONTENT_PREVIEW_LIMIT // 5)) + "def end():\n    return 'done'\n"
+    assert len(big_content) > _RUBRIC_CONTENT_PREVIEW_LIMIT, "test file must exceed preview limit"
+    prompt = v._build_rubric_prompt("goal", {"big.py": {"content": big_content, "size_bytes": len(big_content)}},
+                                    ["completeness"])
+    # 开头和结尾都应出现
+    assert "def start()" in prompt
+    assert "def end()" in prompt
+    assert "return 'done'" in prompt
+    # 应标注中间省略
+    assert "omitted" in prompt
+
+
+def test_rubric_prompt_shows_full_small_file():
+    """小文件应完整展示，不做 head+tail 拆分。"""
+    v = LLMRubricVerifier(model_available=True)
+    small = "print('hello world')\n"
+    prompt = v._build_rubric_prompt("goal", {"s.py": {"content": small}}, ["completeness"])
+    assert "print('hello world')" in prompt
+    assert "omitted" not in prompt

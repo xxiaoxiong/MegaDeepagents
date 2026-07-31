@@ -3603,6 +3603,56 @@ select:focus-visible {
   background: var(--canvas);
 }
 
+/* 右侧产出文件抽屉：第三列，对齐 codex 聊天 + 文件面板体验 */
+.chat-layout.has-drawer {
+  grid-template-columns: 280px minmax(0, 1fr) 460px;
+}
+
+.chat-drawer {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-left: 1px solid var(--line);
+  background: var(--surface, #fff);
+  overflow: hidden;
+}
+
+.chat-drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.chat-drawer-head strong {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+}
+
+.chat-drawer .artifact-explorer {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.chat-drawer-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  margin-left: 4px;
+  font-size: 11px;
+  border-radius: 8px;
+  background: var(--accent-soft, rgba(99, 102, 241, 0.15));
+  color: var(--accent, #4f46e5);
+}
+
 .chat-sidebar {
   display: flex;
   flex-direction: column;
@@ -4857,6 +4907,21 @@ select:focus-visible {
     grid-template-columns: 240px minmax(0, 1fr);
   }
 
+  /* 抽屉在中小屏改为浮层覆盖，避免挤压聊天主区 */
+  .chat-layout.has-drawer {
+    grid-template-columns: 240px minmax(0, 1fr);
+  }
+
+  .chat-drawer {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(420px, 92vw);
+    z-index: 50;
+    box-shadow: -12px 0 32px rgba(0, 0, 0, 0.18);
+  }
+
   .chat-team-pulse {
     grid-template-columns: minmax(0, 1fr);
   }
@@ -4870,6 +4935,14 @@ select:focus-visible {
 @media (max-width: 720px) {
   .chat-layout {
     grid-template-columns: 1fr;
+  }
+
+  .chat-layout.has-drawer {
+    grid-template-columns: 1fr;
+  }
+
+  .chat-drawer {
+    width: 100vw;
   }
 
   .chat-sidebar {

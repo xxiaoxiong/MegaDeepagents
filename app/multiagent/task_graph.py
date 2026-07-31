@@ -94,10 +94,18 @@ def is_legal_transition(from_status: TaskNodeStatus, to_status: TaskNodeStatus) 
 # tasks — and crucially their repair tasks — before they could finish, then
 # retries hit 429s and permanently failed the run.
 CAPABILITY_TIMEOUTS: dict[str, float] = {
-    "planning": 900.0,      # 深度思考 + 多轮工具调用
+    # 900s was too tight for complex planning tasks (e.g. "构建一个前后端项目"
+    # architecture design on the agnes endpoint timed out at 900s in
+    # run_fdad04073bf748f8, burning retries).  1200s gives deep architecture
+    # tasks room to finish while still bounding runaway loops.
+    "planning": 1200.0,     # 深度思考 + 多轮工具调用 + 设计文档产出
     "research": 600.0,      # 调研 + 网络请求
-    "coding": 600.0,        # 编码 + 编译 + 测试
-    "testing": 300.0,       # 测试相对快
+    "coding": 900.0,        # 编码：多文件项目需要更多时间（19+ files observed in run_72df9e9852a64998）
+    # 300s was too tight for testing tasks that must WRITE test files (often
+    # many) AND run them.  task_4__repair_v29 timed out twice at 300s while the
+    # agent was still writing/running e2e tests (run_3fb3c2572f1348b0).
+    # 600s gives the tester room to author + execute + capture a report.
+    "testing": 600.0,
     "reviewing": 300.0,     # 评审相对快
     "summarization": 600.0, # 总结需要读全部产物
 }
@@ -127,7 +135,11 @@ class TaskBudget(BaseModel):
     """
 
     max_attempts: int = Field(default=4, ge=1, le=10)
-    max_tool_calls: int = Field(default=20, ge=1, le=200)
+    # 20 was too tight for coding/build tasks that create many files; a single
+    # "构建一个前后端项目" task routinely needs 30+ file writes.  40 is a budget
+    # ceiling (admission guard), not a target — it stops runaway loops without
+    # strangling legitimate work.  Repair tasks override this higher still.
+    max_tool_calls: int = Field(default=40, ge=1, le=200)
     # 0.0 means "use the scheduler's global task_execution_timeout_seconds".
     # The planner sets this per-task based on the primary capability
     # (planning→900s, coding→600s, testing→300s, ...).  0.0 preserves the
@@ -400,7 +412,18 @@ class TaskGraph(BaseModel):
         if target_node_id not in self.nodes:
             raise ValueError(f"target_node_id={target_node_id!r} 不存在")
         target = self.nodes[target_node_id]
-        repair_id = f"{target_node_id}__repair_v{self.version}"
+        # Resolve the original base id when re-repairing a repair task so the
+        # id stays flat: repairing "1__repair_v7" produces "1__repair_v9",
+        # not "1__repair_v7__repair_v9".  Nested ids would make the
+        # ``__repair_v`` substring checks and audit trails harder to read and
+        # could collide with the fallback dedup loop below.  The original
+        # target id is the prefix before the first ``__repair_v`` marker.
+        base_id = (
+            target_node_id.split("__repair_v", 1)[0]
+            if "__repair_v" in target_node_id
+            else target_node_id
+        )
+        repair_id = f"{base_id}__repair_v{self.version}"
         # 避免重复
         i = 0
         while repair_id in self.nodes:
@@ -422,6 +445,21 @@ class TaskGraph(BaseModel):
             target.budget.max_attempts if target.budget.max_attempts else 4,
             4,
         )
+        # Repair tasks read the original artifact, apply fixes, and re-run
+        # verification — they need more tool calls than a fresh task.  Without
+        # this override the default (40) plus the tight recursion_limit formula
+        # (max_tool_calls*2+4=44 historically) killed repair tasks like
+        # 1__repair_v8 with ``Recursion limit of 44 reached``.
+        #
+        # Floor at 80: the old 60 floor gave recursion_limit=200, but complex
+        # backend repairs (run_e705290b97cf4a14 task_3__repair_v13/v23) still
+        # hit "Recursion limit of 200 reached" on attempt 1 because the agent
+        # needed to read 10+ existing files AND write fixes.  80 tool calls →
+        # recursion_limit=260, enough headroom for read-heavy repair work.
+        repair_max_tool_calls = max(
+            target.budget.max_tool_calls if target.budget.max_tool_calls else 40,
+            80,
+        )
         node = TaskNode(
             id=repair_id,
             title=f"Repair {target_node_id}",
@@ -431,16 +469,31 @@ class TaskGraph(BaseModel):
             # 继承 target 的上游依赖（不依赖已 FAILED 的 target）
             dependencies=list(target.dependencies),
             required_capabilities=repair_caps,
+            # 继承原任务的 output_contract：repair 的目标是让原产物通过原验收
+            # 标准，所以 verifier 应该用原 acceptance_criteria 检查修复后的产物，
+            # 而不是用泛化的 "patch" / "修复后必须通过 Verifier" 来检查。
+            #
+            # 旧代码用 ``artifact_type="patch", required_artifacts=["repair_patch"]``
+            # 导致两个问题：
+            # 1. repair agent 通过 create_file 产出的是 code/document，不是
+            #    "repair_patch" → required_artifacts 永远不满足 → verifier
+            #    每轮都判 repair → 修复链永远不收敛
+            #    (run_163696336480406b: task_2 经历 4 轮 repair 全部失败)
+            # 2. acceptance_criteria "修复后必须通过 Verifier" 是循环引用，
+            #    LLM rubric 无法据此给出可操作的评判
             output_contract=OutputContract(
-                artifact_type="patch",
-                description="修复产物",
-                acceptance_criteria=["修复后必须通过 Verifier"],
-                required_artifacts=["repair_patch"],
+                artifact_type=target.output_contract.artifact_type,
+                description=target.output_contract.description,
+                acceptance_criteria=list(target.output_contract.acceptance_criteria),
+                required_artifacts=[],  # 不强制 required_artifacts：repair
+                #    产物可能只是 edit_file 修改了已有文件，不一定产生新
+                #    artifact 满足某个 role 约束。
             ),
             priority=10,
             max_attempts=repair_max_attempts,
             budget=TaskBudget(
                 max_attempts=repair_max_attempts,
+                max_tool_calls=repair_max_tool_calls,
                 max_seconds=repair_timeout,
             ),
         )

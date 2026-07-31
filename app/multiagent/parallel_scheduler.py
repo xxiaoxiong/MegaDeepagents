@@ -446,12 +446,6 @@ class ParallelTeamScheduler:
                 item[0].task_id,
             ),
         )
-        running_has_exclusive = any(
-            not self._task_allows_parallel(task_id)
-            for task_id in already_running
-        )
-        if running_has_exclusive:
-            return []
 
         exclusive_ready = [
             item for item in ordered
@@ -459,6 +453,13 @@ class ParallelTeamScheduler:
         ]
         if running:
             # An exclusive task waits for the current parallel wave to drain.
+            # BUT: parallel-capable tasks (allow_parallel=True) CAN start
+            # alongside a running exclusive task.  The old code returned []
+            # entirely when any running task was exclusive, which incorrectly
+            # blocked independent parallel tasks (e.g. task_3 frontend coding
+            # blocked by task_2 backend coding with allow_parallel=False —
+            # run_b5f932e160884113).  Now we only filter out OTHER exclusive
+            # tasks; parallel tasks proceed normally.
             ordered = [
                 item for item in ordered
                 if self._task_allows_parallel(item[0].task_id)
@@ -668,10 +669,61 @@ class ParallelTeamScheduler:
         # or permanent capability gap.
         pending = [t for t in all_tasks if t.status == BoardTaskStatus.PENDING]
         if pending:
-            # Pending tasks but none dispatchable → no eligible worker.
+            # 真正"无人可服务"的死锁：列出每个 pending task 的 required_capabilities
+            # 与现存 agent 的 capabilities，让运维 / 前端能看到原因（而不是只收到一个
+            # 抽象的 no_eligible_worker，再被 root_graph 走 human_interrupt → dispatch
+            # 死循环几千次产出几千条同名事件——run 进入"消息暴涨"症状）。
+            from app.multiagent.agent_instance import AgentStatus
+            live_agent_caps = sorted({
+                cap
+                for agent in self.registry.list_by_run(self.run_id)
+                if getattr(agent.status, "value", agent.status)
+                not in {"stopped", "failed"}
+                for cap in agent.capabilities
+            })
+            pending_detail = [
+                {
+                    "task_id": task.task_id,
+                    "required_capabilities": list(task.required_capabilities),
+                    "dependencies": list(task.dependencies),
+                    "next_attempt_at": (
+                        task.next_attempt_at.isoformat()
+                        if task.next_attempt_at else None
+                    ),
+                }
+                for task in pending
+            ]
+            # 区分两种场景：依赖未满足（等运行中任务）vs 真正无人能干。
+            # 只有真无人能干才报错终止；只是依赖未满足让外层再 loop 一次。
+            truly_unserviceable_now = [
+                t for t in pending
+                if self._deps_satisfied(t)
+                and not any(
+                    self._agent_can_serve(a, t)
+                    for a in self.registry.list_by_run(self.run_id)
+                    if getattr(a.status, "value", a.status)
+                    not in {"stopped", "failed"}
+                )
+            ]
+            self._event("NoEligibleWorkerDeadlock", payload={
+                "pending": pending_detail,
+                "live_agent_capabilities": live_agent_caps,
+                "truly_unserviceable_task_ids": [
+                    t.task_id for t in truly_unserviceable_now
+                ],
+            })
+            # 关键修复：把 WAITING_HUMAN / no_eligible_worker 改成 FAILED。
+            # 原语义让 root_graph 走 human_interrupt → Command(resume) → dispatch
+            # 又回到同一调度器，但 human 没有可补的输入，于是反复产出
+            # `no_eligible_worker` 事件，单次 run 累计几千条消息（用户症状）。
             return self._finalize(
-                round_n, status=ScheduleStatus.WAITING_HUMAN.value,
-                error="no_eligible_worker",
+                round_n,
+                status=ScheduleStatus.FAILED.value,
+                error=(
+                    "no_eligible_worker:required_capabilities="
+                    f"{[t.required_capabilities for t in truly_unserviceable_now]}"
+                    f";available={live_agent_caps}"
+                ),
             )
 
         logger.warning(

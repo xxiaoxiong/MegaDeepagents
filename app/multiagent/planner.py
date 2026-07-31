@@ -12,6 +12,7 @@ Planner 输出不能再只是自然语言 plan。
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from app.core.logging import logger
@@ -125,6 +126,82 @@ def _llm_plan_to_taskgraph(json_output: dict | str, goal: str) -> TaskGraph:
             )
             caps = [keep_primary] + tool_caps
 
+        # 启发式纠错：LLM 对"构建项目"类目标常把所有子任务标成 ["planning"]
+        # 或干脆返回空 required_capabilities（fallback 为 ["default"]），导致：
+        # 1. TeamBuilder 只生成 Planner agent、Planner 凭 file_write 自己实现
+        #    一切（用户症状：只有 planner 在干活）。
+        # 2. capability_timeout() 返回 0.0 → 任务用 600s 全局默认超时 → coding
+        #    task 在 600s 被杀（run_a3a9f8e5f5004e21 task_2: 54 个 create_file
+        #    后超时，artifact 不完整 → repair 循环）。
+        #
+        # 修复：对 planning-only / default / 空 caps 的 task 扫描 title+objective+
+        # description 文本：命中测试关键词→改写为 testing；命中实现关键词→改写为
+        # coding；让 Coder/Tester 真正被生成与调度，且拿到正确的 per-capability
+        # 超时（coding→900s, planning→1200s, testing→300s）。
+        # 纯规划/设计/架构类保留 planning。英文关键词用词边界避免 "latest"→test
+        # 之类的误判。
+        needs_heuristic = (
+            not caps
+            or caps[0] in ("planning", "default")
+        ) and not any(c in PRIMARY_CAPS for c in caps[1:])
+        if needs_heuristic:
+            text = " ".join([
+                str(t.get("title", "")),
+                str(t.get("objective", "")),
+                str(t.get("description", "")),
+            ])
+            text_lower = text.lower()
+            # 设计/架构/规划类关键词优先：即使文本提到"前端/后端"（如"设计前后端
+            # 架构"），也应保留 planning，避免把架构设计任务误判为 coding。这优先于
+            # impl/test 命中——架构 task 的产物是设计文档，不是代码。
+            design_hit = any(kw in text for kw in (
+                "设计", "架构", "规划", "方案", "技术选型", "调研",
+            )) or any(
+                re.search(rf"\b{kw}\b", text_lower)
+                for kw in ("design", "architecture", "blueprint", "plan", "spec")
+            )
+            test_hit = any(kw in text for kw in ("测试", "验收测试")) or any(
+                re.search(rf"\b{kw}\b", text_lower)
+                for kw in ("test", "pytest", "unittest")
+            )
+            impl_hit = any(kw in text for kw in (
+                "实现", "编写", "创建", "构建", "开发", "前端", "后端",
+                "组件", "页面", "接口", "数据库",
+            )) or any(
+                re.search(rf"\b{kw}\b", text_lower)
+                for kw in ("develop", "implement", "build", "code", "api",
+                           "service", "server", "client")
+            )
+            if design_hit:
+                # 纯设计/架构 task：保留/设为 planning，不改写为 coding
+                if not caps or caps[0] == "default":
+                    caps = ["planning"] + [c for c in caps[1:] if c in TOOL_CAPS]
+                    logger.warning(
+                        f"[Planner] task {t.get('id')} 无主角色能力但文本含设计关键词，"
+                        f"设为 planning 以便 Planner 接管并拿到 1200s 超时。"
+                    )
+                # else: already ["planning"], keep as-is
+            elif test_hit:
+                caps = ["testing"] + [c for c in caps[1:] if c in TOOL_CAPS]
+                logger.warning(
+                    f"[Planner] task {t.get('id')} 声明 {caps[0] if caps else '空'} 但文本含测试关键词，"
+                    f"改写主角色能力为 testing 以便 Tester 接管。"
+                )
+            elif impl_hit:
+                caps = ["coding"] + [c for c in caps[1:] if c in TOOL_CAPS]
+                logger.warning(
+                    f"[Planner] task {t.get('id')} 声明 {caps[0] if caps else '空'} 但文本含实现关键词，"
+                    f"改写主角色能力为 coding 以便 Coder 接管。"
+                )
+            elif not caps or caps[0] == "default":
+                # 无任何命中且 caps 为空/default：默认设为 planning，确保
+                # capability_timeout() 返回 1200s 而非 0.0→600s 全局默认。
+                caps = ["planning"] + [c for c in caps[1:] if c in TOOL_CAPS]
+                logger.warning(
+                    f"[Planner] task {t.get('id')} 无主角色能力且无关键词命中，"
+                    f"默认设为 planning。"
+                )
+
         # LLM gateways intermittently 429 or time out; a 2-attempt budget
         # turns a single transient failure into a permanent task failure.
         # 4 attempts gives the RATE_LIMITED backoff (15/30/60s) room to
@@ -148,6 +225,47 @@ def _llm_plan_to_taskgraph(json_output: dict | str, goal: str) -> TaskGraph:
         # its retry hit a 429 and permanently failed the run.
         timeout_seconds = capability_timeout(caps)
 
+        # 默认验收条件：LLM 经常返回空 acceptance_criteria（run_3fb3c2572f1348b0
+        # task_4 测试任务的 contract 全空），导致 Verifier 只能用默认 rubric 评估，
+        # LLM rubric 会幻觉出"所有测试用例必须通过且提供执行结果证据"这类契约里
+        # 没有的要求，然后因"仅提供了测试配置文件、无执行结果"判 REPLAN/REPAIR，
+        # 把测试任务打入无限修复。
+        #
+        # 修复：对空 contract 的 task 按主角色能力注入合理的语义验收条件，让
+        # LLM rubric 有具体维度可评，而不是自行发明标准。
+        acceptance_criteria = list(t.get("acceptance_criteria") or [])
+        if not acceptance_criteria:
+            primary_cap = caps[0] if caps else "default"
+            if primary_cap == "testing":
+                acceptance_criteria = [
+                    "测试文件已创建且包含可执行的测试用例",
+                    "测试覆盖核心功能场景（认证、增删改查、异常处理等）",
+                    "测试代码结构清晰、断言明确",
+                ]
+                logger.warning(
+                    f"[Planner] task {t.get('id')} 为 testing 任务但无验收条件，"
+                    f"注入默认测试验收条件。"
+                )
+            elif primary_cap == "coding":
+                acceptance_criteria = [
+                    "实现代码已创建且非空",
+                    "代码结构与架构设计一致",
+                    "核心功能逻辑已实现",
+                ]
+                logger.warning(
+                    f"[Planner] task {t.get('id')} 为 coding 任务但无验收条件，"
+                    f"注入默认实现验收条件。"
+                )
+            elif primary_cap == "planning":
+                acceptance_criteria = [
+                    "设计文档已创建且涵盖架构、模块划分、技术选型",
+                    "文档内容完整、结构清晰",
+                ]
+                logger.warning(
+                    f"[Planner] task {t.get('id')} 为 planning 任务但无验收条件，"
+                    f"注入默认设计验收条件。"
+                )
+
         node = TaskNode(
             id=t["id"],
             title=t.get("title", t["id"]),
@@ -160,7 +278,7 @@ def _llm_plan_to_taskgraph(json_output: dict | str, goal: str) -> TaskGraph:
             output_contract=OutputContract(
                 artifact_type=t.get("output_artifact_type", "any"),
                 description=t.get("objective", t["id"]),
-                acceptance_criteria=t.get("acceptance_criteria", []),
+                acceptance_criteria=acceptance_criteria,
                 allow_parallel=allow_parallel,
             ),
             priority=t.get("priority", 5),
@@ -278,7 +396,20 @@ def plan_with_llm(
         "   - coding 任务: ['coding', 'file_read', 'file_write', 'shell_execute']\n"
         "   - testing 任务: ['testing', 'file_read', 'shell_execute']\n"
         "   - reviewing 任务: ['reviewing', 'file_read']\n"
-        "   - summarization 任务: ['summarization', 'file_read', 'file_write']"
+        "   - summarization 任务: ['summarization', 'file_read', 'file_write']\n"
+        "9. **能力与角色必须匹配**（关键）：\n"
+        "   - 只有产出规划/架构设计/方案文档的 task 才用 'planning'；\n"
+        "   - 任何涉及编写代码、创建代码文件、实现功能的 task 必须用 'coding'；\n"
+        "   - 任何涉及编写或运行测试的 task 必须用 'testing'；\n"
+        "   - 不要让 'planning' 任务承担代码实现工作。\n"
+        "10. **构建项目类目标必须多角色协作**：不得把整个项目塞进一个 planning 任务。"
+        "应拆为：planning(架构设计) → coding(各模块实现) → testing(测试)，"
+        "通过 dependencies 串联，让 Coder/Tester 等不同角色 agent 真正参与。\n"
+        "11. 示例（目标“构建一个前后端项目”）：\n"
+        "   - task_1: 架构设计, required_capabilities=['planning'], 依赖[]\n"
+        "   - task_2: 实现前端, required_capabilities=['coding','file_read','file_write','shell_execute'], 依赖['task_1']\n"
+        "   - task_3: 实现后端 API, required_capabilities=['coding','file_read','file_write','shell_execute'], 依赖['task_1']\n"
+        "   - task_4: 编写并运行测试, required_capabilities=['testing','file_read','shell_execute'], 依赖['task_2','task_3']"
     )
 
     prompt = f"## 用户目标\n{goal}\n\n## 额外上下文\n{context or '(无)'}"
@@ -298,6 +429,12 @@ def plan_with_llm(
             text = getattr(response, "content", str(response))
             if isinstance(text, list):
                 text = json.dumps(text, ensure_ascii=False)
+
+            # Debug: log the raw LLM response to diagnose parsing failures
+            logger.info(
+                f"[Planner] LLM response (attempt {attempt}, len={len(text) if isinstance(text, str) else 'n/a'}): "
+                f"{(text[:500] if isinstance(text, str) else str(text)[:500])}"
+            )
 
             # 先解析 JSON
             parsed = json.loads(text) if isinstance(text, str) else text

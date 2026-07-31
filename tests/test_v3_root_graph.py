@@ -169,40 +169,51 @@ def test_legacy_task_artifacts_migrate_without_colliding_with_v3(tmp_path):
     from app.core.config import settings
     from app.infrastructure.database.connection import close_connection, get_connection
 
-    close_connection()
-    legacy_path = tmp_path / "legacy.sqlite3"
-    raw = sqlite3.connect(legacy_path)
-    raw.execute(
-        """CREATE TABLE artifacts (
-           id INTEGER PRIMARY KEY AUTOINCREMENT,
-           task_id TEXT NOT NULL,
-           path TEXT NOT NULL,
-           name TEXT NOT NULL,
-           size_bytes INTEGER DEFAULT 0,
-           created_at TEXT NOT NULL)"""
-    )
-    raw.execute(
-        "INSERT INTO artifacts(task_id,path,name,size_bytes,created_at) VALUES(?,?,?,?,?)",
-        ("old-task", "old.txt", "old.txt", 3, "2026-01-01T00:00:00"),
-    )
-    raw.commit()
-    raw.close()
+    # Save original sqlite_path so subsequent tests aren't poisoned by the
+    # legacy temp database (which pytest deletes after this test).  Without
+    # this restore, every test running after this one connects to a stale
+    # path → "no such table" or "database not found" → run fails.
+    original_sqlite_path = settings.sqlite_path
+    try:
+        close_connection()
+        legacy_path = tmp_path / "legacy.sqlite3"
+        raw = sqlite3.connect(legacy_path)
+        raw.execute(
+            """CREATE TABLE artifacts (
+               id INTEGER PRIMARY KEY AUTOINCREMENT,
+               task_id TEXT NOT NULL,
+               path TEXT NOT NULL,
+               name TEXT NOT NULL,
+               size_bytes INTEGER DEFAULT 0,
+               created_at TEXT NOT NULL)"""
+        )
+        raw.execute(
+            "INSERT INTO artifacts(task_id,path,name,size_bytes,created_at) VALUES(?,?,?,?,?)",
+            ("old-task", "old.txt", "old.txt", 3, "2026-01-01T00:00:00"),
+        )
+        raw.commit()
+        raw.close()
 
-    settings.sqlite_path = str(legacy_path)
-    conn = get_connection()
-    columns = {
-        row["name"] for row in conn.execute("PRAGMA table_info(task_artifacts)")
-    }
-    assert {"task_id", "path", "name"}.issubset(columns)
-    assert conn.execute("SELECT COUNT(*) FROM task_artifacts").fetchone()[0] == 1
+        settings.sqlite_path = str(legacy_path)
+        conn = get_connection()
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_artifacts)")
+        }
+        assert {"task_id", "path", "name"}.issubset(columns)
+        assert conn.execute("SELECT COUNT(*) FROM task_artifacts").fetchone()[0] == 1
 
-    from app.multiagent.store import _get_conn
+        from app.multiagent.store import _get_conn
 
-    v3_conn = _get_conn()
-    v3_columns = {
-        row["name"] for row in v3_conn.execute("PRAGMA table_info(artifacts)")
-    }
-    assert {"artifact_id", "run_id", "relative_path"}.issubset(v3_columns)
+        v3_conn = _get_conn()
+        v3_columns = {
+            row["name"] for row in v3_conn.execute("PRAGMA table_info(artifacts)")
+        }
+        assert {"artifact_id", "run_id", "relative_path"}.issubset(v3_columns)
+    finally:
+        # Restore the original database path and clear cached connections so
+        # subsequent tests connect to the real test database.
+        settings.sqlite_path = original_sqlite_path
+        close_connection()
 
 
 def test_whole_run_verifier_creates_and_executes_a_real_repair_task(tmp_path):
@@ -246,6 +257,106 @@ def test_whole_run_verifier_creates_and_executes_a_real_repair_task(tmp_path):
         task.task_id == repair_ids[0] and task.status.value == "succeeded"
         for task in board
     )
+
+
+def test_per_task_repair_rounds_give_each_chain_its_own_budget(tmp_path):
+    """Each task chain gets its own repair budget; one chain's repairs don't
+    starve another's.
+
+    Sequential tasks: alpha (2 repairs needed) → beta (depends on alpha,
+    2 repairs needed).  With max_repair_rounds=3 and the OLD global counter,
+    the run would fail at global round 3 (alpha used 2, beta's 2nd repair
+    would be round 4 ≥ 3).  With per-task tracking, alpha uses 2/3 and beta
+    uses 2/3 — both within budget — so the run completes.
+    """
+    class SequentialRepairVerifier:
+        """Per-task: alpha/beta each fail twice then pass.
+        Whole-run: always pass (per-task verification is the gate)."""
+
+        def __init__(self, store: ArtifactStore) -> None:
+            self.artifact_store = store
+            self._per_task_calls: dict[str, int] = {}
+
+        def validate(self, *, goal, artifacts, checks=None):
+            if checks is not None:
+                # Per-task verification — fail the first 2 attempts for each
+                # task chain, then pass.
+                key = (
+                    "alpha" if "alpha" in goal.lower()
+                    else "beta" if "beta" in goal.lower()
+                    else "other"
+                )
+                count = self._per_task_calls.get(key, 0) + 1
+                self._per_task_calls[key] = count
+                if key in ("alpha", "beta") and count <= 2:
+                    return ValidationResult(
+                        verdict=Verdict.REPAIR,
+                        scores={"evidence": 0.0},
+                        summary=f"{key} repair needed (attempt {count})",
+                    )
+                return ValidationResult(
+                    verdict=Verdict.PASS,
+                    scores={"evidence": 1.0},
+                    evidence=[EvidenceRef(source="test", content=goal)],
+                    summary=f"{key} pass (attempt {count})",
+                )
+            # Whole-run verification
+            return ValidationResult(
+                verdict=Verdict.PASS,
+                scores={"evidence": 1.0},
+                evidence=[EvidenceRef(source="test", content=goal)],
+                summary="whole-run pass",
+            )
+
+    ctx = _context(tmp_path, "Build alpha then beta")
+    store = ArtifactStore(ctx.workspace_root)
+    executor = RecordingExecutor(store)
+    verifier = SequentialRepairVerifier(store)
+
+    def planner(goal, feedback):
+        graph = TaskGraph(root_task_id="alpha")
+        graph.add_node(TaskNode(
+            id="alpha",
+            title="Alpha",
+            objective="Build alpha component",
+            required_capabilities=["coding"],
+            output_contract=OutputContract(
+                artifact_type="document",
+                description="Alpha evidence",
+            ),
+        ))
+        graph.add_node(TaskNode(
+            id="beta",
+            title="Beta",
+            objective="Build beta component",
+            dependencies=["alpha"],
+            required_capabilities=["coding"],
+            output_contract=OutputContract(
+                artifact_type="document",
+                description="Beta evidence",
+            ),
+        ))
+        return graph
+
+    result = run_governed(
+        goal=ctx.user_goal,
+        requested_mode="team",
+        planner=planner,
+        executor=executor,
+        verifier=verifier,
+        ctx=ctx,
+        max_rounds=30,
+        max_repair_rounds=3,
+    )
+
+    assert result.status == "completed", (
+        f"Run should complete with per-task budgets, but got status={result.status}. "
+        f"Executor calls: {executor.calls}"
+    )
+    alpha_repairs = [tid for tid in executor.calls if tid.startswith("alpha__repair")]
+    beta_repairs = [tid for tid in executor.calls if tid.startswith("beta__repair")]
+    assert len(alpha_repairs) == 2, f"Alpha should need 2 repairs, got {alpha_repairs}"
+    assert len(beta_repairs) == 2, f"Beta should need 2 repairs, got {beta_repairs}"
 
 
 def test_replan_atomically_materializes_and_executes_the_revised_graph(tmp_path):

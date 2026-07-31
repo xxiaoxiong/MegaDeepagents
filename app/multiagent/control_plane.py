@@ -347,45 +347,68 @@ def build_team_tools(service: TeamControlPlaneService, run_id: str, agent_id: st
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("agent_cancelled: team tools unavailable after cancel/timeout")
 
+    def _safe_json(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> str:
+        """Run a control-plane call and return JSON.
+
+        ``PermissionError`` (e.g. agent trying to set task ``status`` via
+        ``team_update_task``) and ``ValueError``/``KeyError`` from validation
+        are returned to the agent as a structured error string so the LLM can
+        learn and adjust.  Without this, the exception propagated through the
+        LangChain tool boundary and failed the *entire* task — even though the
+        agent had already produced valid artifacts.  ``RuntimeError`` from
+        ``before()`` (cancel/timeout) still propagates so the executor can stop.
+        """
+        try:
+            return json.dumps(fn(*args, **kwargs), ensure_ascii=False)
+        except (PermissionError, ValueError, KeyError) as exc:
+            return json.dumps({
+                "ok": False,
+                "error": type(exc).__name__,
+                "message": str(exc),
+                "hint": ("Agents cannot directly change task runtime state "
+                         "(status/claimed_by). Produce artifacts and let the "
+                         "Verifier decide completion."),
+            }, ensure_ascii=False)
+
     @tool
     def team_list_members() -> str:
         """列出当前团队成员和生命周期状态。"""
-        before(); return json.dumps(service.team_list_members(run_id, agent_id), ensure_ascii=False)
+        before(); return _safe_json(service.team_list_members, run_id, agent_id)
 
     @tool
     def team_get_member_status(member_agent_id: str) -> str:
         """查询一个团队成员的状态。"""
-        before(); return json.dumps(service.team_get_member_status(run_id, agent_id, member_agent_id), ensure_ascii=False)
+        before(); return _safe_json(service.team_get_member_status, run_id, agent_id, member_agent_id)
 
     @tool
     def team_list_tasks() -> str:
         """列出当前运行的任务板。"""
-        before(); return json.dumps(service.team_list_tasks(run_id, agent_id), ensure_ascii=False)
+        before(); return _safe_json(service.team_list_tasks, run_id, agent_id)
 
     @tool
     def team_get_task(task_id: str) -> str:
         """读取一个任务详情。"""
-        before(); return json.dumps(service.team_get_task(run_id, agent_id, task_id), ensure_ascii=False)
+        before(); return _safe_json(service.team_get_task, run_id, agent_id, task_id)
 
     @tool
     def team_claim_task(task_id: str) -> str:
         """原子认领依赖已满足且能力匹配的任务。"""
-        before(); return json.dumps(service.team_claim_task(run_id, agent_id, task_id), ensure_ascii=False)
+        before(); return _safe_json(service.team_claim_task, run_id, agent_id, task_id)
 
     @tool
     def team_create_task(task: dict[str, Any], mutation_id: str = "") -> str:
         """通过控制平面创建合法补充任务。"""
-        before(); return json.dumps(service.team_create_task(run_id, agent_id, task, mutation_id or None), ensure_ascii=False)
+        before(); return _safe_json(service.team_create_task, run_id, agent_id, task, mutation_id or None)
 
     @tool
     def team_update_task(task_id: str, changes: dict[str, Any], mutation_id: str = "") -> str:
         """更新任务计划字段，不能直接设置成功状态。"""
-        before(); return json.dumps(service.team_update_task(run_id, agent_id, task_id, changes, mutation_id or None), ensure_ascii=False)
+        before(); return _safe_json(service.team_update_task, run_id, agent_id, task_id, changes, mutation_id or None)
 
     @tool
     def team_add_dependency(task_id: str, dependency_id: str, mutation_id: str = "") -> str:
         """经 DAG 校验增加任务依赖。"""
-        before(); return json.dumps(service.team_add_dependency(run_id, agent_id, task_id, dependency_id, mutation_id or None), ensure_ascii=False)
+        before(); return _safe_json(service.team_add_dependency, run_id, agent_id, task_id, dependency_id, mutation_id or None)
 
     @tool
     def team_mark_blocked(task_id: str, reason: str) -> bool:
@@ -410,17 +433,17 @@ def build_team_tools(service: TeamControlPlaneService, run_id: str, agent_id: st
     @tool
     def team_read_messages(max_count: int = 20) -> str:
         """读取自己的团队消息。"""
-        before(); return json.dumps(service.team_read_messages(run_id, agent_id, max_count), ensure_ascii=False)
+        before(); return _safe_json(service.team_read_messages, run_id, agent_id, max_count)
 
     @tool
     def team_wait_for_message(timeout: float = 30) -> str:
         """短暂等待一条团队消息。"""
-        before(); return json.dumps(service.team_wait_for_message(run_id, agent_id, timeout), ensure_ascii=False)
+        before(); return _safe_json(service.team_wait_for_message, run_id, agent_id, timeout)
 
     @tool
     def team_spawn_teammate(required_capabilities: list[str]) -> str:
         """按预算和权限请求创建子队友。"""
-        before(); return json.dumps(service.team_spawn_teammate(run_id, agent_id, required_capabilities), ensure_ascii=False)
+        before(); return _safe_json(service.team_spawn_teammate, run_id, agent_id, required_capabilities)
 
     @tool
     def team_request_teammate_shutdown(target_agent_id: str, reason: str) -> bool:
@@ -431,12 +454,12 @@ def build_team_tools(service: TeamControlPlaneService, run_id: str, agent_id: st
     def team_request_permission(kind: str, operation: str,
                                 parameters: dict[str, Any], reason: str = "") -> str:
         """提交结构化权限请求，不能自行批准。"""
-        before(); return json.dumps(service.team_request_permission(run_id, agent_id, kind, operation, parameters, reason), ensure_ascii=False)
+        before(); return _safe_json(service.team_request_permission, run_id, agent_id, kind, operation, parameters, reason)
 
     @tool
     def team_submit_plan(plan: dict[str, Any]) -> str:
         """提交写操作前的结构化计划。"""
-        before(); return json.dumps(service.team_submit_plan(run_id, agent_id, plan), ensure_ascii=False)
+        before(); return _safe_json(service.team_submit_plan, run_id, agent_id, plan)
 
     @tool
     def team_report_progress(task_id: str, progress: float, summary: str) -> bool:

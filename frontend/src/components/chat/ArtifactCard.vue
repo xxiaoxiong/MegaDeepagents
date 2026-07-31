@@ -1,6 +1,5 @@
 <script setup lang="ts">
-import { ExternalLink, FileCode2 } from "@lucide/vue";
-import { useRouter } from "vue-router";
+import { FileCode2, PanelRight } from "@lucide/vue";
 
 const props = defineProps<{
   runId: string;
@@ -9,12 +8,12 @@ const props = defineProps<{
   producedBy?: string | null;
 }>();
 
-const router = useRouter();
+const emit = defineEmits<{ open: [artifactId: string] }>();
+
+// 不再 router.push 跳到任务运行页：点击卡片在聊天页右侧抽屉直接展示产出内容，
+// 对齐 codex "聊天 + 右侧文件面板" 的体验。runId 保留为 prop 以备上下文使用。
 function open() {
-  router.push({
-    path: `/runs/${props.runId}`,
-    hash: `#artifact-${props.artifactId}`,
-  });
+  emit("open", props.artifactId);
 }
 </script>
 
@@ -26,6 +25,6 @@ function open() {
       <code>{{ artifactId }}</code>
       <small v-if="producedBy">由 {{ producedBy }} 生成</small>
     </div>
-    <ExternalLink :size="14" class="artifact-go" />
+    <PanelRight :size="14" class="artifact-go" />
   </button>
 </template>

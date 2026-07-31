@@ -1,6 +1,7 @@
 """Build the real, persistent teammates for a TASK_TEAM run."""
 from __future__ import annotations
 
+from collections import Counter
 from typing import Any
 
 from app.core.logging import logger
@@ -11,6 +12,12 @@ from app.multiagent.default_teams import get_team
 from app.multiagent.mailbox import get_mailbox
 from app.infrastructure.database.run_store import get_agent_run_history, make_run_event_id
 from app.multiagent.team_run_context import TeamRunContext
+
+
+# 同一 profile 最多生成的并行 agent 数量上限。超过此数的并行任务由
+# 既有 agent 通过队列轮转处理，避免为单个 run 生成过多 agent 导致
+# 内存/checkpoint 压力。
+_MAX_PARALLEL_AGENTS_PER_PROFILE = 3
 
 
 class TeamBuilder:
@@ -25,6 +32,36 @@ class TeamBuilder:
 
     async def build_team(self, ctx: TeamRunContext, team_spec: Any, task_graph: Any) -> list[AgentInstance]:
         return self.build_team_sync(ctx, team_spec, task_graph)
+
+    @staticmethod
+    def _compute_task_depths(nodes: dict[str, Any]) -> dict[str, int]:
+        """Compute the dependency depth of each task node.
+
+        Depth = longest path from any root (a root has no dependencies).
+        Two tasks at the same depth are guaranteed **not** to depend on each
+        other (if A→B then depth(A) > depth(B)), so they can run in parallel.
+        Used to determine how many agents of the same profile to spawn.
+        """
+        depths: dict[str, int] = {}
+
+        def depth_of(node_id: str) -> int:
+            if node_id in depths:
+                return depths[node_id]
+            node = nodes.get(node_id)
+            if node is None:
+                return 0
+            deps = getattr(node, "dependencies", None) or []
+            if not deps:
+                depths[node_id] = 0
+            else:
+                depths[node_id] = 1 + max(
+                    (depth_of(d) for d in deps if d in nodes), default=0
+                )
+            return depths[node_id]
+
+        for nid in nodes:
+            depth_of(nid)
+        return depths
 
     def build_team_sync(self, ctx: TeamRunContext, team_spec: Any, task_graph: Any) -> list[AgentInstance]:
         existing = self.registry.list_by_run(ctx.run_id)
@@ -51,6 +88,8 @@ class TeamBuilder:
                 key=lambda profile: (profiles.score_worker(profile), profile.id),
             )
 
+        # ---- 第一步：为每个 task 匹配 profile，并记录 (task_id, profile_id) ----
+        task_profile_map: dict[str, str] = {}
         required_profile_ids: set[str] = set()
         for node in task_graph.nodes.values():
             caps = set(node.required_capabilities)
@@ -93,41 +132,79 @@ class TeamBuilder:
                 raise RuntimeError(
                     f"no_matching_worker for task={node.id} capabilities={node.required_capabilities}"
                 )
+            task_profile_map[node.id] = profile.id
             required_profile_ids.add(profile.id)
 
-        # Team size follows actual graph capability demand.  The
-        # ``required_profile_ids`` filter is the correct demand-based limiter:
-        # only profiles needed by at least one task are spawned.  A hard
-        # ``[:5]`` cap here used to silently drop the Finalizer (the 6th
-        # registered profile) when a plan required both Researcher and
-        # Finalizer, deadlocking every ``summarization`` task (T14/T15 in
-        # run_2a438328372441d8) with ``no_eligible_worker``.
-        live_profile_ids = {
-            agent.profile_id
-            for agent in existing
-            if getattr(agent.status, "value", agent.status)
-            not in {"stopped", "failed"}
-        }
-        selected = [
-            profile
-            for profile in profiles.list_profiles()
-            if profile.id in required_profile_ids
-            and profile.id not in live_profile_ids
-        ]
-        if not selected and required_profile_ids.issubset(live_profile_ids):
+        # ---- 第二步：计算并行需求 ----
+        #
+        # 同一 profile 的多个任务如果处于同一依赖深度层，它们互不依赖、可
+        # 并行执行（run_de866d4e976b4c3a：task_2/task_3 均为 coding、均只
+        # 依赖 task_1，可并行；但旧代码只生成 1 个 coder → 串行执行 → 用户
+        # 感觉"只有 planner 在干活"）。为每个 profile 取其在同一深度层的
+        # 最大任务数作为并行 agent 数（cap 在 _MAX_PARALLEL_AGENTS_PER_PROFILE）。
+        depths = self._compute_task_depths(task_graph.nodes)
+        # (profile_id, depth) → task count
+        profile_depth_demand: Counter[tuple[str, int]] = Counter()
+        for task_id, profile_id in task_profile_map.items():
+            d = depths.get(task_id, 0)
+            profile_depth_demand[(profile_id, d)] += 1
+
+        # profile_id → 需要的 agent 数量（同一深度的最大任务数，至少 1）
+        profile_agent_demand: Counter[str] = Counter()
+        for (profile_id, _depth), count in profile_depth_demand.items():
+            profile_agent_demand[profile_id] = max(
+                profile_agent_demand.get(profile_id, 0), count
+            )
+        # 确保每个被需要的 profile 至少 1 个 agent
+        for pid in required_profile_ids:
+            if profile_agent_demand[pid] < 1:
+                profile_agent_demand[pid] = 1
+            profile_agent_demand[pid] = min(
+                profile_agent_demand[pid], _MAX_PARALLEL_AGENTS_PER_PROFILE
+            )
+
+        # ---- 第三步：按需求生成 agent（支持同 profile 多实例）----
+        #
+        # 旧代码用 set 去重，导致同一 profile 永远只有 1 个 agent。现在按
+        # profile_agent_demand 生成 N 个实例。已存活（非 stopped/failed）的
+        # 同 profile agent 计入已有数量，只补差值。
+        live_profile_counts: Counter[str] = Counter()
+        for agent in existing:
+            status = getattr(agent.status, "value", agent.status)
+            if status not in {"stopped", "failed"}:
+                live_profile_counts[agent.profile_id] += 1
+
+        # 构建 selected_profiles 列表（同一 profile 可出现多次）
+        selected_profiles: list[Any] = []
+        for profile in profiles.list_profiles():
+            if profile.id not in required_profile_ids:
+                continue
+            needed = profile_agent_demand.get(profile.id, 1)
+            already = live_profile_counts.get(profile.id, 0)
+            to_spawn = max(0, needed - already)
+            for _ in range(to_spawn):
+                selected_profiles.append(profile)
+
+        if not selected_profiles and required_profile_ids:
+            # 所有需求已被现有 agent 满足
             return existing
-        if not selected:
+        if not selected_profiles:
             raise RuntimeError("no_executable_teammates")
 
         history = get_agent_run_history()
         mailbox = get_mailbox()
         created: list[AgentInstance] = []
-        for profile in selected:
+        # 同 profile 多实例时给 name 加序号，便于前端区分
+        spawn_index: Counter[str] = Counter()
+        for profile in selected_profiles:
+            spawn_index[profile.id] += 1
+            idx = spawn_index[profile.id]
+            agent_name = profile.name if idx == 1 and live_profile_counts[profile.id] == 0 else f"{profile.name}-{idx}"
             agent = self.registry.create_agent(
-                profile_id=profile.id, name=profile.name, role=profile.role,
+                profile_id=profile.id, name=agent_name, role=profile.role,
                 team_id=ctx.team_id, run_id=ctx.run_id,
                 description=profile.description, capabilities=sorted(profile.capabilities),
-                checkpoint_namespace=f"{ctx.checkpoint_namespace}:{profile.id}",
+                checkpoint_namespace=f"{ctx.checkpoint_namespace}:{profile.id}:{idx}",
                 workspace_root=ctx.workspace_root, max_concurrency=profile.max_concurrency,
             )
             # Force creation of a dedicated inbox; Mailbox owns no shared
@@ -142,5 +219,8 @@ class TeamBuilder:
                          "thread_id": agent.thread_id},
             )
             created.append(agent)
-        logger.info("[TeamBuilder] run=%s spawned=%s", ctx.run_id, len(created))
+        logger.info(
+            "[TeamBuilder] run=%s spawned=%s profile_demand=%s",
+            ctx.run_id, len(created), dict(profile_agent_demand),
+        )
         return [*existing, *created]

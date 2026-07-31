@@ -14,7 +14,17 @@ def _install_deepagents_openai_profile_override() -> None:
         from deepagents import ProviderProfile, register_provider_profile
         register_provider_profile(
             "openai",
-            ProviderProfile(init_kwargs={"use_responses_api": False, "request_timeout": 600.0, "max_retries": 2, "streaming": True}),
+            ProviderProfile(init_kwargs={
+                "use_responses_api": False,
+                "request_timeout": 600.0,
+                "max_retries": 2,
+                "streaming": True,
+                # DeepSeek-Chat default max_tokens is 4096, which truncates
+                # long planning documents mid-sentence (e.g. "日期处理" ending
+                # at "d").  8192 is the model's max output and gives the LLM
+                # enough room to complete architecture/design artifacts.
+                "max_tokens": 8192,
+            }),
         )
     except Exception as exc:
         logger.debug(f"deepagents openai profile override skipped: {exc}")
@@ -169,7 +179,7 @@ def build_model_for_policy(model_policy) -> "Any":
         kwargs: dict = {}
         if temperature is not None:
             kwargs["temperature"] = temperature
-        if max_tokens and max_tokens != 4096:
+        if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
         if timeout and timeout != 60.0:
             kwargs["request_timeout"] = timeout
